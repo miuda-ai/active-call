@@ -489,6 +489,14 @@ impl CallRecordManager {
     ) -> Result<String> {
         let file_content = formatter.format(record)?;
         let file_name = formatter.format_file_name(record);
+
+        // Ensure parent directory exists
+        if let Some(parent) = Path::new(&file_name).parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                anyhow::anyhow!("Failed to create parent directory for {}: {}", file_name, e)
+            })?;
+        }
+
         let mut file = File::create(&file_name).await.map_err(|e| {
             anyhow::anyhow!("Failed to create call record file {}: {}", file_name, e)
         })?;
