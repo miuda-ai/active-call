@@ -4,13 +4,13 @@ use crate::{
         ActiveCall, ActiveCallType, Command,
         active_call::{ActiveCallGuard, CallParams},
     },
-    handler::api,
+    handler::playbook,
     playbook::{Playbook, PlaybookRunner},
 };
 use axum::{
-    Router,
+    Json, Router,
     extract::{Query, State, WebSocketUpgrade, ws::Message},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::get,
 };
 use bytes::Bytes;
@@ -21,24 +21,28 @@ use tokio::{join, select};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
-use voice_engine::{event::SessionEvent, media::track::TrackConfig};
+use voice_engine::{IceServer, event::SessionEvent, media::track::TrackConfig};
 
 pub fn call_router() -> Router<AppState> {
     Router::new()
         .route("/call", get(ws_handler))
         .route("/call/webrtc", get(webrtc_handler))
         .route("/call/sip", get(sip_handler))
+        .route("/iceservers", get(get_iceservers))
 }
 
 pub fn playbook_router() -> Router<AppState> {
     Router::new()
-        .route("/api/playbooks", get(api::list_playbooks))
+        .route("/api/playbooks", get(playbook::list_playbooks))
         .route(
             "/api/playbooks/{name}",
-            get(api::get_playbook).post(api::save_playbook),
+            get(playbook::get_playbook).post(playbook::save_playbook),
         )
-        .route("/api/playbook/run", axum::routing::post(api::run_playbook))
-        .route("/api/records", get(api::list_records))
+        .route(
+            "/api/playbook/run",
+            axum::routing::post(playbook::run_playbook),
+        )
+        .route("/api/records", get(playbook::list_records))
 }
 
 pub async fn ws_handler(
@@ -220,6 +224,17 @@ pub async fn call_handler(
         debug!(session_id, "WebSocket connection closed");
     });
     resp
+}
+
+pub(crate) async fn get_iceservers(State(state): State<AppState>) -> Response {
+    if let Some(ice_servers) = state.config.ice_servers.as_ref() {
+        return Json(ice_servers).into_response();
+    }
+    Json(vec![IceServer {
+        urls: vec!["stun:stun.l.google.com:19302".to_string()],
+        ..Default::default()
+    }])
+    .into_response()
 }
 
 trait IntoWsMessage {

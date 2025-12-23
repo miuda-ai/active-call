@@ -210,9 +210,9 @@ impl AppStateInner {
                 rsip::Method::Invite | rsip::Method::Ack => {
                     let invitation_handler = match self.create_invitation_handler {
                         Some(ref create_invitation_handler) => {
-                            create_invitation_handler(self.config.sip_handler.as_ref()).ok()
+                            create_invitation_handler(self.config.handler.as_ref()).ok()
                         }
-                        _ => default_create_invite_handler(self.config.sip_handler.as_ref()),
+                        _ => default_create_invite_handler(self.config.handler.as_ref()),
                     };
                     let invitation_handler = match invitation_handler {
                         Some(h) => h,
@@ -289,7 +289,7 @@ impl AppStateInner {
 
                     let accept_timeout = self
                         .config
-                        .sip_accept_timeout
+                        .accept_timeout
                         .as_ref()
                         .and_then(|t| parse_duration(t).ok())
                         .unwrap_or_else(|| Duration::from_secs(60));
@@ -537,13 +537,13 @@ impl AppStateBuilder {
             .unwrap_or_else(|| CancellationToken::new());
         let _ = set_cache_dir(&config.media_cache_path);
 
-        let local_ip = if !config.sip_addr.is_empty() {
-            std::net::IpAddr::from_str(config.sip_addr.as_str())?
+        let local_ip = if !config.addr.is_empty() {
+            std::net::IpAddr::from_str(config.addr.as_str())?
         } else {
             voice_engine::net_tool::get_first_non_loopback_interface()?
         };
         let transport_layer = rsipstack::transport::TransportLayer::new(token.clone());
-        let local_addr: SocketAddr = format!("{}:{}", local_ip, config.sip_port).parse()?;
+        let local_addr: SocketAddr = format!("{}:{}", local_ip, config.udp_port).parse()?;
 
         let udp_conn = rsipstack::transport::udp::UdpConnection::create_connection(
             local_addr,

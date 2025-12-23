@@ -151,10 +151,3 @@ pub async fn run_playbook(
 
     Json(RunPlaybookResponse { session_id })
 }
-
-pub async fn index() -> impl IntoResponse {
-    match fs::read_to_string("static/index.html") {
-        Ok(content) => (StatusCode::OK, [("content-type", "text/html")], content).into_response(),
-        Err(_) => (StatusCode::NOT_FOUND, "Index not found").into_response(),
-    }
-}

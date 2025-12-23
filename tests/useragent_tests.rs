@@ -23,10 +23,10 @@ struct WebhookRequest {
 async fn create_test_useragent(webhook_url: String) -> Result<AppState> {
     let mut config = Config::default();
     config.http_addr = "127.0.0.1:0".to_string();
-    config.sip_addr = "127.0.0.1".to_string();
-    config.sip_port = 0; // Let system assign a port
-    config.sip_accept_timeout = Some("30s".to_string()); // Increase accept timeout to 30 seconds
-    config.sip_handler = Some(InviteHandlerConfig::Webhook {
+    config.addr = "127.0.0.1".to_string();
+    config.udp_port = 0; // Let system assign a port
+    config.accept_timeout = Some("30s".to_string()); // Increase accept timeout to 30 seconds
+    config.handler = Some(InviteHandlerConfig::Webhook {
         url: Some(webhook_url),
         urls: None,
         method: Some("POST".to_string()),
@@ -51,8 +51,8 @@ async fn create_test_useragent(webhook_url: String) -> Result<AppState> {
 async fn create_simple_useragent(listen_addr: String) -> Result<AppState> {
     let mut config = Config::default();
     config.http_addr = "127.0.0.1:0".to_string();
-    config.sip_addr = listen_addr;
-    config.sip_port = 0; // Let system assign a port
+    config.addr = listen_addr;
+    config.udp_port = 0; // Let system assign a port
 
     let ua = AppStateBuilder::new()
         .with_config(config)

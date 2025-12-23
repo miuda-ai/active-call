@@ -106,20 +106,19 @@ impl RecordingPolicy {
 pub struct Config {
     #[serde(default = "default_config_http_addr")]
     pub http_addr: String,
+    pub addr: String,
+    pub udp_port: u16,
+
     pub log_level: Option<String>,
     pub log_file: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub http_access_skip_paths: Vec<String>,
 
-    #[serde(default = "default_sip_addr")]
-    pub sip_addr: String,
-    #[serde(default = "default_sip_port")]
-    pub sip_port: u16,
     pub useragent: Option<String>,
     pub register_users: Option<Vec<RegisterOption>>,
     pub graceful_shutdown: Option<bool>,
-    pub sip_handler: Option<InviteHandlerConfig>,
-    pub sip_accept_timeout: Option<String>,
+    pub handler: Option<InviteHandlerConfig>,
+    pub accept_timeout: Option<String>,
 
     pub external_ip: Option<String>,
     #[serde(default = "default_config_rtp_start_port")]
@@ -203,13 +202,13 @@ impl Default for Config {
             log_level: None,
             log_file: None,
             http_access_skip_paths: Vec::new(),
-            sip_addr: default_sip_addr(),
-            sip_port: default_sip_port(),
+            addr: default_sip_addr(),
+            udp_port: default_sip_port(),
             useragent: None,
             register_users: None,
             graceful_shutdown: Some(true),
-            sip_handler: None,
-            sip_accept_timeout: Some("50s".to_string()),
+            handler: None,
+            accept_timeout: Some("50s".to_string()),
             media_cache_path: default_config_media_cache_path(),
             callrecord: None,
             ice_servers: None,

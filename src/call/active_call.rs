@@ -805,10 +805,8 @@ impl ActiveCall {
         callee: String,
         refer_option: Option<ReferOption>,
     ) -> Result<()> {
-        if let Some(moh) = refer_option.as_ref().and_then(|o| o.moh.clone()) {
-            self.do_play(moh, None, None, None).await?;
-        }
-        self.tts_handle.lock().await.take();
+        self.do_interrupt(false).await.ok();
+        let moh = refer_option.as_ref().and_then(|o| o.moh.clone());
         let session_id = self.session_id.clone();
         let track_id = self.server_side_track_id.clone();
 
@@ -874,12 +872,12 @@ impl ActiveCall {
             })
             .ok();
 
-        let auto_hangup = refer_option
+        let auto_hangup_requested = refer_option
             .as_ref()
             .and_then(|o| o.auto_hangup)
             .unwrap_or(true);
 
-        if auto_hangup {
+        if auto_hangup_requested && moh.is_none() {
             *self.auto_hangup.lock().await = Some((ssrc, CallRecordHangupReason::ByRefer));
         } else {
             *self.auto_hangup.lock().await = None;
@@ -888,7 +886,11 @@ impl ActiveCall {
 
         info!(
             session_id = self.session_id,
-            ssrc, auto_hangup, callee, timeout_secs, "do_refer"
+            ssrc,
+            auto_hangup = auto_hangup_requested,
+            callee,
+            timeout_secs,
+            "do_refer"
         );
 
         let r = tokio::time::timeout(
@@ -898,6 +900,8 @@ impl ActiveCall {
                 refer_call_state.clone(),
                 &track_id,
                 invite_option,
+                moh,
+                auto_hangup_requested,
             ),
         )
         .await;
@@ -1116,6 +1120,8 @@ impl ActiveCall {
                         self.call_state.clone(),
                         &self.session_id,
                         invite_option,
+                        None,
+                        false,
                     )
                     .await
                 {
@@ -1362,6 +1368,8 @@ impl ActiveCall {
         call_state_ref: ActiveCallStateRef,
         track_id: &String,
         mut invite_option: InviteOption,
+        moh: Option<String>,
+        auto_hangup: bool,
     ) -> Result<String, rsipstack::Error> {
         let ssrc = call_state_ref
             .read()
@@ -1389,9 +1397,24 @@ impl ActiveCall {
 
         invite_option.offer = offer.clone().map(|s| s.into());
 
-        self.setup_track_with_stream(&call_option, Box::new(rtp_track))
-            .await
-            .map_err(|e| rsipstack::Error::Error(e.to_string()))?;
+        let mut rtp_track_to_setup = Some(Box::new(rtp_track) as Box<dyn Track>);
+
+        if let Some(moh) = moh {
+            let ssrc = rand::random::<u32>();
+            let file_track = FileTrack::new(self.server_side_track_id.clone())
+                .with_play_id(Some(moh.clone()))
+                .with_ssrc(ssrc)
+                .with_path(moh.clone())
+                .with_cancel_token(self.cancel_token.child_token());
+            self.media_stream
+                .update_track(Box::new(file_track), Some(moh))
+                .await;
+        } else {
+            let track = rtp_track_to_setup.take().unwrap();
+            self.setup_track_with_stream(&call_option, track)
+                .await
+                .map_err(|e| rsipstack::Error::Error(e.to_string()))?;
+        }
 
         info!(
             session_id = self.session_id,
@@ -1428,6 +1451,15 @@ impl ActiveCall {
             .invitation
             .invite(invite_option, dlg_state_sender)
             .await?;
+
+        if let Some(track) = rtp_track_to_setup {
+            self.setup_track_with_stream(&call_option, track)
+                .await
+                .map_err(|e| rsipstack::Error::Error(e.to_string()))?;
+            if auto_hangup {
+                *self.auto_hangup.lock().await = Some((ssrc, CallRecordHangupReason::ByRefer));
+            }
+        }
 
         let answer = match answer {
             Some(answer) => String::from_utf8_lossy(&answer).to_string(),

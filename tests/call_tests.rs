@@ -147,7 +147,7 @@ async fn test_webrtc_call_workflow() -> Result<()> {
 
     let mut config = Config::default();
     config.http_addr = format!("127.0.0.1:{}", port);
-    config.sip_port = 0;
+    config.udp_port = 0;
     let http_addr = config.http_addr.clone();
 
     let app_state = AppStateBuilder::new()

@@ -1,8 +1,9 @@
-use active_call::handler::api;
 use anyhow::Result;
+use axum::response::IntoResponse;
 use axum::routing::get;
 use clap::Parser;
 use dotenv::dotenv;
+use reqwest::StatusCode;
 use std::sync::Arc;
 use tokio::signal;
 use tower_http::services::ServeDir;
@@ -12,6 +13,13 @@ use voice_engine::media::engine::StreamEngine;
 
 use active_call::app::AppStateBuilder;
 use active_call::config::{Cli, Config};
+
+pub async fn index() -> impl IntoResponse {
+    match std::fs::read_to_string("static/index.html") {
+        Ok(content) => (StatusCode::OK, [("content-type", "text/html")], content).into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "Index not found").into_response(),
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -35,12 +43,12 @@ async fn main() -> Result<()> {
 
     if let Some(sip) = cli.sip {
         if let Ok(port) = sip.parse::<u16>() {
-            config.sip_port = port;
+            config.udp_port = port;
         } else if let Ok(socket_addr) = sip.parse::<std::net::SocketAddr>() {
-            config.sip_addr = socket_addr.ip().to_string();
-            config.sip_port = socket_addr.port();
+            config.addr = socket_addr.ip().to_string();
+            config.udp_port = socket_addr.port();
         } else {
-            config.sip_addr = sip;
+            config.addr = sip;
         }
     }
 
@@ -69,7 +77,7 @@ async fn main() -> Result<()> {
 
     let app = active_call::handler::call_router()
         .merge(active_call::handler::playbook_router())
-        .route("/", get(api::index))
+        .route("/", get(index))
         .nest_service("/static", ServeDir::new("static"))
         .with_state(app_state.clone());
 
