@@ -15,7 +15,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /build
 
 # Copy the source code
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml ./
 COPY src ./src
 COPY static ./static
 
