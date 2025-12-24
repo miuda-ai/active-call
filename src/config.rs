@@ -102,6 +102,12 @@ impl RecordingPolicy {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RewriteRule {
+    pub r#match: String,
+    pub rewrite: String,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default = "default_config_http_addr")]
@@ -132,6 +138,7 @@ pub struct Config {
     pub ice_servers: Option<Vec<IceServer>>,
     #[serde(default)]
     pub recording: Option<RecordingPolicy>,
+    pub rewrites: Option<Vec<RewriteRule>>,
 }
 
 #[derive(Debug, Deserialize, Clone, Serialize)]
@@ -216,6 +223,7 @@ impl Default for Config {
             rtp_start_port: default_config_rtp_start_port(),
             rtp_end_port: default_config_rtp_end_port(),
             recording: None,
+            rewrites: None,
         }
     }
 }

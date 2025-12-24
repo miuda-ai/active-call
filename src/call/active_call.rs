@@ -346,20 +346,34 @@ impl ActiveCall {
                             continue;
                         }
 
-                        let moh_path = moh.lock().await.clone();
+                        let mut moh_guard = moh.lock().await;
+                        let moh_path = moh_guard.clone();
                         if let Some(path) = moh_path {
-                            info!(
-                                session_id = self.session_id,
-                                "looping moh on error: {}", path
-                            );
+                            let fallback = "./config/sounds/refer_moh.wav".to_string();
+                            let next_path =
+                                if path != fallback && std::path::Path::new(&fallback).exists() {
+                                    info!(
+                                        session_id = self.session_id,
+                                        "moh error, switching to fallback: {}", fallback
+                                    );
+                                    *moh_guard = Some(fallback.clone());
+                                    fallback
+                                } else {
+                                    info!(
+                                        session_id = self.session_id,
+                                        "looping moh on error: {}", path
+                                    );
+                                    path
+                                };
+
                             let ssrc = rand::random::<u32>();
                             let file_track = FileTrack::new(self.server_side_track_id.clone())
-                                .with_play_id(Some(path.clone()))
+                                .with_play_id(Some(next_path.clone()))
                                 .with_ssrc(ssrc)
-                                .with_path(path.clone())
+                                .with_path(next_path.clone())
                                 .with_cancel_token(self.cancel_token.child_token());
                             self.media_stream
-                                .update_track(Box::new(file_track), Some(path))
+                                .update_track(Box::new(file_track), Some(next_path))
                                 .await;
                             continue;
                         }
@@ -849,7 +863,19 @@ impl ActiveCall {
         refer_option: Option<ReferOption>,
     ) -> Result<()> {
         self.do_interrupt(false).await.ok();
-        let moh = refer_option.as_ref().and_then(|o| o.moh.clone());
+        let mut moh = refer_option.as_ref().and_then(|o| o.moh.clone());
+        if let Some(ref path) = moh {
+            if !path.starts_with("http") && !std::path::Path::new(path).exists() {
+                let fallback = "./config/sounds/refer_moh.wav";
+                if std::path::Path::new(fallback).exists() {
+                    info!(
+                        session_id = self.session_id,
+                        "moh {} not found, using fallback {}", path, fallback
+                    );
+                    moh = Some(fallback.to_string());
+                }
+            }
+        }
         let session_id = self.session_id.clone();
         let track_id = self.server_side_track_id.clone();
 
@@ -894,12 +920,13 @@ impl ActiveCall {
                         ));
                     });
                 });
-                headers.push(rsip::Header::Other(
-                    "X-Referred-Id".to_string(),
-                    cs.session_id.clone(),
-                ));
             })
             .ok();
+
+        headers.push(rsip::Header::Other(
+            "X-Referred-Id".to_string(),
+            self.session_id.clone(),
+        ));
 
         let ssrc = rand::random::<u32>();
         let refer_call_state = Arc::new(RwLock::new(ActiveCallState {
