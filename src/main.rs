@@ -105,7 +105,7 @@ async fn main() -> Result<()> {
 
     info!("Starting active-call service...");
 
-    let stream_engine = Arc::new(StreamEngine::new());
+    let stream_engine = Arc::new(StreamEngine::default());
 
     let app_state = AppStateBuilder::new()
         .with_config(config.clone())

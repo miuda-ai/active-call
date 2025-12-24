@@ -1,4 +1,6 @@
+addr = "0.0.0.0"
 http_addr = "0.0.0.0:8080"
+udp_port = 13050
 # http_gzip = true
 log_level = "debug"
 #log_file = "/tmp/rustpbx.log"
