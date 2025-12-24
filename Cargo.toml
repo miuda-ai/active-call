@@ -11,7 +11,7 @@ keywords = ["sip", "voip", "telephony", "voice-agent", "webrtc"]
 categories = ["network-programming", "multimedia"]
 
 [dependencies]
-voice-engine = { version = "0.3.28", features = ["opus"] }
+voice-engine = { version = "0.3.29", features = ["opus"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.146"
 anyhow = "1"
@@ -36,7 +36,7 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 tracing-appender = "0.2.4"
 toml = "0.9.8"
 rsip = "0.4.0"
-rsipstack = "0.3.0"
+rsipstack = "0.3.2"
 #rsipstack = { path = "../rsipstack" }
 uuid = { version = "1.19.0", features = ["v4"] }
 reqwest = { version = "0.12.28", features = [

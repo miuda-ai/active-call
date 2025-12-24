@@ -4,6 +4,7 @@ use crate::{
         CallRecordFormatter, CallRecordManagerBuilder, CallRecordSender, DefaultCallRecordFormatter,
     },
     config::Config,
+    locator::RewriteTargetLocator,
     useragent::{
         RegisterOption,
         invitation::FnCreateInvitationHandler,
@@ -16,8 +17,11 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use humantime::parse_duration;
 use rsip::prelude::HeadersExt;
-use rsipstack::dialog::dialog_layer::DialogLayer;
-use rsipstack::transaction::{Endpoint, TransactionReceiver};
+use rsipstack::transaction::{
+    Endpoint, TransactionReceiver,
+    endpoint::{TargetLocator, TransportEventInspector},
+};
+use rsipstack::{dialog::dialog_layer::DialogLayer, transaction::endpoint::MessageInspector};
 use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
@@ -60,6 +64,10 @@ pub struct AppStateBuilder {
     pub create_invitation_handler: Option<FnCreateInvitationHandler>,
     pub config_loaded_at: Option<DateTime<Utc>>,
     pub config_path: Option<String>,
+
+    pub message_inspector: Option<Box<dyn MessageInspector>>,
+    pub target_locator: Option<Box<dyn TargetLocator>>,
+    pub transport_inspector: Option<Box<dyn TransportEventInspector>>,
 }
 
 impl AppStateInner {
@@ -493,6 +501,9 @@ impl AppStateBuilder {
             create_invitation_handler: None,
             config_loaded_at: None,
             config_path: None,
+            message_inspector: None,
+            target_locator: None,
+            transport_inspector: None,
         }
     }
 
@@ -530,6 +541,23 @@ impl AppStateBuilder {
         self
     }
 
+    pub fn with_inspector(&mut self, inspector: Box<dyn MessageInspector>) -> &mut Self {
+        self.message_inspector = Some(inspector);
+        self
+    }
+    pub fn with_target_locator(&mut self, locator: Box<dyn TargetLocator>) -> &mut Self {
+        self.target_locator = Some(locator);
+        self
+    }
+
+    pub fn with_transport_inspector(
+        &mut self,
+        inspector: Box<dyn TransportEventInspector>,
+    ) -> &mut Self {
+        self.transport_inspector = Some(inspector);
+        self
+    }
+
     pub async fn build(self) -> Result<AppState> {
         let config: Arc<Config> = Arc::new(self.config.unwrap_or_default());
         let token = self
@@ -561,11 +589,28 @@ impl AppStateBuilder {
         if let Some(ref user_agent) = config.useragent {
             endpoint_builder.with_user_agent(user_agent.as_str());
         }
-        let endpoint = endpoint_builder
+
+        let mut endpoint_builder = endpoint_builder
             .with_cancel_token(token.child_token())
             .with_transport_layer(transport_layer)
-            .with_option(endpoint_option)
-            .build();
+            .with_option(endpoint_option);
+
+        if let Some(inspector) = self.message_inspector {
+            endpoint_builder = endpoint_builder.with_inspector(inspector);
+        }
+
+        if let Some(locator) = self.target_locator {
+            endpoint_builder.with_target_locator(locator);
+        } else if let Some(ref rules) = config.rewrites {
+            endpoint_builder
+                .with_target_locator(Box::new(RewriteTargetLocator::new(rules.clone())));
+        }
+
+        if let Some(inspector) = self.transport_inspector {
+            endpoint_builder = endpoint_builder.with_transport_inspector(inspector);
+        }
+
+        let endpoint = endpoint_builder.build();
         let dialog_layer = Arc::new(DialogLayer::new(endpoint.inner.clone()));
 
         let stream_engine = self.stream_engine.unwrap_or_default();
