@@ -1,0 +1,22 @@
+FROM ghcr.io/cross-rs/x86_64-unknown-linux-gnu:main
+
+# Install clang, libclang (for bindgen), openssl, and dependencies  
+RUN apt-get update && apt-get install -y \
+    cmake \
+    pkg-config \
+    clang \
+    llvm \
+    libclang-dev \
+    libopus-dev \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Bake environment variables into the image
+ENV LIBCLANG_PATH=/usr/lib/llvm-10/lib
+ENV CC=clang
+ENV CXX=clang++
+
+# Force Static SSL
+ENV OPENSSL_STATIC=1
+ENV OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu
+ENV OPENSSL_INCLUDE_DIR=/usr/include

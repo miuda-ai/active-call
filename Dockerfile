@@ -1,33 +1,5 @@
 # ============================================
-# Stage 1: Build the active-call binary
-# ============================================
-FROM rust:bookworm AS rust-builder
-
-# Install build dependencies
-RUN apt-get update && apt-get install -y \
-    libasound2-dev \
-    libopus-dev \
-    cmake \
-    pkg-config \
-    && rm -rf /var/lib/apt/lists/*
-
-# Create build directory
-WORKDIR /build
-
-# Copy the source code
-COPY Cargo.toml ./
-COPY src ./src
-COPY static ./static
-
-# Build the release binary with cargo caching
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/target \
-    cargo build --release && \
-    mkdir -p /build/bin && \
-    cp /build/target/release/active-call /build/bin/
-
-# ============================================
-# Stage 2: Create the runtime image
+# Runtime Image (Packaging only - No Compilation)
 # ============================================
 FROM debian:bookworm-slim
 
@@ -56,9 +28,11 @@ RUN groupadd -r activeuser && useradd -r -g activeuser activeuser
 WORKDIR /app
 RUN mkdir -p /app/config/mediacache /app/config/cdr /app/config/recorders /app/static
 
-# Copy built binary and static files
-COPY --from=rust-builder /build/bin/active-call /app/active-call
-COPY --from=rust-builder /build/static /app/static
+# Automatically pick the correct binary based on the architecture being built
+# We expect binaries to be placed in bin/amd64/ and bin/arm64/ by the build script
+ARG TARGETARCH
+COPY bin/${TARGETARCH}/active-call /app/active-call
+COPY ./static /app/static
 
 # Set ownership
 RUN chown -R activeuser:activeuser /app
@@ -67,15 +41,12 @@ RUN chown -R activeuser:activeuser /app
 USER activeuser
 
 # Expose ports
-# - HTTP API port
 EXPOSE 8080
-# - SIP UDP port (default)
 EXPOSE 13050/udp
-# - RTP port range (customize based on rtp_start_port/rtp_end_port in config)
 EXPOSE 20000-30000/udp
 
 # Default entrypoint
 ENTRYPOINT ["/app/active-call"]
 
-# Default command (can be overridden)
+# Default command
 CMD ["--conf", "/app/config.toml"]

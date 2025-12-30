@@ -55,6 +55,9 @@ sha2 = "0.10.9"
 serde_yaml = "0.9.33"
 regex = "1.12.2"
 
+# Workaround for cross-compilation - generate bindings at compile time
+aws-lc-rs = { version = "1", features = ["bindgen"] }
+
 [dev-dependencies]
 tempfile = "3.23.0"
 warp = "0.4.2"
