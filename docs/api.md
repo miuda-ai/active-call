@@ -665,7 +665,7 @@ The `CallOption` object is used in `invite` and `accept` commands and contains t
     "outputSampleRate": 16000,
     "packetSize": 2560
   },
-  "handshakeTimeout": "30s",
+  "handshakeTimeout": 30,
   "enableIpv6": false,
   "inactivityTimeout": 50,
   "sip": {
@@ -743,7 +743,7 @@ The `CallOption` object is used in `invite` and `accept` commands and contains t
   - `inputSampleRate` (number): Sample rate of audio received from WebSocket server
   - `outputSampleRate` (number): Sample rate of audio sent to WebSocket server
   - `packetSize` (number, optional): Packet size sent to WebSocket server in bytes (default: 2560)
-- `handshakeTimeout` (string, optional): Timeout for connection handshake (e.g., "30s")
+- `handshakeTimeout` (number, optional): Timeout for connection handshake in seconds (e.g., 30)
 - `enableIpv6` (boolean, optional): Enable IPv6 support for networking
 - `inactivityTimeout` (number, optional): Timeout for audio inactivity in seconds
 - `sip` (SipOption, optional): SIP protocol configuration

@@ -47,7 +47,8 @@ pub struct CallOption {
     pub asr: Option<TranscriptionOption>,
     pub tts: Option<SynthesisOption>,
     pub media_pass: Option<MediaPassOption>,
-    pub handshake_timeout: Option<String>,
+    // handshake timeout in seconds
+    pub handshake_timeout: Option<u64>,
     pub enable_ipv6: Option<bool>,
     pub inactivity_timeout: Option<u64>, // inactivity timeout in seconds
     pub sip: Option<SipOption>,

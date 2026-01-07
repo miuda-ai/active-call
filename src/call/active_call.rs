@@ -1491,12 +1491,7 @@ impl ActiveCall {
             webrtc_track = webrtc_track.with_external_ip(external_ip.clone());
         }
 
-        let timeout = option
-            .handshake_timeout
-            .as_ref()
-            .map(|d| d.parse::<u64>().map(|d| Duration::from_secs(d)).ok())
-            .flatten();
-
+        let timeout = option.handshake_timeout.map(|t| Duration::from_secs(t));
         let offer = match option.enable_ipv6 {
             Some(false) | None => {
                 strip_ipv6_candidates(option.offer.as_ref().unwrap_or(&"".to_string()))
@@ -1686,11 +1681,7 @@ impl ActiveCall {
             _ => offer.clone(),
         };
 
-        let timeout = option
-            .handshake_timeout
-            .as_ref()
-            .map(|d| d.parse::<u64>().map(|d| Duration::from_secs(d)).ok())
-            .flatten();
+        let timeout = option.handshake_timeout.map(|t| Duration::from_secs(t));
 
         let mut media_track = if Self::is_webrtc_sdp(&offer) {
             let mut rtp_track =
