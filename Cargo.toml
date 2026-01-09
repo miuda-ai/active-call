@@ -77,7 +77,6 @@ url = "2.5.8"
 unic-emoji = "0.9.0"
 realfft = "3.3"
 rmp3 = "0.3"
-ndarray = "0.17.1"
 tempfile = "3.24.0"
 # Workaround for cross-compilation - generate bindings at compile time
 aws-lc-rs = { version = "1", features = ["bindgen"] }

@@ -1,6 +1,7 @@
 use super::{VADOption, VadEngine};
 use crate::media::{AudioFrame, Samples};
 use anyhow::Result;
+use once_cell::sync::Lazy;
 use realfft::{RealFftPlanner, RealToComplex};
 use std::sync::Arc;
 
@@ -10,387 +11,60 @@ const HIDDEN_SIZE: usize = 128;
 const STFT_WINDOW_SIZE: usize = 256;
 const STFT_STRIDE: usize = 128;
 
-#[inline(always)]
-fn dot_product_128(w: &[f32], x: &[f32]) -> f32 {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        if is_x86_feature_detected!("fma") {
-            return unsafe { super::simd::dot_product_fma(w, x) };
-        } else if is_x86_feature_detected!("avx") {
-            return unsafe { super::simd::dot_product_avx(w, x) };
-        }
+static SIGMOID_TABLE: Lazy<[f32; 1024]> = Lazy::new(|| {
+    let mut table = [0.0; 1024];
+    for i in 0..1024 {
+        let x = -8.0 + (i as f32) * (16.0 / 1023.0);
+        table[i] = 1.0 / (1.0 + (-x).exp());
     }
+    table
+});
 
-    #[cfg(target_arch = "aarch64")]
-    {
-        return unsafe { super::simd::dot_product_neon(w, x) };
+static TANH_TABLE: Lazy<[f32; 1024]> = Lazy::new(|| {
+    let mut table = [0.0; 1024];
+    for i in 0..1024 {
+        let x = -5.0 + (i as f32) * (10.0 / 1023.0);
+        table[i] = x.tanh();
     }
-
-    #[allow(unreachable_code)]
-    let mut sum = 0.0;
-    // Unroll 8 times for better pipelining
-    for k in 0..16 {
-        let base = k * 8;
-        sum += w[base] * x[base]
-            + w[base + 1] * x[base + 1]
-            + w[base + 2] * x[base + 2]
-            + w[base + 3] * x[base + 3]
-            + w[base + 4] * x[base + 4]
-            + w[base + 5] * x[base + 5]
-            + w[base + 6] * x[base + 6]
-            + w[base + 7] * x[base + 7];
-    }
-    sum
-}
+    table
+});
 
 #[inline(always)]
-fn dot_product_256(w: &[f32], x: &[f32]) -> f32 {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        if is_x86_feature_detected!("fma") {
-            return unsafe { super::simd::dot_product_fma(w, x) };
-        } else if is_x86_feature_detected!("avx") {
-            return unsafe { super::simd::dot_product_avx(w, x) };
-        }
+fn fast_sigmoid(x: f32) -> f32 {
+    if x <= -8.0 {
+        return 0.0;
     }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        return unsafe { super::simd::dot_product_neon(w, x) };
+    if x >= 8.0 {
+        return 1.0;
     }
-
-    #[allow(unreachable_code)]
-    let mut sum = 0.0;
-    // Unroll 8 times
-    for k in 0..32 {
-        let base = k * 8;
-        sum += w[base] * x[base]
-            + w[base + 1] * x[base + 1]
-            + w[base + 2] * x[base + 2]
-            + w[base + 3] * x[base + 3]
-            + w[base + 4] * x[base + 4]
-            + w[base + 5] * x[base + 5]
-            + w[base + 6] * x[base + 6]
-            + w[base + 7] * x[base + 7];
-    }
-    sum
+    let idx = (x + 8.0) * (1023.0 / 16.0);
+    let i = idx as usize;
+    let frac = idx - i as f32;
+    let table = &*SIGMOID_TABLE;
+    table[i] * (1.0 - frac) + table[i + 1] * frac
 }
 
-struct Conv1dLayer {
-    weights: Vec<f32>,      // [out_c, in_c, k]
-    bias: Option<Vec<f32>>, // [out_c]
-    in_channels: usize,
-    out_channels: usize,
-    kernel_size: usize,
-    stride: usize,
-    padding: usize,
-    dilation: usize,
+#[inline(always)]
+fn fast_tanh(x: f32) -> f32 {
+    if x <= -5.0 {
+        return -1.0;
+    }
+    if x >= 5.0 {
+        return 1.0;
+    }
+    let idx = (x + 5.0) * (1023.0 / 10.0);
+    let i = idx as usize;
+    let frac = idx - i as f32;
+    let table = &*TANH_TABLE;
+    table[i] * (1.0 - frac) + table[i + 1] * frac
 }
 
-impl Conv1dLayer {
-    fn new(
-        in_channels: usize,
-        out_channels: usize,
-        kernel_size: usize,
-        stride: usize,
-        padding: usize,
-    ) -> Self {
-        Self {
-            weights: vec![],
-            bias: None,
-            in_channels,
-            out_channels,
-            kernel_size,
-            stride,
-            padding,
-            dilation: 1,
-        }
-    }
+static SILERO_MODEL: Lazy<Arc<SileroModel>> = Lazy::new(|| {
+    let model = SileroModel::new().expect("Failed to load Silero model");
+    Arc::new(model)
+});
 
-    fn load_weights(&mut self, w: Vec<f32>) {
-        assert_eq!(
-            w.len(),
-            self.out_channels * self.in_channels * self.kernel_size
-        );
-        self.weights = w;
-    }
-
-    fn load_bias(&mut self, b: Vec<f32>) {
-        assert_eq!(b.len(), self.out_channels);
-        self.bias = Some(b);
-    }
-
-    fn forward(&self, input: &[f32], input_len: usize, output: &mut [f32]) {
-        if self.weights.is_empty() {
-            panic!(
-                "Conv1dLayer weights not loaded! in_channels={}, out_channels={}",
-                self.in_channels, self.out_channels
-            );
-        }
-        let output_len =
-            (input_len + 2 * self.padding - self.dilation * (self.kernel_size - 1) - 1)
-                / self.stride
-                + 1;
-
-        // Initialize output with bias
-        if let Some(bias) = &self.bias {
-            for oc in 0..self.out_channels {
-                let b = bias[oc];
-                let start = oc * output_len;
-                let end = start + output_len;
-                output[start..end].fill(b);
-            }
-        } else {
-            output.fill(0.0);
-        }
-
-        // Optimization for STFT (Large Kernel, No Padding, Stride > 1)
-        if self.padding == 0 && self.kernel_size > 16 {
-            // oc -> t -> ic -> k
-            // Since padding is 0, we can skip bounds checks
-            for oc in 0..self.out_channels {
-                let w_oc_offset = oc * self.in_channels * self.kernel_size;
-                let out_idx_base = oc * output_len;
-
-                for t in 0..output_len {
-                    let t_stride = t * self.stride;
-                    let mut sum = 0.0;
-
-                    for ic in 0..self.in_channels {
-                        let in_offset = ic * input_len + t_stride;
-                        let w_ic_offset = w_oc_offset + ic * self.kernel_size;
-
-                        // Vectorization friendly loop
-                        let input_slice = &input[in_offset..in_offset + self.kernel_size];
-                        let weight_slice =
-                            &self.weights[w_ic_offset..w_ic_offset + self.kernel_size];
-
-                        if self.kernel_size == 256 {
-                            sum += dot_product_256(weight_slice, input_slice);
-                        } else {
-                            sum += super::simd::dot_product(weight_slice, input_slice);
-                        }
-                    }
-                    output[out_idx_base + t] += sum;
-                }
-            }
-            return;
-        }
-
-        // Optimization for Enc0 (k=3, s=1, p=1, input_len=3)
-        if self.kernel_size == 3 && self.stride == 1 && self.padding == 1 && input_len == 3 {
-            for oc in 0..self.out_channels {
-                let w_oc_offset = oc * self.in_channels * 3;
-                let out_idx_base = oc * 3; // output_len is 3
-
-                let mut sum0 = 0.0;
-                let mut sum1 = 0.0;
-                let mut sum2 = 0.0;
-
-                if let Some(bias) = &self.bias {
-                    let b = bias[oc];
-                    sum0 = b;
-                    sum1 = b;
-                    sum2 = b;
-                }
-
-                for ic in 0..self.in_channels {
-                    let in_offset = ic * 3;
-                    let w_offset = w_oc_offset + ic * 3;
-
-                    // Load 3 inputs and 3 weights
-                    // Using get_unchecked for speed if we are sure
-                    let x0 = unsafe { *input.get_unchecked(in_offset) };
-                    let x1 = unsafe { *input.get_unchecked(in_offset + 1) };
-                    let x2 = unsafe { *input.get_unchecked(in_offset + 2) };
-
-                    let w0 = unsafe { *self.weights.get_unchecked(w_offset) };
-                    let w1 = unsafe { *self.weights.get_unchecked(w_offset + 1) };
-                    let w2 = unsafe { *self.weights.get_unchecked(w_offset + 2) };
-
-                    sum0 += w1 * x0 + w2 * x1;
-                    sum1 += w0 * x0 + w1 * x1 + w2 * x2;
-                    sum2 += w0 * x1 + w1 * x2;
-                }
-
-                // ReLU
-                output[out_idx_base] = if sum0 > 0.0 { sum0 } else { 0.0 };
-                output[out_idx_base + 1] = if sum1 > 0.0 { sum1 } else { 0.0 };
-                output[out_idx_base + 2] = if sum2 > 0.0 { sum2 } else { 0.0 };
-            }
-            return;
-        }
-
-        // Optimization for Enc1 (k=3, s=2, p=1, input_len=3) -> output_len=2
-        if self.kernel_size == 3 && self.stride == 2 && self.padding == 1 && input_len == 3 {
-            for oc in 0..self.out_channels {
-                let w_oc_offset = oc * self.in_channels * 3;
-                let out_idx_base = oc * 2;
-
-                let mut sum0 = 0.0;
-                let mut sum1 = 0.0;
-
-                if let Some(bias) = &self.bias {
-                    let b = bias[oc];
-                    sum0 = b;
-                    sum1 = b;
-                }
-
-                for ic in 0..self.in_channels {
-                    let in_offset = ic * 3;
-                    let w_offset = w_oc_offset + ic * 3;
-
-                    let x0 = unsafe { *input.get_unchecked(in_offset) };
-                    let x1 = unsafe { *input.get_unchecked(in_offset + 1) };
-                    let x2 = unsafe { *input.get_unchecked(in_offset + 2) };
-
-                    let w0 = unsafe { *self.weights.get_unchecked(w_offset) };
-                    let w1 = unsafe { *self.weights.get_unchecked(w_offset + 1) };
-                    let w2 = unsafe { *self.weights.get_unchecked(w_offset + 2) };
-
-                    // t=0: w[1]*x[0] + w[2]*x[1]
-                    sum0 += w1 * x0 + w2 * x1;
-                    // t=1: w[0]*x[1] + w[1]*x[2]
-                    sum1 += w0 * x1 + w1 * x2;
-                }
-
-                output[out_idx_base] = if sum0 > 0.0 { sum0 } else { 0.0 };
-                output[out_idx_base + 1] = if sum1 > 0.0 { sum1 } else { 0.0 };
-            }
-            return;
-        }
-
-        // Optimization for Enc2 (k=3, s=2, p=1, input_len=2) -> output_len=1
-        if self.kernel_size == 3 && self.stride == 2 && self.padding == 1 && input_len == 2 {
-            for oc in 0..self.out_channels {
-                let w_oc_offset = oc * self.in_channels * 3;
-                let out_idx_base = oc; // output_len is 1
-
-                let mut sum0 = 0.0;
-
-                if let Some(bias) = &self.bias {
-                    sum0 = bias[oc];
-                }
-
-                for ic in 0..self.in_channels {
-                    let in_offset = ic * 2;
-                    let w_offset = w_oc_offset + ic * 3;
-
-                    let x0 = unsafe { *input.get_unchecked(in_offset) };
-                    let x1 = unsafe { *input.get_unchecked(in_offset + 1) };
-
-                    let w1 = unsafe { *self.weights.get_unchecked(w_offset + 1) };
-                    let w2 = unsafe { *self.weights.get_unchecked(w_offset + 2) };
-
-                    // t=0: w[1]*x[0] + w[2]*x[1]
-                    sum0 += w1 * x0 + w2 * x1;
-                }
-
-                output[out_idx_base] = if sum0 > 0.0 { sum0 } else { 0.0 };
-            }
-            return;
-        }
-
-        // Optimization for Enc3 (k=3, s=1, p=1, input_len=1) -> output_len=1
-        if self.kernel_size == 3 && self.stride == 1 && self.padding == 1 && input_len == 1 {
-            for oc in 0..self.out_channels {
-                let w_oc_offset = oc * self.in_channels * 3;
-                let out_idx_base = oc;
-
-                let mut sum0 = 0.0;
-
-                if let Some(bias) = &self.bias {
-                    sum0 = bias[oc];
-                }
-
-                for ic in 0..self.in_channels {
-                    let in_offset = ic; // input_len is 1
-                    let w_offset = w_oc_offset + ic * 3;
-
-                    let x0 = unsafe { *input.get_unchecked(in_offset) };
-                    let w1 = unsafe { *self.weights.get_unchecked(w_offset + 1) };
-
-                    // t=0: w[1]*x[0]
-                    sum0 += w1 * x0;
-                }
-
-                output[out_idx_base] = if sum0 > 0.0 { sum0 } else { 0.0 };
-            }
-            return;
-        }
-
-        // Optimization for Encoder (Small Kernel k=3, Padding=1)
-        if self.kernel_size == 3 {
-            for oc in 0..self.out_channels {
-                let w_oc_offset = oc * self.in_channels * 3;
-                let out_idx_base = oc * output_len;
-
-                for ic in 0..self.in_channels {
-                    let in_offset = ic * input_len;
-                    let w_ic_offset = w_oc_offset + ic * 3;
-
-                    let w0 = self.weights[w_ic_offset];
-                    let w1 = self.weights[w_ic_offset + 1];
-                    let w2 = self.weights[w_ic_offset + 2];
-
-                    for t in 0..output_len {
-                        let t_stride = t * self.stride;
-                        let input_t0 = (t_stride) as isize - self.padding as isize;
-                        let input_t1 = (t_stride + 1) as isize - self.padding as isize;
-                        let input_t2 = (t_stride + 2) as isize - self.padding as isize;
-
-                        let mut val = 0.0;
-                        if input_t0 >= 0 && input_t0 < input_len as isize {
-                            val += input[in_offset + input_t0 as usize] * w0;
-                        }
-                        if input_t1 >= 0 && input_t1 < input_len as isize {
-                            val += input[in_offset + input_t1 as usize] * w1;
-                        }
-                        if input_t2 >= 0 && input_t2 < input_len as isize {
-                            val += input[in_offset + input_t2 as usize] * w2;
-                        }
-                        output[out_idx_base + t] += val;
-                    }
-                }
-            }
-        } else {
-            // Fallback generic
-            for oc in 0..self.out_channels {
-                let w_oc_offset = oc * self.in_channels * self.kernel_size;
-                let out_idx_base = oc * output_len;
-
-                for t in 0..output_len {
-                    let mut sum = 0.0;
-                    let t_stride = t * self.stride;
-
-                    for ic in 0..self.in_channels {
-                        let in_offset = ic * input_len;
-                        let w_ic_offset = w_oc_offset + ic * self.kernel_size;
-
-                        for k in 0..self.kernel_size {
-                            let input_t = (t_stride + k) as isize - self.padding as isize;
-
-                            if input_t >= 0 && input_t < input_len as isize {
-                                let val = input[in_offset + input_t as usize];
-                                let w = self.weights[w_ic_offset + k];
-                                sum += w * val;
-                            }
-                        }
-                    }
-                    output[out_idx_base + t] += sum;
-                }
-            }
-        }
-
-        for x in output.iter_mut() {
-            if *x < 0.0 {
-                *x = 0.0;
-            }
-        }
-    }
-}
-
-pub struct TinySilero {
+pub struct SileroModel {
     fft: Arc<dyn RealToComplex<f32>>,
     window: Vec<f32>,
 
@@ -405,87 +79,33 @@ pub struct TinySilero {
     lstm_b_hh: Vec<f32>,
 
     out_layer: Conv1dLayer,
-
-    // State: h, c. Shape [2, 1, 128] -> We flatten to [2, 128]
-    h: Vec<Vec<f32>>,
-    c: Vec<Vec<f32>>,
-
-    // Buffers
-    // buf_stft_out: Vec<f32>, // Removed
-    buf_fft_input: Vec<f32>,
-    buf_fft_output: Vec<realfft::num_complex::Complex<f32>>,
-    buf_fft_scratch: Vec<realfft::num_complex::Complex<f32>>,
-
-    buf_enc0_out: Vec<f32>, // [128 * 3]
-
-    buf_enc1_out: Vec<f32>, // [64 * 2]
-    buf_enc2_out: Vec<f32>, // [64 * 1]
-    buf_enc3_out: Vec<f32>, // [128 * 1]
-
-    // Temp buffers
-    buf_mag: Vec<f32>,        // [129 * 3]
-    buf_gates: Vec<f32>,      // [4 * HIDDEN_SIZE]
-    buf_lstm_input: Vec<f32>, // [HIDDEN_SIZE]
-    buf_chunk_f32: Vec<f32>,  // [CHUNK_SIZE]
-
-    config: VADOption,
-    buffer: Vec<i16>,
-    current_timestamp: u64,
-    processed_samples: u64,
-    initialized_timestamp: bool,
 }
 
-impl TinySilero {
-    pub fn new(config: VADOption) -> Result<Self> {
+impl SileroModel {
+    pub fn new() -> Result<Self> {
         let mut planner = RealFftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(STFT_WINDOW_SIZE);
-        let fft_scratch_len = fft.get_scratch_len();
-        let fft_output_len = STFT_WINDOW_SIZE / 2 + 1;
 
         let window = super::utils::generate_hann_window(STFT_WINDOW_SIZE, true);
 
-        let mut vad = Self {
+        let mut model = Self {
             fft,
             window,
 
-            enc0: Conv1dLayer::new(129, 128, 3, 1, 1),
-            enc1: Conv1dLayer::new(128, 64, 3, 2, 1),
-            enc2: Conv1dLayer::new(64, 64, 3, 2, 1),
-            enc3: Conv1dLayer::new(64, 128, 3, 1, 1),
+            enc0: Conv1dLayer::new(129, 128, 3, 1, 1, true),
+            enc1: Conv1dLayer::new(128, 64, 3, 2, 1, true),
+            enc2: Conv1dLayer::new(64, 64, 3, 2, 1, true),
+            enc3: Conv1dLayer::new(64, 128, 3, 1, 1, true),
             lstm_w_ih: vec![],
             lstm_w_hh: vec![],
             lstm_b_ih: vec![],
             lstm_b_hh: vec![],
-            out_layer: Conv1dLayer::new(128, 1, 1, 1, 0), // 1x1 conv
-
-            h: vec![vec![0.0; HIDDEN_SIZE]; 2],
-            c: vec![vec![0.0; HIDDEN_SIZE]; 2],
-
-            // buf_stft_out: vec![0.0; 258 * 3],
-            buf_fft_input: vec![0.0; STFT_WINDOW_SIZE],
-            buf_fft_output: vec![realfft::num_complex::Complex::new(0.0, 0.0); fft_output_len],
-            buf_fft_scratch: vec![realfft::num_complex::Complex::new(0.0, 0.0); fft_scratch_len],
-
-            buf_enc0_out: vec![0.0; 128 * 3],
-            buf_enc1_out: vec![0.0; 64 * 2],
-            buf_enc2_out: vec![0.0; 64 * 1],
-            buf_enc3_out: vec![0.0; 128 * 1],
-
-            buf_mag: vec![0.0; 129 * 3],
-            buf_gates: vec![0.0; 4 * HIDDEN_SIZE],
-            buf_lstm_input: vec![0.0; HIDDEN_SIZE],
-            buf_chunk_f32: vec![0.0; CHUNK_SIZE],
-
-            config,
-            buffer: Vec::with_capacity(CHUNK_SIZE),
-            current_timestamp: 0,
-            processed_samples: 0,
-            initialized_timestamp: false,
+            out_layer: Conv1dLayer::new(128, 1, 1, 1, 0, false), // 1x1 conv
         };
 
-        vad.load_weights()?;
+        model.load_weights()?;
 
-        Ok(vad)
+        Ok(model)
     }
 
     pub fn load_weights(&mut self) -> Result<()> {
@@ -512,8 +132,6 @@ impl TinySilero {
             let name = std::str::from_utf8(name_bytes)?.to_string();
             offset += name_len;
 
-            // println!("Loading tensor: {}", name);
-
             let shape_len = read_u32(&mut offset, buffer) as usize;
             let mut shape = Vec::new();
             for _ in 0..shape_len {
@@ -529,11 +147,7 @@ impl TinySilero {
             offset += data_len;
 
             // Assign weights
-            // println!("Loading tensor: {}", name);
-            if name == "stft_weight" {
-                // self.stft.load_weights(data_f32);
-                // Ignored, using FFT
-            } else if name == "enc0_weight" {
+            if name == "enc0_weight" {
                 self.enc0.load_weights(data_f32);
             } else if name == "enc0_bias" {
                 self.enc0.load_bias(data_f32);
@@ -550,9 +164,25 @@ impl TinySilero {
             } else if name == "enc3_bias" {
                 self.enc3.load_bias(data_f32);
             } else if name == "lstm_w_ih" {
-                self.lstm_w_ih = data_f32;
+                // Transform from [4*H, H] to [H, 4*H]
+                let mut transformed = vec![0.0; data_f32.len()];
+                let h = HIDDEN_SIZE;
+                for i in 0..4 * h {
+                    for j in 0..h {
+                        transformed[j * 4 * h + i] = data_f32[i * h + j];
+                    }
+                }
+                self.lstm_w_ih = transformed;
             } else if name == "lstm_w_hh" {
-                self.lstm_w_hh = data_f32;
+                // Transform from [4*H, H] to [H, 4*H]
+                let mut transformed = vec![0.0; data_f32.len()];
+                let h = HIDDEN_SIZE;
+                for i in 0..4 * h {
+                    for j in 0..h {
+                        transformed[j * 4 * h + i] = data_f32[i * h + j];
+                    }
+                }
+                self.lstm_w_hh = transformed;
             } else if name == "lstm_b_ih" {
                 self.lstm_b_ih = data_f32;
             } else if name == "lstm_b_hh" {
@@ -561,99 +191,309 @@ impl TinySilero {
                 self.out_layer.load_weights(data_f32);
             } else if name == "out_bias" {
                 self.out_layer.load_bias(data_f32);
-            } else {
-                println!(
-                    "WARNING: Ignored tensor: {} (size: {})",
-                    name,
-                    data_f32.len()
-                );
             }
         }
 
         Ok(())
     }
+}
+
+pub struct SileroSession {
+    // State: h, c. Shape [2, 1, 128] -> We flatten to [2, 128]
+    h: Vec<Vec<f32>>,
+    c: Vec<Vec<f32>>,
+
+    // Buffers for forward pass
+    buf_fft_input: Vec<f32>,
+    buf_fft_output: Vec<realfft::num_complex::Complex<f32>>,
+    buf_fft_scratch: Vec<realfft::num_complex::Complex<f32>>,
+
+    buf_enc0_out: Vec<f32>,
+    buf_enc1_out: Vec<f32>,
+    buf_enc2_out: Vec<f32>,
+    buf_enc3_out: Vec<f32>,
+
+    // Temp buffers
+    buf_mag: Vec<f32>,
+    buf_gates: Vec<f32>,
+    buf_lstm_input: Vec<f32>,
+    buf_chunk_f32: Vec<f32>,
+
+    buffer: Vec<i16>,
+    current_timestamp: u64,
+    processed_samples: u64,
+    initialized_timestamp: bool,
+}
+
+impl SileroSession {
+    pub fn new(fft: &dyn RealToComplex<f32>) -> Self {
+        let fft_scratch_len = fft.get_scratch_len();
+        let fft_output_len = STFT_WINDOW_SIZE / 2 + 1;
+
+        Self {
+            h: vec![vec![0.0; HIDDEN_SIZE]; 2],
+            c: vec![vec![0.0; HIDDEN_SIZE]; 2],
+
+            buf_fft_input: vec![0.0; STFT_WINDOW_SIZE],
+            buf_fft_output: vec![realfft::num_complex::Complex::new(0.0, 0.0); fft_output_len],
+            buf_fft_scratch: vec![realfft::num_complex::Complex::new(0.0, 0.0); fft_scratch_len],
+
+            buf_enc0_out: vec![0.0; 128 * 3],
+            buf_enc1_out: vec![0.0; 64 * 2],
+            buf_enc2_out: vec![0.0; 64 * 1],
+            buf_enc3_out: vec![0.0; 128 * 1],
+
+            buf_mag: vec![0.0; 129 * 3],
+            buf_gates: vec![0.0; 4 * HIDDEN_SIZE],
+            buf_lstm_input: vec![0.0; HIDDEN_SIZE],
+            buf_chunk_f32: vec![0.0; CHUNK_SIZE],
+
+            buffer: Vec::with_capacity(CHUNK_SIZE),
+            current_timestamp: 0,
+            processed_samples: 0,
+            initialized_timestamp: false,
+        }
+    }
+}
+
+pub struct TinySilero {
+    config: VADOption,
+    model: Arc<SileroModel>,
+    session: SileroSession,
+}
+
+// removed dot_product definitions as they are no longer used by layout-optimized loops
+
+struct Conv1dLayer {
+    weights: Vec<f32>,      // [in_c, k, out_c]
+    bias: Option<Vec<f32>>, // [out_c]
+    in_channels: usize,
+    out_channels: usize,
+    kernel_size: usize,
+    stride: usize,
+    padding: usize,
+    dilation: usize,
+    relu: bool,
+}
+
+impl Conv1dLayer {
+    fn new(
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+        relu: bool,
+    ) -> Self {
+        Self {
+            weights: vec![],
+            bias: None,
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding,
+            dilation: 1,
+            relu,
+        }
+    }
+
+    fn load_weights(&mut self, w: Vec<f32>) {
+        assert_eq!(
+            w.len(),
+            self.out_channels * self.in_channels * self.kernel_size
+        );
+        // Transform from [OC, IC, K] to [IC, K, OC] for better SIMD (broadcasting OC)
+        let mut transformed = vec![0.0; w.len()];
+        for oc in 0..self.out_channels {
+            for ic in 0..self.in_channels {
+                for k in 0..self.kernel_size {
+                    let old_idx = (oc * self.in_channels + ic) * self.kernel_size + k;
+                    let new_idx = (ic * self.kernel_size + k) * self.out_channels + oc;
+                    transformed[new_idx] = w[old_idx];
+                }
+            }
+        }
+        self.weights = transformed;
+    }
+
+    fn load_bias(&mut self, b: Vec<f32>) {
+        assert_eq!(b.len(), self.out_channels);
+        self.bias = Some(b);
+    }
+
+    fn forward(&self, input: &[f32], input_len: usize, output: &mut [f32]) {
+        if self.weights.is_empty() {
+            panic!(
+                "Conv1dLayer weights not loaded! in_channels={}, out_channels={}",
+                self.in_channels, self.out_channels
+            );
+        }
+        let output_len =
+            (input_len + 2 * self.padding - self.dilation * (self.kernel_size - 1) - 1)
+                / self.stride
+                + 1;
+
+        // Initialize output with bias (Layout: [T, OC])
+        if let Some(bias) = &self.bias {
+            for t in 0..output_len {
+                let start = t * self.out_channels;
+                output[start..start + self.out_channels].copy_from_slice(bias);
+            }
+        } else {
+            output.fill(0.0);
+        }
+
+        // Weight Layout: [IC, K, OC]
+        // Input Layout: [T, IC]
+        // Output Layout: [T, OC]
+        for t in 0..output_len {
+            let t_stride = t * self.stride;
+            let out_start = t * self.out_channels;
+
+            for ic in 0..self.in_channels {
+                let in_ic_base = ic; // Input is [T, IC]
+                let weight_ic_base = ic * self.kernel_size * self.out_channels;
+
+                for k in 0..self.kernel_size {
+                    let input_t = (t_stride + k) as isize - self.padding as isize;
+
+                    if input_t >= 0 && input_t < input_len as isize {
+                        let x = input[input_t as usize * self.in_channels + in_ic_base];
+                        if x == 0.0 {
+                            continue;
+                        }
+
+                        let w_start = weight_ic_base + k * self.out_channels;
+                        let weight_slice = &self.weights[w_start..w_start + self.out_channels];
+                        let out_slice = &mut output[out_start..out_start + self.out_channels];
+
+                        super::simd::vec_fma(out_slice, weight_slice, x);
+                    }
+                }
+            }
+        }
+
+        if self.relu {
+            for x in output.iter_mut() {
+                if *x < 0.0 {
+                    *x = 0.0;
+                }
+            }
+        }
+    }
+}
+
+impl TinySilero {
+    pub fn new(config: VADOption) -> Result<Self> {
+        let model = Arc::clone(&SILERO_MODEL);
+        let session = SileroSession::new(model.fft.as_ref());
+
+        Ok(Self {
+            config,
+            model,
+            session,
+        })
+    }
 
     pub fn predict(&mut self, audio: &[f32]) -> f32 {
+        let model = &self.model;
+        let session = &mut self.session;
+
         for t in 0..3 {
             let start = t * STFT_STRIDE;
             // Copy and Window
             for i in 0..STFT_WINDOW_SIZE {
-                self.buf_fft_input[i] = audio[start + i] * self.window[i];
+                session.buf_fft_input[i] = audio[start + i] * model.window[i];
             }
 
             // FFT
-            self.fft
+            model
+                .fft
                 .process_with_scratch(
-                    &mut self.buf_fft_input,
-                    &mut self.buf_fft_output,
-                    &mut self.buf_fft_scratch,
+                    &mut session.buf_fft_input,
+                    &mut session.buf_fft_output,
+                    &mut session.buf_fft_scratch,
                 )
                 .unwrap();
 
             for i in 0..129 {
-                let complex = self.buf_fft_output[i];
+                let complex = session.buf_fft_output[i];
                 let mag = complex.norm(); // sqrt(re^2 + im^2)
-                self.buf_mag[i * 3 + t] = mag;
+                session.buf_mag[t * 129 + i] = mag;
             }
         }
 
-        self.enc0.forward(&self.buf_mag, 3, &mut self.buf_enc0_out);
-        self.enc1
-            .forward(&self.buf_enc0_out, 3, &mut self.buf_enc1_out);
-        self.enc2
-            .forward(&self.buf_enc1_out, 2, &mut self.buf_enc2_out);
-        self.enc3
-            .forward(&self.buf_enc2_out, 1, &mut self.buf_enc3_out);
-        self.buf_lstm_input.copy_from_slice(&self.buf_enc3_out);
-        let (w_ih, w_hh, b_ih, b_hh) = (
-            &self.lstm_w_ih,
-            &self.lstm_w_hh,
-            &self.lstm_b_ih,
-            &self.lstm_b_hh,
-        );
+        model
+            .enc0
+            .forward(&session.buf_mag, 3, &mut session.buf_enc0_out);
+        model
+            .enc1
+            .forward(&session.buf_enc0_out, 3, &mut session.buf_enc1_out);
+        model
+            .enc2
+            .forward(&session.buf_enc1_out, 2, &mut session.buf_enc2_out);
+        model
+            .enc3
+            .forward(&session.buf_enc2_out, 1, &mut session.buf_enc3_out);
+        session
+            .buf_lstm_input
+            .copy_from_slice(&session.buf_enc3_out);
+        let (b_ih, b_hh) = (&model.lstm_b_ih, &model.lstm_b_hh);
 
-        self.buf_gates.fill(0.0);
-        for i in 0..4 * HIDDEN_SIZE {
-            let sum = b_ih[i]
-                + dot_product_128(
-                    &w_ih[i * HIDDEN_SIZE..(i + 1) * HIDDEN_SIZE],
-                    &self.buf_lstm_input,
-                );
-            self.buf_gates[i] = sum;
+        session.buf_gates.copy_from_slice(b_ih);
+        // Add b_hh
+        for (g, &b) in session.buf_gates.iter_mut().zip(b_hh.iter()) {
+            *g += b;
         }
 
-        // W_hh * h + b_hh
-        for i in 0..4 * HIDDEN_SIZE {
-            let sum = b_hh[i]
-                + dot_product_128(&w_hh[i * HIDDEN_SIZE..(i + 1) * HIDDEN_SIZE], &self.h[0]);
-            self.buf_gates[i] += sum;
+        // Apply W_ih (Layout: [H, 4*H]) - Broadcasting input x
+        for j in 0..HIDDEN_SIZE {
+            let x = session.buf_lstm_input[j];
+            if x == 0.0 {
+                continue;
+            }
+            let w_start = j * 4 * HIDDEN_SIZE;
+            let weight_slice = &model.lstm_w_ih[w_start..w_start + 4 * HIDDEN_SIZE];
+            super::simd::vec_fma(&mut session.buf_gates, weight_slice, x);
+        }
+
+        // Apply W_hh (Layout: [H, 4*H]) - Broadcasting hidden state h
+        for j in 0..HIDDEN_SIZE {
+            let h_val = session.h[0][j];
+            if h_val == 0.0 {
+                continue;
+            }
+            let w_start = j * 4 * HIDDEN_SIZE;
+            let weight_slice = &model.lstm_w_hh[w_start..w_start + 4 * HIDDEN_SIZE];
+            super::simd::vec_fma(&mut session.buf_gates, weight_slice, h_val);
         }
 
         let chunk = HIDDEN_SIZE;
         for j in 0..HIDDEN_SIZE {
             // IFCO order
-            let i_gate = crate::media::vad::utils::sigmoid(self.buf_gates[0 * chunk + j]);
-            let f_gate = crate::media::vad::utils::sigmoid(self.buf_gates[1 * chunk + j]);
-            let g_gate = crate::media::vad::utils::tanh(self.buf_gates[2 * chunk + j]); // Cell
-            let o_gate = crate::media::vad::utils::sigmoid(self.buf_gates[3 * chunk + j]);
+            let i_gate = fast_sigmoid(session.buf_gates[0 * chunk + j]);
+            let f_gate = fast_sigmoid(session.buf_gates[1 * chunk + j]);
+            let g_gate = fast_tanh(session.buf_gates[2 * chunk + j]); // Cell
+            let o_gate = fast_sigmoid(session.buf_gates[3 * chunk + j]);
 
-            let c_new = f_gate * self.c[0][j] + i_gate * g_gate;
-            let h_val = o_gate * crate::media::vad::utils::tanh(c_new);
+            let c_new = f_gate * session.c[0][j] + i_gate * g_gate;
+            let h_val = o_gate * fast_tanh(c_new);
 
-            self.c[0][j] = c_new;
-            self.h[0][j] = h_val;
+            session.c[0][j] = c_new;
+            session.h[0][j] = h_val;
         }
 
-        let w = &self.out_layer.weights; // [1, 128, 1] -> [128]
-        let b = self.out_layer.bias.as_ref().unwrap()[0];
+        let w = &model.out_layer.weights; // [128, 1, 1] -> flat 128
+        let b = model.out_layer.bias.as_ref().unwrap()[0];
 
         let mut sum = b;
         for j in 0..HIDDEN_SIZE {
-            let val = self.h[0][j];
+            let val = session.h[0][j];
             let val_relu = if val > 0.0 { val } else { 0.0 };
             sum += w[j] * val_relu;
         }
-        let out = crate::media::vad::utils::sigmoid(sum);
+        let out = fast_sigmoid(sum);
 
         out
     }
@@ -666,41 +506,41 @@ impl VadEngine for TinySilero {
             _ => return vec![(false, frame.timestamp)],
         };
 
-        if !self.initialized_timestamp {
-            self.current_timestamp = frame.timestamp;
-            self.initialized_timestamp = true;
+        if !self.session.initialized_timestamp {
+            self.session.current_timestamp = frame.timestamp;
+            self.session.initialized_timestamp = true;
         }
 
-        self.buffer.extend_from_slice(samples);
+        self.session.buffer.extend_from_slice(samples);
 
         let mut results = Vec::new();
 
-        while self.buffer.len() >= CHUNK_SIZE {
+        while self.session.buffer.len() >= CHUNK_SIZE {
             // Swap out buffer to satisfy borrow checker
-            let mut chunk_f32 = std::mem::take(&mut self.buf_chunk_f32);
+            let mut chunk_f32 = std::mem::take(&mut self.session.buf_chunk_f32);
             // Ensure capacity/length (should be preserved across calls)
             if chunk_f32.len() != CHUNK_SIZE {
                 chunk_f32.resize(CHUNK_SIZE, 0.0);
             }
 
             // Convert to f32 without allocation
-            for (i, sample) in self.buffer.iter().take(CHUNK_SIZE).enumerate() {
+            for (i, sample) in self.session.buffer.iter().take(CHUNK_SIZE).enumerate() {
                 chunk_f32[i] = *sample as f32 / 32768.0;
             }
 
             // Remove processed samples
-            self.buffer.drain(..CHUNK_SIZE);
+            self.session.buffer.drain(..CHUNK_SIZE);
 
             let score = self.predict(&chunk_f32);
 
             // Restore buffer
-            self.buf_chunk_f32 = chunk_f32;
+            self.session.buf_chunk_f32 = chunk_f32;
 
             let is_voice = score > self.config.voice_threshold;
 
-            let chunk_timestamp = self.current_timestamp
-                + (self.processed_samples * 1000) / (frame.sample_rate as u64);
-            self.processed_samples += CHUNK_SIZE as u64;
+            let chunk_timestamp = self.session.current_timestamp
+                + (self.session.processed_samples * 1000) / (frame.sample_rate as u64);
+            self.session.processed_samples += CHUNK_SIZE as u64;
 
             results.push((is_voice, chunk_timestamp));
         }

@@ -119,17 +119,12 @@ async fn test_vad_speech_intervals() {
 
     println!("Testing VAD detection on specific intervals...");
 
-    for vad_type in [VadType::Silero, VadType::Ten] {
+    for vad_type in [VadType::Silero] {
         println!("Testing VAD type: {:?}", vad_type);
         let (event_sender, mut event_receiver) = broadcast::channel(128);
         let mut option = VADOption::default();
         option.r#type = vad_type.clone();
-        // Adjust threshold for Ten to match Silero's sensitivity on this file
-        option.voice_threshold = if matches!(vad_type, VadType::Ten) {
-            0.5
-        } else {
-            0.5
-        };
+        option.voice_threshold = 0.5;
 
         option.speech_padding = 100;
         option.silence_padding = 100;

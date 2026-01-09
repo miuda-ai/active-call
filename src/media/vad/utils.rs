@@ -12,13 +12,3 @@ pub fn generate_hann_window(size: usize, periodic: bool) -> Vec<f32> {
     }
     window
 }
-
-#[inline(always)]
-pub fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
-}
-
-#[inline(always)]
-pub fn tanh(x: f32) -> f32 {
-    x.tanh()
-}

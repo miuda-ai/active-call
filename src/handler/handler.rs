@@ -26,13 +26,18 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 pub fn call_router() -> Router<AppState> {
-    Router::new()
+    let r = Router::new()
         .route("/call", get(ws_handler))
         .route("/call/webrtc", get(webrtc_handler))
         .route("/call/sip", get(sip_handler))
-        .route("/iceservers", get(get_iceservers))
         .route("/list", get(list_active_calls))
-        .route("/kill/{id}", get(kill_active_call))
+        .route("/kill/{id}", get(kill_active_call));
+    r
+}
+
+pub fn iceservers_router() -> Router<AppState> {
+    let r = Router::new();
+    r.route("/iceservers", get(get_iceservers))
 }
 
 pub fn playbook_router() -> Router<AppState> {

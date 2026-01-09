@@ -10,10 +10,8 @@ use tokio_util::sync::CancellationToken;
 
 pub(crate) mod simd;
 pub mod tiny_silero;
-pub mod tiny_ten;
 pub(crate) mod utils;
 pub use tiny_silero::TinySilero;
-pub use tiny_ten::TinyTen;
 
 #[cfg(test)]
 mod benchmark_all;
@@ -46,8 +44,7 @@ impl Default for VADOption {
         Self {
             r#type: VadType::Silero,
             samplerate: 16000,
-            // Python defaults: min_speech_duration_ms=250, min_silence_duration_ms=100, speech_pad_ms=30
-            speech_padding: 250,  // min_speech_duration_ms
+            speech_padding: 200,  // min_speech_duration_ms
             silence_padding: 100, // min_silence_duration_ms
             ratio: 0.5,
             voice_threshold: 0.5,
@@ -64,7 +61,6 @@ impl Default for VADOption {
 #[serde(rename_all = "lowercase")]
 pub enum VadType {
     Silero,
-    Ten,
     Other(String),
 }
 
@@ -76,7 +72,6 @@ impl<'de> Deserialize<'de> for VadType {
         let value = String::deserialize(deserializer)?;
         match value.as_str() {
             "silero" => Ok(VadType::Silero),
-            "ten" => Ok(VadType::Ten),
             _ => Ok(VadType::Other(value)),
         }
     }
@@ -86,7 +81,6 @@ impl std::fmt::Display for VadType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             VadType::Silero => write!(f, "silero"),
-            VadType::Ten => write!(f, "ten"),
             VadType::Other(provider) => write!(f, "{}", provider),
         }
     }
@@ -98,7 +92,6 @@ impl TryFrom<&String> for VadType {
     fn try_from(value: &String) -> std::result::Result<Self, Self::Error> {
         match value.as_str() {
             "silero" => Ok(VadType::Silero),
-            "ten" => Ok(VadType::Ten),
             other => Ok(VadType::Other(other.to_string())),
         }
     }
@@ -250,7 +243,6 @@ impl VadProcessor {
     ) -> Result<Box<dyn Processor>> {
         let vad: Box<dyn VadEngine> = match option.r#type {
             VadType::Silero => Box::new(tiny_silero::TinySilero::new(option.clone())?),
-            VadType::Ten => Box::new(tiny_ten::TinyTen::new(option.clone())?),
             _ => Box::new(NopVad::new()?),
         };
         Ok(Box::new(VadProcessor::new(vad, event_sender, option)?))

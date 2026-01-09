@@ -712,7 +712,7 @@ The `CallOption` object is used in `invite` and `accept` commands and contains t
   - `extra` (object, optional): Additional provider-specific parameters
   - `startWhenAnswer` (boolean, optional): Start ASR when call is answered
 - `vad` (VADOption, optional): Voice Activity Detection configuration
-  - `type` (string): VAD algorithm type ("webrtc", "tencent")
+  - `type` (string): VAD algorithm type ("silero")
   - `samplerate` (number): Audio sample rate for VAD processing (default: 16000)
   - `speechPadding` (number): Padding before speech detection in milliseconds (default: 250)
   - `silencePadding` (number): Padding after silence detection in milliseconds (default: 100)

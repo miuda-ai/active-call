@@ -7,6 +7,7 @@ use audio_codec::samples_to_bytes;
 use clap::Parser;
 use std::fs::File;
 use std::io::Write;
+use std::time::Instant;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -21,7 +22,7 @@ struct Args {
     #[arg(short, long)]
     output: Option<String>,
 
-    /// VAD type: silero or ten
+    /// VAD type: silero
     #[arg(short, long, default_value = "silero")]
     vad: String,
 
@@ -30,7 +31,7 @@ struct Args {
     threshold: f32,
 
     /// Speech padding (ms)
-    #[arg(long, default_value_t = 300)]
+    #[arg(long, default_value_t = 200)]
     speech_pad: u64,
 
     /// Silence padding (ms)
@@ -44,30 +45,22 @@ async fn main() -> Result<()> {
 
     println!("Processing file: {}", args.input);
     let (all_samples, sample_rate) = active_call::media::track::file::read_wav_file(&args.input)?;
+    let audio_duration_secs = all_samples.len() as f64 / sample_rate as f64;
     println!(
         "Sample rate: {}, Total samples: {}, Duration: {:.2}s",
         sample_rate,
         all_samples.len(),
-        all_samples.len() as f64 / sample_rate as f64
+        audio_duration_secs
     );
 
     let nr = NoiseReducer::new(sample_rate as usize);
     let (event_sender, mut event_receiver) = broadcast::channel(128);
 
     let mut option = VADOption::default();
-    option.r#type = if args.vad.to_lowercase() == "ten" {
-        VadType::Ten
-    } else {
-        VadType::Silero
-    };
+    option.r#type = VadType::Silero;
     option.voice_threshold = args.threshold;
     option.speech_padding = args.speech_pad;
     option.silence_padding = args.silence_pad;
-    option.r#type = if args.vad == "ten" {
-        VadType::Ten
-    } else {
-        VadType::Silero
-    };
 
     println!("VAD Config: {:?}", option);
 
@@ -84,8 +77,11 @@ async fn main() -> Result<()> {
     let _chunk_duration_ms = (frame_size as u64 * 1000) / sample_rate as u64;
 
     let mut processed_samples_count = 0;
+    let mut chunk_count = 0;
+    let start = Instant::now();
 
     for chunk in all_samples.chunks(frame_size) {
+        chunk_count += 1;
         let mut chunk_vec = chunk.to_vec();
         if chunk_vec.len() < frame_size {
             chunk_vec.resize(frame_size, 0);
@@ -126,6 +122,9 @@ async fn main() -> Result<()> {
         vad.process_frame(&mut frame)?;
     }
 
+    let duration = start.elapsed();
+    let rtf = duration.as_secs_f64() / audio_duration_secs;
+
     // Process events
     println!("\nDetected Speech Segments:");
     use active_call::event::SessionEvent;
@@ -151,7 +150,15 @@ async fn main() -> Result<()> {
             _ => {}
         }
     }
-    println!("Total segments: {}", segment_count);
+    println!("\nTotal segments: {}", segment_count);
+
+    let frame_duration_ms = (frame_size as f32 * 1000.0) / sample_rate as f32;
+    let ms_per_frame = duration.as_secs_f32() * 1000.0 / chunk_count as f32;
+
+    println!(
+        "RTF for {}: {:.4} (processed {} chunks), {:.2}ms per {:.0}ms frame",
+        args.input, rtf, chunk_count, ms_per_frame, frame_duration_ms
+    );
 
     Ok(())
 }

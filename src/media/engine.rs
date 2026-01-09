@@ -76,7 +76,6 @@ impl Default for StreamEngine {
     fn default() -> Self {
         let mut engine = Self::new();
         engine.register_vad(VadType::Silero, VadProcessor::create);
-        engine.register_vad(VadType::Ten, VadProcessor::create);
         engine.register_vad(VadType::Other("nop".to_string()), VadProcessor::create_nop);
 
         engine.register_asr(
@@ -310,13 +309,12 @@ impl StreamEngine {
             }
             match option.inactivity_timeout {
                 Some(timeout_secs) if timeout_secs > 0 => {
-                    let inactivity_processor =
-                        crate::media::inactivity::InactivityProcessor::new(
-                            track_id.clone(),
-                            std::time::Duration::from_secs(timeout_secs),
-                            event_sender.clone(),
-                            cancel_token.child_token(),
-                        );
+                    let inactivity_processor = crate::media::inactivity::InactivityProcessor::new(
+                        track_id.clone(),
+                        std::time::Duration::from_secs(timeout_secs),
+                        event_sender.clone(),
+                        cancel_token.child_token(),
+                    );
                     processors.push(Box::new(inactivity_processor) as Box<dyn Processor>);
                 }
                 _ => {}
