@@ -1,6 +1,6 @@
 [package]
 name = "active-call"
-version = "0.3.19"
+version = "0.3.20"
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 description = "A SIP/WebRTC voice agent"
@@ -17,8 +17,8 @@ not_vad = []
 
 [dependencies]
 opusic-sys = { version = "0.5.8", optional = true }
-audio-codec = { version = "0.3.29", features = ["opus"] }
-rustrtc = "0.2.34"
+audio-codec = { version = "0.3.30", features = ["opus"] }
+rustrtc = "0.2.35"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.148"
 anyhow = "1"

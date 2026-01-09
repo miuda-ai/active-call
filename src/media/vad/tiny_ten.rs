@@ -1,5 +1,5 @@
 use super::{VADOption, VadEngine};
-use crate::media::{AudioFrame, PcmBuf, Samples};
+use crate::media::{AudioFrame, Samples};
 use anyhow::Result;
 use realfft::{RealFftPlanner, RealToComplex};
 use std::sync::Arc;
@@ -106,7 +106,6 @@ const FEATURE_STDS: [f32; FEATURE_LEN] = [
 ];
 
 pub struct TenFeatureExtractor {
-    pre_emphasis_prev: f32,
     mel_filters: ndarray::Array2<f32>,
     mel_filter_ranges: Vec<(usize, usize)>,
     window: Vec<f32>,
@@ -139,7 +138,6 @@ impl TenFeatureExtractor {
         let inv_stds: Vec<f32> = FEATURE_STDS.iter().map(|&std| 1.0 / (std + EPS)).collect();
 
         Self {
-            pre_emphasis_prev: 0.0,
             mel_filters,
             mel_filter_ranges,
             window,
@@ -208,39 +206,14 @@ impl TenFeatureExtractor {
         (mel_filters, ranges)
     }
 
-    fn pre_emphasis(prev_state: &mut f32, audio_frame: &[i16], output: &mut [f32]) {
-        if !audio_frame.is_empty() {
-            let inv_scale = 1.0 / 32768.0;
-            let first_sample = audio_frame[0] as f32;
-            output[0] = (first_sample - PRE_EMPHASIS_COEFF * *prev_state) * inv_scale;
-
-            // Use windows(2) to iterate over pairs (prev, curr)
-            // This avoids bounds checks and allows better vectorization
-            for (out, samples) in output[1..].iter_mut().zip(audio_frame.windows(2)) {
-                let prev = samples[0] as f32;
-                let curr = samples[1] as f32;
-                *out = (curr - PRE_EMPHASIS_COEFF * prev) * inv_scale;
-            }
-
-            if !audio_frame.is_empty() {
-                // Store unscaled last sample for next frame
-                *prev_state = audio_frame[audio_frame.len() - 1] as f32;
-            }
-        }
-    }
-
-    pub fn extract_features(&mut self, audio_frame: &[i16]) -> ndarray::Array1<f32> {
+    pub fn extract_features(&mut self, audio_frame: &[f32]) -> ndarray::Array1<f32> {
         // Prepare FFT input buffer
         // 1. Clear buffer
         self.fft_input.fill(0.0);
 
-        // 2. Pre-emphasis directly into fft_input
+        // 2. Use provided pre-emphasized audio
         let copy_len = audio_frame.len().min(WINDOW_SIZE);
-        Self::pre_emphasis(
-            &mut self.pre_emphasis_prev,
-            audio_frame,
-            &mut self.fft_input[..copy_len],
-        );
+        self.fft_input[..copy_len].copy_from_slice(audio_frame);
 
         // 3. Windowing
         for (i, sample) in self.fft_input.iter_mut().enumerate().take(copy_len) {
@@ -258,7 +231,7 @@ impl TenFeatureExtractor {
 
         // 5. Power spectrum
         let n_bins = FFT_SIZE / 2 + 1;
-        let scale = 1.0 / (32768.0 * 32768.0);
+        let scale = 1.0 / FFT_SIZE as f32;
 
         // Compute power spectrum once
         // Use iterators to avoid bounds checks
@@ -879,9 +852,11 @@ impl LstmLayer {
 
 pub struct TinyTen {
     config: VADOption,
-    buffer: PcmBuf,
-    last_timestamp: u64,
-    chunk_size: usize,
+    buffer: Vec<f32>, // Store pre-emphasized f32 samples
+    pre_emphasis_prev: f32,
+    current_timestamp: u64,
+    processed_samples: u64,
+    initialized_timestamp: bool,
 
     feature_extractor: TenFeatureExtractor,
     feature_buffer: ndarray::Array2<f32>,
@@ -987,9 +962,11 @@ impl TinyTen {
 
         let mut vad = Self {
             config,
-            buffer: Vec::new(),
-            chunk_size: HOP_SIZE,
-            last_timestamp: 0,
+            buffer: Vec::with_capacity(768),
+            pre_emphasis_prev: 0.0,
+            current_timestamp: 0,
+            processed_samples: 0,
+            initialized_timestamp: false,
             feature_extractor,
             feature_buffer,
             conv1_dw,
@@ -1024,9 +1001,9 @@ impl TinyTen {
         Ok(vad)
     }
 
-    pub fn predict(&mut self, samples: &[i16]) -> f32 {
+    pub fn predict(&mut self, audio_frame: &[f32]) -> f32 {
         // 1. Extract features
-        let features = self.feature_extractor.extract_features(samples);
+        let features = self.feature_extractor.extract_features(audio_frame);
 
         // 2. Update context window
         for i in 0..CONTEXT_WINDOW_LEN - 1 {
@@ -1235,31 +1212,47 @@ impl TinyTen {
 }
 
 impl VadEngine for TinyTen {
-    fn process(&mut self, frame: &mut AudioFrame) -> Option<(bool, u64)> {
+    fn process(&mut self, frame: &mut AudioFrame) -> Vec<(bool, u64)> {
         let samples = match &frame.samples {
             Samples::PCM { samples } => samples,
-            _ => return Some((false, frame.timestamp)),
+            _ => return vec![(false, frame.timestamp)],
         };
 
-        self.buffer.extend_from_slice(samples);
-
-        if self.buffer.len() >= self.chunk_size {
-            let chunk: Vec<i16> = self.buffer.drain(..self.chunk_size).collect();
-            let score = self.predict(&chunk);
-
-            let is_voice = score > self.config.voice_threshold;
-            let chunk_duration_ms = (self.chunk_size as u64 * 1000) / (frame.sample_rate as u64);
-
-            if self.last_timestamp == 0 {
-                self.last_timestamp = frame.timestamp;
-            }
-
-            let chunk_timestamp = self.last_timestamp;
-            self.last_timestamp += chunk_duration_ms;
-
-            return Some((is_voice, chunk_timestamp));
+        if !self.initialized_timestamp {
+            self.current_timestamp = frame.timestamp;
+            self.initialized_timestamp = true;
+            // Pre-pad with zeros for the initial context
+            // librosa center=True pads n_fft/2 (512).
+            // 512 context makes the first chunk start at the end of the window.
+            self.buffer.resize(512, 0.0);
         }
 
-        None
+        // Apply pre-emphasis once to NEW samples and push to buffer
+        let inv_scale = 1.0 / 32768.0;
+        for &sample in samples {
+            let s_f32 = sample as f32;
+            let pre_emphasized = (s_f32 - PRE_EMPHASIS_COEFF * self.pre_emphasis_prev) * inv_scale;
+            self.buffer.push(pre_emphasized);
+            self.pre_emphasis_prev = s_f32;
+        }
+
+        let mut results = Vec::new();
+
+        while self.buffer.len() >= WINDOW_SIZE {
+            // Predict uses the full window but we only drain the hop size
+            let window = self.buffer[..WINDOW_SIZE].to_vec();
+            let score = self.predict(&window);
+
+            let is_voice = score > self.config.voice_threshold;
+
+            let chunk_timestamp =
+                self.current_timestamp + (self.processed_samples * 1000) / (SAMPLE_RATE as u64);
+            self.processed_samples += HOP_SIZE as u64;
+
+            results.push((is_voice, chunk_timestamp));
+            self.buffer.drain(..HOP_SIZE);
+        }
+
+        results
     }
 }

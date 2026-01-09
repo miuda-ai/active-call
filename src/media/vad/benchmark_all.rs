@@ -52,7 +52,7 @@ mod tests {
         let start = Instant::now();
         let mut count = 0;
         // TinyVad usually consumes chunks of specific size, let's use 512 (32ms) as input
-        for chunk in samples_i16.chunks(chunk_size) {
+        for chunk in samples_f32.chunks(chunk_size) {
             if chunk.len() == chunk_size {
                 ten_tiny.predict(chunk);
                 count += 1;

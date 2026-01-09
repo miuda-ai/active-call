@@ -6,8 +6,9 @@ use crate::{
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use futures::stream::{FuturesUnordered, StreamExt};
+use object_store::PutPayload;
 use object_store::{
-    ObjectStore, ObjectStoreExt, PutPayload, aws::AmazonS3Builder, azure::MicrosoftAzureBuilder,
+    ObjectStore, ObjectStoreExt, aws::AmazonS3Builder, azure::MicrosoftAzureBuilder,
     gcp::GoogleCloudStorageBuilder, path::Path as ObjectPath,
 };
 use reqwest;

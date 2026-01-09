@@ -124,7 +124,7 @@ unsafe impl Send for VadProcessor {}
 unsafe impl Sync for VadProcessor {}
 
 pub trait VadEngine: Send + Sync + Any {
-    fn process(&mut self, frame: &mut AudioFrame) -> Option<(bool, u64)>;
+    fn process(&mut self, frame: &mut AudioFrame) -> Vec<(bool, u64)>;
 }
 
 impl VadProcessorInner {
@@ -134,11 +134,14 @@ impl VadProcessorInner {
             _ => return Ok(()),
         };
 
-        let samples = samples.to_owned();
-        let result = self.vad.process(frame);
-        if let Some((is_speaking, timestamp)) = result {
+        let samples_cloned = samples.to_owned();
+        let results = self.vad.process(frame);
+        for (is_speaking, timestamp) in results {
             if is_speaking || self.triggered {
-                let current_buf = SpeechBuf { samples, timestamp };
+                let current_buf = SpeechBuf {
+                    samples: samples_cloned.clone(),
+                    timestamp,
+                };
                 self.window_bufs.push(current_buf);
             }
             self.process_vad_logic(is_speaking, timestamp, &frame.track_id)?;
@@ -299,13 +302,13 @@ impl NopVad {
 }
 
 impl VadEngine for NopVad {
-    fn process(&mut self, frame: &mut AudioFrame) -> Option<(bool, u64)> {
+    fn process(&mut self, frame: &mut AudioFrame) -> Vec<(bool, u64)> {
         let samples = match &frame.samples {
             Samples::PCM { samples } => samples,
-            _ => return Some((false, frame.timestamp)),
+            _ => return vec![(false, frame.timestamp)],
         };
         // Check if there are any non-zero samples
         let has_speech = samples.iter().any(|&x| x != 0);
-        Some((has_speech, frame.timestamp))
+        vec![(has_speech, frame.timestamp)]
     }
 }

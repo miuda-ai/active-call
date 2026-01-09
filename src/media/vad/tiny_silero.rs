@@ -464,7 +464,9 @@ pub struct TinySilero {
 
     config: VADOption,
     buffer: Vec<i16>,
-    last_timestamp: u64,
+    current_timestamp: u64,
+    processed_samples: u64,
+    initialized_timestamp: bool,
 }
 
 impl TinySilero {
@@ -514,7 +516,9 @@ impl TinySilero {
 
             config,
             buffer: Vec::with_capacity(CHUNK_SIZE),
-            last_timestamp: 0,
+            current_timestamp: 0,
+            processed_samples: 0,
+            initialized_timestamp: false,
         };
 
         vad.load_weights()?;
@@ -739,15 +743,22 @@ impl TinySilero {
 }
 
 impl VadEngine for TinySilero {
-    fn process(&mut self, frame: &mut AudioFrame) -> Option<(bool, u64)> {
+    fn process(&mut self, frame: &mut AudioFrame) -> Vec<(bool, u64)> {
         let samples = match &frame.samples {
             Samples::PCM { samples } => samples,
-            _ => return Some((false, frame.timestamp)),
+            _ => return vec![(false, frame.timestamp)],
         };
+
+        if !self.initialized_timestamp {
+            self.current_timestamp = frame.timestamp;
+            self.initialized_timestamp = true;
+        }
 
         self.buffer.extend_from_slice(samples);
 
-        if self.buffer.len() >= CHUNK_SIZE {
+        let mut results = Vec::new();
+
+        while self.buffer.len() >= CHUNK_SIZE {
             // Swap out buffer to satisfy borrow checker
             let mut chunk_f32 = std::mem::take(&mut self.buf_chunk_f32);
             // Ensure capacity/length (should be preserved across calls)
@@ -769,19 +780,15 @@ impl VadEngine for TinySilero {
             self.buf_chunk_f32 = chunk_f32;
 
             let is_voice = score > self.config.voice_threshold;
-            let chunk_duration_ms = (CHUNK_SIZE as u64 * 1000) / (frame.sample_rate as u64);
 
-            if self.last_timestamp == 0 {
-                self.last_timestamp = frame.timestamp;
-            }
+            let chunk_timestamp = self.current_timestamp
+                + (self.processed_samples * 1000) / (frame.sample_rate as u64);
+            self.processed_samples += CHUNK_SIZE as u64;
 
-            let chunk_timestamp = self.last_timestamp;
-            self.last_timestamp += chunk_duration_ms;
-
-            return Some((is_voice, chunk_timestamp));
+            results.push((is_voice, chunk_timestamp));
         }
 
-        None
+        results
     }
 }
 

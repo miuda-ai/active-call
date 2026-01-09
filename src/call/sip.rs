@@ -249,6 +249,14 @@ impl DialogStateReceiverGuard {
                 }
                 DialogState::Updated(dialog_id, _req, tx_handle) => {
                     info!(session_id = states.session_id, %dialog_id, "dialog update received");
+                    if let Some(sdp_body) = _req.body().get(..) {
+                        let sdp_str = String::from_utf8_lossy(sdp_body);
+                        info!(session_id=states.session_id, %dialog_id, "updating remote description:\n{}", sdp_str);
+                        states
+                            .media_stream
+                            .update_remote_description(&states.track_id, &sdp_str.to_string())
+                            .await?;
+                    }
                     tx_handle.reply(rsip::StatusCode::OK).await.ok();
                 }
                 DialogState::Options(dialog_id, _req, tx_handle) => {
