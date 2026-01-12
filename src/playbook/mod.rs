@@ -67,13 +67,18 @@ impl Playbook {
         let mut config: PlaybookConfig = serde_yaml::from_str(yaml_str)?;
         if let Some(llm) = config.llm.as_mut() {
             if llm.api_key.is_none() {
-                if let Ok(key) = std::env::var("LLM_API_KEY") {
+                if let Ok(key) = std::env::var("OPENAI_API_KEY") {
                     llm.api_key = Some(key);
                 }
             }
             if llm.base_url.is_none() {
-                if let Ok(url) = std::env::var("LLM_BASE_URL") {
+                if let Ok(url) = std::env::var("OPENAI_BASE_URL") {
                     llm.base_url = Some(url);
+                }
+            }
+            if llm.model.is_none() {
+                if let Ok(model) = std::env::var("OPENAI_MODEL") {
+                    llm.model = Some(model);
                 }
             }
             llm.prompt = Some(prompt);

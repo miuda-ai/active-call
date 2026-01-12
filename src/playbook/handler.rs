@@ -14,8 +14,7 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 static RE_HANGUP: Lazy<Regex> = Lazy::new(|| Regex::new(r"<hangup\s*/>").unwrap());
-static RE_REFER: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"<refer\s+to="([^"]+)"\s*/>"#).unwrap());
+static RE_REFER: Lazy<Regex> = Lazy::new(|| Regex::new(r#"<refer\s+to="([^"]+)"\s*/>"#).unwrap());
 static RE_SENTENCE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?m)[.!?。！？\n]\s*").unwrap());
 
 use super::InterruptionStrategy;
@@ -58,11 +57,11 @@ impl LlmProvider for DefaultLlmProvider {
         let mut url = config
             .base_url
             .clone()
-            .unwrap_or_else(|| "https://api.openai.com/v1/chat/completions".to_string());
+            .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
         let model = config
             .model
             .clone()
-            .unwrap_or_else(|| "gpt-3.5-turbo".to_string());
+            .unwrap_or_else(|| "gpt-4-turbo".to_string());
         let api_key = config.api_key.clone().unwrap_or_default();
 
         if !url.ends_with("/chat/completions") {
@@ -103,11 +102,11 @@ impl LlmProvider for DefaultLlmProvider {
         let mut url = config
             .base_url
             .clone()
-            .unwrap_or_else(|| "https://api.openai.com/v1/chat/completions".to_string());
+            .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
         let model = config
             .model
             .clone()
-            .unwrap_or_else(|| "gpt-3.5-turbo".to_string());
+            .unwrap_or_else(|| "gpt-4-turbo".to_string());
         let api_key = config.api_key.clone().unwrap_or_default();
 
         if !url.ends_with("/chat/completions") {
@@ -328,7 +327,10 @@ impl LlmHandler {
         );
 
         let play_id = uuid::Uuid::new_v4().to_string();
-        let mut stream = self.provider.call_stream(&self.config, &self.history).await?;
+        let mut stream = self
+            .provider
+            .call_stream(&self.config, &self.history)
+            .await?;
 
         let mut full_content = String::new();
         let mut buffer = String::new();
