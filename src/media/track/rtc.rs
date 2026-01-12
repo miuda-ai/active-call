@@ -105,12 +105,12 @@ impl RtcTrack {
         (Arc::new(source), track)
     }
 
-    pub fn local_description(&self) -> Result<String> {
+    pub async fn local_description(&self) -> Result<String> {
         let pc = self
             .peer_connection
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No PeerConnection"))?;
-        let offer = pc.create_offer()?;
+        let offer = pc.create_offer().await?;
         pc.set_local_description(offer.clone())?;
         Ok(offer.to_sdp_string())
     }
@@ -140,14 +140,7 @@ impl RtcTrack {
                     CodecType::PCMU => AudioCapability::pcmu(),
                     CodecType::PCMA => AudioCapability::pcma(),
                     CodecType::G722 => AudioCapability::g722(),
-                    CodecType::G729 => AudioCapability {
-                        payload_type: codec.payload_type(),
-                        codec_name: "G729".to_string(),
-                        clock_rate: codec.clock_rate(),
-                        channels: codec.channels() as u8,
-                        fmtp: codec.fmtp().map(Into::into),
-                        rtcp_fbs: vec![],
-                    },
+                    CodecType::G729 => AudioCapability::g729(),
                     CodecType::TelephoneEvent => AudioCapability::telephone_event(),
                     #[cfg(feature = "opus")]
                     CodecType::Opus => AudioCapability::opus(),
@@ -439,7 +432,7 @@ impl Track for RtcTrack {
 
         self.parse_sdp_payload_types(rustrtc::SdpType::Offer, &offer)?;
 
-        let answer = pc.create_answer()?;
+        let answer = pc.create_answer().await?;
         pc.set_local_description(answer.clone())?;
 
         if self.rtc_config.mode != TransportMode::Rtp {

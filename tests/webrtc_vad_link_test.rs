@@ -80,7 +80,7 @@ async fn test_webrtc_vad_link() -> Result<()> {
     pc.add_track(track, params).expect("Failed to add track");
 
     // Create offer
-    let offer = pc.create_offer()?;
+    let offer = pc.create_offer().await?;
     pc.set_local_description(offer.clone())?;
 
     // 4. Send Invite command with VAD enabled

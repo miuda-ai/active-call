@@ -1526,6 +1526,7 @@ impl ActiveCall {
         let offer = Some(
             rtp_track
                 .local_description()
+                .await
                 .map_err(|e| rsipstack::Error::Error(e.to_string()))?,
         );
 
