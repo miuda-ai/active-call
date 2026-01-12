@@ -18,7 +18,8 @@ not_vad = []
 [dependencies]
 opusic-sys = { version = "0.5.8", optional = true }
 audio-codec = { version = "0.3.30", features = ["opus"] }
-rustrtc = "0.3.0"
+rustrtc = "0.3.1"
+#rustrtc = { path = "../rustrtc" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.148"
 anyhow = "1"

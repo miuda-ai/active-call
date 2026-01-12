@@ -30,17 +30,7 @@ pub fn parse_rtpmap(rtpmap: &str) -> Result<(u8, CodecType, u32, u16), anyhow::E
         let codec_parts: Vec<&str> = codec_spec.split('/').collect();
 
         if let [codec_name, clock_rate_str, channel_count @ ..] = codec_parts.as_slice() {
-            let codec_type = match codec_name.to_lowercase().as_str() {
-                "pcmu" => CodecType::PCMU,
-                "pcma" => CodecType::PCMA,
-                "g722" => CodecType::G722,
-                "g729" => CodecType::G729,
-                #[cfg(feature = "opus")]
-                "opus" => CodecType::Opus,
-                "telephone-event" => CodecType::TelephoneEvent,
-                _ => return Err(anyhow::anyhow!("Unsupported codec name: {}", codec_name)),
-            };
-
+            let codec_type = CodecType::try_from(*codec_name)?;
             let clock_rate = clock_rate_str
                 .parse::<u32>()
                 .map_err(|e| anyhow::anyhow!("Failed to parse clock rate: {}", e))?;

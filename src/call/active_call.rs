@@ -488,16 +488,18 @@ impl ActiveCall {
 
     fn build_record_option(&self, option: &CallOption) -> Option<RecorderOption> {
         if let Some(recorder_option) = &option.recorder {
-            let recorder_file = if recorder_option.recorder_file.is_empty() {
+            let mut recorder_file = recorder_option.recorder_file.clone();
+            if recorder_file.contains("{id}") {
+                recorder_file = recorder_file.replace("{id}", &self.session_id);
+            }
+
+            let recorder_file = if recorder_file.is_empty() {
                 self.app_state.get_recorder_file(&self.session_id)
             } else {
-                let p = Path::new(&recorder_option.recorder_file);
+                let p = Path::new(&recorder_file);
                 p.is_absolute()
-                    .then(|| recorder_option.recorder_file.clone())
-                    .unwrap_or_else(|| {
-                        self.app_state
-                            .get_recorder_file(&recorder_option.recorder_file)
-                    })
+                    .then(|| recorder_file.clone())
+                    .unwrap_or_else(|| self.app_state.get_recorder_file(&recorder_file))
             };
             info!(
                 session_id = self.session_id,

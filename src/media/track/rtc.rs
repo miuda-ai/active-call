@@ -339,20 +339,28 @@ impl RtcTrack {
     ) {
         let packet_sender = packet_sender.lock().await;
         if let Some(sender) = packet_sender.as_ref() {
+            let payload_type = frame
+                .payload_type
+                .unwrap_or_else(|| default_payload_type.load(std::sync::atomic::Ordering::SeqCst));
+            let src_codec = match CodecType::try_from(payload_type) {
+                Ok(c) => c,
+                Err(_) => {
+                    debug!(track_id=%track_id, "Unknown payload type {}, skipping frame", payload_type);
+                    return;
+                }
+            };
+
             let mut af = AudioFrame {
                 track_id: track_id.clone(),
                 samples: crate::media::Samples::RTP {
-                    payload_type: frame.payload_type.unwrap_or_else(|| {
-                        default_payload_type.load(std::sync::atomic::Ordering::SeqCst)
-                    }),
+                    payload_type,
                     payload: frame.data.to_vec(),
                     sequence_number: frame.sequence_number.unwrap_or(0),
                 },
                 timestamp: crate::media::get_timestamp(),
-                sample_rate: frame.sample_rate,
-                channels: frame.channels as u16,
+                sample_rate: src_codec.samplerate(),
+                channels: src_codec.channels(),
             };
-
             if let Err(e) = processor_chain.process_frame(&mut af) {
                 debug!(track_id=%track_id, "processor_chain process_frame error: {:?}", e);
             }
@@ -361,7 +369,7 @@ impl RtcTrack {
         }
     }
 
-    pub fn parse_sdp_payload_types(&self, sdp_type: SdpType, sdp_str: &str) -> Result<()> {
+    pub fn parse_sdp_payload_types(&mut self, sdp_type: SdpType, sdp_str: &str) -> Result<()> {
         use crate::media::negotiate::parse_rtpmap;
         let sdp = rustrtc::SessionDescription::parse(sdp_type, sdp_str)?;
 
@@ -375,9 +383,7 @@ impl RtcTrack {
                     if let Some(value) = &attr.value {
                         if let Ok((pt, codec, _, _)) = parse_rtpmap(value) {
                             self.encoder.set_payload_type(pt, codec.clone());
-                            if let Ok(c) = self.processor_chain.codec.lock() {
-                                c.set_payload_type(pt, codec);
-                            }
+                            self.processor_chain.codec.set_payload_type(pt, codec);
                         }
                     }
                 }
@@ -427,7 +433,9 @@ impl Track for RtcTrack {
         info!(track_id=%self.track_id, "rtc handshake start");
         self.create().await?;
 
-        let pc = self.peer_connection.as_ref().unwrap();
+        let pc = self.peer_connection.clone().ok_or_else(|| {
+            anyhow::anyhow!("No PeerConnection available for track {}", self.track_id)
+        })?;
 
         let sdp = rustrtc::SessionDescription::parse(rustrtc::SdpType::Offer, &offer)?;
         pc.set_remote_description(sdp).await?;
@@ -503,17 +511,11 @@ impl Track for RtcTrack {
                 crate::media::Samples::PCM { samples } => {
                     let payload_type = self.get_payload_type();
                     let (_, encoded) = self.encoder.encode(payload_type, packet.clone());
-
+                    let target_codec = CodecType::try_from(payload_type)?;
                     if !encoded.is_empty() {
-                        let target_sample_rate = match payload_type {
-                            0 | 8 | 18 => 8000,
-                            9 => 16000,
-                            111 => 48000,
-                            _ => packet.sample_rate,
-                        };
-                        let target_samples = (samples.len() as u64 * target_sample_rate as u64
-                            / packet.sample_rate as u64)
-                            as u32;
+                        let target_samples =
+                            (samples.len() as u64 * target_codec.samplerate() as u64
+                                / packet.sample_rate as u64) as u32;
                         let sample_count_per_channel =
                             target_samples / self.track_config.channels as u32;
                         let rtp_timestamp = self.next_rtp_timestamp.fetch_add(
@@ -526,9 +528,7 @@ impl Track for RtcTrack {
 
                         let frame = RtcAudioFrame {
                             data: Bytes::from(encoded),
-                            sample_rate: target_sample_rate,
-                            channels: self.track_config.channels as u8,
-                            samples: sample_count_per_channel,
+                            clock_rate: target_codec.clock_rate(),
                             payload_type: Some(payload_type),
                             sequence_number: Some(sequence_number),
                             rtp_timestamp,
@@ -562,9 +562,7 @@ impl Track for RtcTrack {
 
                     let frame = RtcAudioFrame {
                         data: Bytes::from(payload.clone()),
-                        sample_rate: target_sample_rate,
-                        channels: self.track_config.channels as u8,
-                        samples: 0, // Not used for RTP
+                        clock_rate: target_sample_rate,
                         payload_type: Some(*payload_type),
                         sequence_number: Some(sequence_number),
                         rtp_timestamp,
@@ -606,7 +604,7 @@ mod tests {
     fn test_parse_sdp_payload_types() {
         let track_id = "test-track".to_string();
         let cancel_token = CancellationToken::new();
-        let track = RtcTrack::new(
+        let mut track = RtcTrack::new(
             cancel_token,
             track_id,
             TrackConfig::default(),
@@ -623,7 +621,7 @@ mod tests {
         // Case 2: telephone-event at the beginning, should skip it and pick PCMU (0)
         let mut rtc_config = RtcTrackConfig::default();
         rtc_config.preferred_codec = Some(CodecType::PCMU);
-        let track2 = RtcTrack::new(
+        let mut track2 = RtcTrack::new(
             CancellationToken::new(),
             "test-track-2".to_string(),
             TrackConfig::default(),

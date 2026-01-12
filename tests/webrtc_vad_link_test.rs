@@ -139,9 +139,7 @@ async fn test_webrtc_vad_link() -> Result<()> {
 
             let frame = rustrtc::media::frame::AudioFrame {
                 data: bytes::Bytes::from(encoded),
-                sample_rate: 16000,
-                channels: 1,
-                samples: chunk_vec.len() as u32,
+                clock_rate: 16000,
                 payload_type: Some(9),
                 ..Default::default()
             };

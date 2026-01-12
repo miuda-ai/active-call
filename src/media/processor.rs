@@ -49,7 +49,7 @@ impl Samples {
 #[derive(Clone)]
 pub struct ProcessorChain {
     processors: Arc<Mutex<Vec<Box<dyn Processor>>>>,
-    pub codec: Arc<Mutex<TrackCodec>>,
+    pub codec: TrackCodec,
     sample_rate: u32,
     pub force_decode: bool,
 }
@@ -58,7 +58,7 @@ impl ProcessorChain {
     pub fn new(sample_rate: u32) -> Self {
         Self {
             processors: Arc::new(Mutex::new(Vec::new())),
-            codec: Arc::new(Mutex::new(TrackCodec::new())),
+            codec: TrackCodec::new(),
             sample_rate,
             force_decode: true,
         }
@@ -95,12 +95,9 @@ impl ProcessorChain {
         } = &frame.samples
         {
             if TrackCodec::is_audio(*payload_type) {
-                let samples = self.codec.lock().unwrap().decode(
-                    *payload_type,
-                    &payload,
-                    frame.channels,
-                    self.sample_rate,
-                );
+                let samples =
+                    self.codec
+                        .decode(*payload_type, &payload, frame.channels, self.sample_rate);
                 frame.channels = 1; // Since we converted to mono in decode
                 frame.samples = Samples::PCM { samples };
                 frame.sample_rate = self.sample_rate;

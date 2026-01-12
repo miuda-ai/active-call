@@ -255,9 +255,7 @@ async fn test_webrtc_call_workflow() -> Result<()> {
 
             let frame = rustrtc::media::frame::AudioFrame {
                 data: bytes::Bytes::from(data),
-                sample_rate: 48000,
-                channels: 1,
-                samples: 960,
+                clock_rate: 48000,
                 ..Default::default()
             };
             if let Err(e) = source.send_audio(frame).await {

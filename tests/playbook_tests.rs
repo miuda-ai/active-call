@@ -145,3 +145,25 @@ async fn test_aliyun_llm_integration() {
         }
     }
 }
+
+#[tokio::test]
+async fn test_parse_playbook_with_recorder() {
+    let content = r#"---
+recorder:
+  recorderFile: "records/{id}.wav"
+  samplerate: 16000
+---
+Hello
+"#;
+    let path = "test_playbook_recorder.md";
+    fs::write(path, content).unwrap();
+
+    let playbook = Playbook::load(path).await.unwrap();
+    assert_eq!(
+        playbook.config.recorder.as_ref().unwrap().recorder_file,
+        "records/{id}.wav"
+    );
+    assert_eq!(playbook.config.recorder.as_ref().unwrap().samplerate, 16000);
+
+    fs::remove_file(path).unwrap();
+}
