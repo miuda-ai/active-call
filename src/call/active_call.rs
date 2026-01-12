@@ -29,6 +29,7 @@ use crate::{
     useragent::invitation::PendingDialog,
 };
 use anyhow::Result;
+use audio_codec::CodecType;
 use chrono::{DateTime, Utc};
 use rsipstack::dialog::{invitation::InviteOption, server_dialog::ServerInviteDialog};
 use serde::{Deserialize, Serialize};
@@ -1177,7 +1178,29 @@ impl ActiveCall {
     pub async fn create_rtp_track(&self, track_id: TrackId, ssrc: u32) -> Result<RtcTrack> {
         let mut rtc_config = RtcTrackConfig::default();
         rtc_config.mode = rustrtc::TransportMode::Rtp;
-        rtc_config.preferred_codec = Some(self.track_config.codec.clone());
+
+        if let Some(codecs) = &self.app_state.config.codecs {
+            let mut codec_types = Vec::new();
+            for c in codecs {
+                match c.to_lowercase().as_str() {
+                    "pcmu" => codec_types.push(CodecType::PCMU),
+                    "pcma" => codec_types.push(CodecType::PCMA),
+                    "g722" => codec_types.push(CodecType::G722),
+                    "g729" => codec_types.push(CodecType::G729),
+                    "opus" => codec_types.push(CodecType::Opus),
+                    _ => {}
+                }
+            }
+            if !codec_types.is_empty() {
+                rtc_config.preferred_codec = Some(codec_types[0].clone());
+                rtc_config.codecs = codec_types;
+            }
+        }
+
+        if rtc_config.preferred_codec.is_none() {
+            rtc_config.preferred_codec = Some(self.track_config.codec.clone());
+        }
+
         rtc_config.rtp_port_range = self
             .app_state
             .config

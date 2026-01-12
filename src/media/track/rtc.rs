@@ -13,8 +13,9 @@ use audio_codec::CodecType;
 use bytes::Bytes;
 use futures::StreamExt;
 use rustrtc::{
-    IceServer, PeerConnection, PeerConnectionEvent, PeerConnectionState, RtcConfiguration,
-    RtpCodecParameters, TransportMode,
+    AudioCapability, IceServer, PeerConnection, PeerConnectionEvent, PeerConnectionState,
+    RtcConfiguration, RtpCodecParameters, TransportMode,
+    config::MediaCapabilities,
     media::{
         MediaStreamTrack, SampleStreamSource,
         frame::{AudioFrame as RtcAudioFrame, MediaKind},
@@ -34,6 +35,7 @@ pub struct RtcTrackConfig {
     pub local_addr: Option<IpAddr>,
     pub rtp_port_range: Option<(u16, u16)>,
     pub preferred_codec: Option<CodecType>,
+    pub codecs: Vec<CodecType>,
     pub payload_type: Option<u8>,
 }
 
@@ -45,6 +47,7 @@ impl Default for RtcTrackConfig {
             local_addr: None,
             rtp_port_range: None,
             preferred_codec: None,
+            codecs: Vec::new(),
             payload_type: None,
         }
     }
@@ -124,33 +127,46 @@ impl RtcTrack {
 
         if let Some(ice_servers) = &self.rtc_config.ice_servers {
             config.ice_servers = ice_servers.clone();
-        } else if self.rtc_config.mode == TransportMode::WebRtc {
-            // Default STUN for WebRTC mode if not specified
-            config.ice_servers = vec![IceServer {
-                urls: vec!["stun:stun.l.google.com:19302".to_string()],
-                ..Default::default()
-            }];
+        }
+
+        if !self.rtc_config.codecs.is_empty() {
+            let mut caps = MediaCapabilities::default();
+            caps.audio.clear();
+            for codec in &self.rtc_config.codecs {
+                let cap = match codec {
+                    CodecType::PCMU => AudioCapability::pcmu(),
+                    CodecType::PCMA => AudioCapability::pcma(),
+                    CodecType::G722 => AudioCapability::g722(),
+                    CodecType::G729 => AudioCapability {
+                        payload_type: codec.payload_type(),
+                        codec_name: "G729".to_string(),
+                        clock_rate: codec.clock_rate(),
+                        channels: codec.channels() as u8,
+                        fmtp: codec.fmtp().map(Into::into),
+                        rtcp_fbs: vec![],
+                    },
+                    CodecType::TelephoneEvent => AudioCapability::telephone_event(),
+                    #[cfg(feature = "opus")]
+                    CodecType::Opus => AudioCapability::opus(),
+                };
+                caps.audio.push(cap);
+            }
+            config.media_capabilities = Some(caps);
         }
 
         let peer_connection = Arc::new(PeerConnection::new(config));
         self.peer_connection = Some(peer_connection.clone());
 
-        // Setup Local Track
-        // Default to Opus for both RTP and WebRTC to ensure high quality
-        let default_codec = CodecType::Opus;
+        let default_codec = CodecType::G722;
         let codec = self.rtc_config.preferred_codec.unwrap_or(default_codec);
 
         let (source, track) = Self::create_audio_track(codec, Some(self.track_id.clone()));
         self.local_source = Some(source);
 
-        // Calculate payload type
-        let payload_type = self.rtc_config.payload_type.unwrap_or_else(|| match codec {
-            CodecType::PCMU => 0,
-            CodecType::PCMA => 8,
-            CodecType::Opus => 111,
-            CodecType::G722 => 9,
-            _ => 111,
-        });
+        let payload_type = self
+            .rtc_config
+            .payload_type
+            .unwrap_or_else(|| codec.payload_type());
 
         self.payload_type
             .store(payload_type, std::sync::atomic::Ordering::SeqCst);
@@ -354,6 +370,7 @@ impl RtcTrack {
             ("pcma", CodecType::PCMA),
             ("g722", CodecType::G722),
             ("g729", CodecType::G729),
+            ("telephone-event", CodecType::TelephoneEvent),
         ];
 
         for (name, codec_type) in patterns {

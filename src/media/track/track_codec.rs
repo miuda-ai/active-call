@@ -53,6 +53,7 @@ impl TrackCodec {
         payload_type_map.insert(8, CodecType::PCMA);
         payload_type_map.insert(9, CodecType::G722);
         payload_type_map.insert(18, CodecType::G729);
+        payload_type_map.insert(101, CodecType::TelephoneEvent);
         payload_type_map.insert(111, CodecType::Opus);
 
         Self {
