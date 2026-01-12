@@ -1188,6 +1188,9 @@ impl ActiveCall {
                     "g722" => codec_types.push(CodecType::G722),
                     "g729" => codec_types.push(CodecType::G729),
                     "opus" => codec_types.push(CodecType::Opus),
+                    "dtmf" | "2833" | "telephone_event" => {
+                        codec_types.push(CodecType::TelephoneEvent)
+                    }
                     _ => {}
                 }
             }
