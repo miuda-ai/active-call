@@ -53,6 +53,23 @@ fn default_config_rtp_end_port() -> Option<u16> {
     Some(42000)
 }
 
+fn default_codecs() -> Option<Vec<String>> {
+    let mut codecs = vec![
+        "pcmu".to_string(),
+        "pcma".to_string(),
+        "g722".to_string(),
+        "g729".to_string(),
+        "telephone_event".to_string(),
+    ];
+
+    #[cfg(feature = "opus")]
+    {
+        codecs.push("opus".to_string());
+    }
+
+    Some(codecs)
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub struct RecordingPolicy {
@@ -123,6 +140,7 @@ pub struct Config {
     pub graceful_shutdown: Option<bool>,
     pub handler: Option<InviteHandlerConfig>,
     pub accept_timeout: Option<String>,
+    #[serde(default = "default_codecs")]
     pub codecs: Option<Vec<String>>,
     pub external_ip: Option<String>,
     #[serde(default = "default_config_rtp_start_port")]

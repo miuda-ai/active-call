@@ -1200,7 +1200,7 @@ impl ActiveCall {
                 rtc_config.preferred_codec = Some(codec_types[0].clone());
                 rtc_config.codecs = codec_types;
             }
-        }
+        }        
 
         if rtc_config.preferred_codec.is_none() {
             rtc_config.preferred_codec = Some(self.track_config.codec.clone());
@@ -1467,6 +1467,27 @@ impl ActiveCall {
         let mut rtc_config = RtcTrackConfig::default();
         rtc_config.mode = rustrtc::TransportMode::WebRtc; // WebRTC
         rtc_config.ice_servers = self.app_state.config.ice_servers.clone();
+        
+        if let Some(codecs) = &self.app_state.config.codecs {
+            let mut codec_types = Vec::new();
+            for c in codecs {
+                match c.to_lowercase().as_str() {
+                    "pcmu" => codec_types.push(CodecType::PCMU),
+                    "pcma" => codec_types.push(CodecType::PCMA),
+                    "g722" => codec_types.push(CodecType::G722),
+                    "g729" => codec_types.push(CodecType::G729),
+                    "opus" => codec_types.push(CodecType::Opus),
+                    "dtmf" | "2833" | "telephone_event" => {
+                        codec_types.push(CodecType::TelephoneEvent)
+                    }
+                    _ => {}
+                }
+            }
+            if !codec_types.is_empty() {
+                rtc_config.preferred_codec = Some(codec_types[0].clone());
+                rtc_config.codecs = codec_types;
+            }
+        }        
 
         if let Some(ref external_ip) = self.app_state.config.external_ip {
             rtc_config.external_ip = Some(external_ip.clone());
