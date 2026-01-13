@@ -9,7 +9,7 @@ This crate handles the complex low-level details of voice communication, making 
 - **ASR (Automatic Speech Recognition)**: Handling speech-to-text transitions and events.
 - **TTS (Text-to-Speech)**: Managing real-time audio synthesis and playback.
 - **SIP & WebRTC**: Bridging traditional telephony and modern web communication protocols.
-- **Voice Details**: Managing audio buffers, codecs (like Opus), and real-time streaming.
+- **Voice Details**: Managing audio buffers, codecs (PCM, G.711, G.722), and real-time streaming.
 
 By abstracting these technical hurdles, `active-call` allows developers to focus on building intelligent dialogue systems rather than worrying about the underlying voice infrastructure.
 

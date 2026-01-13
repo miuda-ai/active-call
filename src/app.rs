@@ -502,12 +502,7 @@ impl AppStateBuilder {
         }
     }
 
-    pub fn with_config(mut self, mut config: Config) -> Self {
-        if config.ensure_recording_defaults() {
-            warn!(
-                "recorder_format=ogg requires compiling with the 'opus' feature; falling back to wav"
-            );
-        }
+    pub fn with_config(mut self, config: Config) -> Self {
         self.config = Some(config);
         if self.config_loaded_at.is_none() {
             self.config_loaded_at = Some(Utc::now());

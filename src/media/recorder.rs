@@ -1,11 +1,10 @@
 use anyhow::{Result, anyhow};
-use audio_codec::{Decoder, PcmBuf, g729::G729Decoder, samples_to_bytes};
+use audio_codec::{PcmBuf, samples_to_bytes};
 use futures::StreamExt;
-use hound::{SampleFormat, WavSpec};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -23,276 +22,29 @@ use tokio_stream::wrappers::IntervalStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-#[cfg(feature = "opus")]
-use opusic_sys::{
-    OPUS_APPLICATION_AUDIO, OPUS_OK, OpusEncoder as OpusEncoderRaw, opus_encode,
-    opus_encoder_create, opus_encoder_destroy, opus_strerror,
-};
-#[cfg(feature = "opus")]
-use std::{ffi::CStr, os::raw::c_int, ptr::NonNull};
-
 use crate::media::{AudioFrame, Samples};
-
-#[cfg(feature = "opus")]
-fn opus_error_message(code: c_int) -> String {
-    if code == OPUS_OK {
-        return "ok".to_string();
-    }
-
-    unsafe {
-        let ptr = opus_strerror(code);
-        if ptr.is_null() {
-            format!("error code {code}")
-        } else {
-            CStr::from_ptr(ptr).to_string_lossy().into_owned()
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum RecorderFormat {
     Wav,
-    Ogg,
-}
-
-#[cfg(feature = "opus")]
-struct OggStreamWriter {
-    encoder: NonNull<OpusEncoderRaw>,
-    serial: u32,
-    sequence: u32,
-    granule_position: u64,
-    sample_rate: u32,
-}
-
-#[cfg(feature = "opus")]
-impl OggStreamWriter {
-    fn new(sample_rate: u32) -> Result<Self> {
-        let normalized = match sample_rate {
-            8000 | 12000 | 16000 | 24000 | 48000 => sample_rate,
-            _ => 16000,
-        };
-
-        let encoder = {
-            let mut error: c_int = 0;
-            let ptr = unsafe {
-                opus_encoder_create(
-                    normalized as c_int,
-                    2,
-                    OPUS_APPLICATION_AUDIO,
-                    &mut error as *mut c_int,
-                )
-            };
-
-            if error != OPUS_OK {
-                unsafe {
-                    if !ptr.is_null() {
-                        opus_encoder_destroy(ptr);
-                    }
-                }
-                return Err(anyhow!(
-                    "Failed to create Opus encoder: {}",
-                    opus_error_message(error)
-                ));
-            }
-
-            NonNull::new(ptr)
-                .ok_or_else(|| anyhow!("Failed to create Opus encoder: null pointer returned"))?
-        };
-
-        let mut serial = rand::random::<u32>();
-        if serial == 0 {
-            serial = 1;
-        }
-
-        Ok(Self {
-            encoder,
-            serial,
-            sequence: 0,
-            granule_position: 0,
-            sample_rate: normalized,
-        })
-    }
-
-    fn sample_rate(&self) -> u32 {
-        self.sample_rate
-    }
-
-    fn granule_increment(&self, frame_samples: usize) -> u64 {
-        let factor = 48000 / self.sample_rate;
-        (frame_samples as u64) * (factor as u64)
-    }
-
-    fn encode_frame(&mut self, pcm: &[i16]) -> Result<Vec<u8>> {
-        if pcm.len() % 2 != 0 {
-            return Err(anyhow!(
-                "PCM frame must contain an even number of samples for stereo Opus encoding"
-            ));
-        }
-
-        let frame_size = (pcm.len() / 2) as c_int;
-        let mut buffer = vec![0u8; 4096];
-        let len = unsafe {
-            opus_encode(
-                self.encoder.as_ptr(),
-                pcm.as_ptr() as *const opusic_sys::opus_int16,
-                frame_size,
-                buffer.as_mut_ptr(),
-                buffer.len() as c_int,
-            )
-        };
-
-        if len < 0 {
-            return Err(anyhow!(
-                "Failed to encode Opus frame: {}",
-                opus_error_message(len)
-            ));
-        }
-
-        buffer.truncate(len as usize);
-        Ok(buffer)
-    }
-
-    async fn write_headers(&mut self, file: &mut File) -> Result<()> {
-        let head = Self::build_opus_head(self.sample_rate);
-        self.write_page(file, &head, 0, 0x02).await?;
-
-        let tags = Self::build_opus_tags();
-        self.write_page(file, &tags, 0, 0x00).await?;
-        Ok(())
-    }
-
-    async fn write_audio_packet(
-        &mut self,
-        file: &mut File,
-        packet: &[u8],
-        frame_samples: usize,
-    ) -> Result<()> {
-        let increment = self.granule_increment(frame_samples);
-        self.granule_position = self.granule_position.saturating_add(increment);
-        self.write_page(file, packet, self.granule_position, 0x00)
-            .await
-    }
-
-    async fn finalize(&mut self, file: &mut File) -> Result<()> {
-        self.write_page(file, &[], self.granule_position, 0x04)
-            .await
-    }
-
-    async fn write_page(
-        &mut self,
-        file: &mut File,
-        packet: &[u8],
-        granule_pos: u64,
-        header_type: u8,
-    ) -> Result<()> {
-        let mut segments = Vec::new();
-        if !packet.is_empty() {
-            let mut remaining = packet.len();
-            while remaining >= 255 {
-                segments.push(255u8);
-                remaining -= 255;
-            }
-            segments.push(remaining as u8);
-        }
-
-        let mut page = Vec::with_capacity(27 + segments.len() + packet.len());
-        page.extend_from_slice(b"OggS");
-        page.push(0); // version
-        page.push(header_type);
-        page.extend_from_slice(&granule_pos.to_le_bytes());
-        page.extend_from_slice(&self.serial.to_le_bytes());
-        page.extend_from_slice(&self.sequence.to_le_bytes());
-        page.extend_from_slice(&0u32.to_le_bytes()); // checksum placeholder
-        page.push(segments.len() as u8);
-        page.extend_from_slice(&segments);
-        page.extend_from_slice(packet);
-
-        let checksum = ogg_crc32(&page);
-        page[22..26].copy_from_slice(&checksum.to_le_bytes());
-
-        file.write_all(&page).await?;
-        self.sequence = self.sequence.wrapping_add(1);
-        Ok(())
-    }
-
-    fn build_opus_head(sample_rate: u32) -> Vec<u8> {
-        let mut head = Vec::with_capacity(19);
-        head.extend_from_slice(b"OpusHead");
-        head.push(1); // version
-        head.push(2); // channel count (stereo)
-        head.extend_from_slice(&0u16.to_le_bytes()); // pre-skip
-        head.extend_from_slice(&sample_rate.to_le_bytes());
-        head.extend_from_slice(&0i16.to_le_bytes()); // output gain
-        head.push(0); // channel mapping family
-        head
-    }
-
-    fn build_opus_tags() -> Vec<u8> {
-        const VENDOR: &str = "rustpbx";
-        let vendor_bytes = VENDOR.as_bytes();
-        let mut tags = Vec::with_capacity(8 + 4 + vendor_bytes.len() + 4);
-        tags.extend_from_slice(b"OpusTags");
-        tags.extend_from_slice(&(vendor_bytes.len() as u32).to_le_bytes());
-        tags.extend_from_slice(vendor_bytes);
-        tags.extend_from_slice(&0u32.to_le_bytes()); // user comment list length
-        tags
-    }
-}
-
-#[cfg(feature = "opus")]
-impl Drop for OggStreamWriter {
-    fn drop(&mut self) {
-        unsafe {
-            opus_encoder_destroy(self.encoder.as_ptr());
-        }
-    }
-}
-
-#[cfg(feature = "opus")]
-unsafe impl Send for OggStreamWriter {}
-
-#[cfg(feature = "opus")]
-unsafe impl Sync for OggStreamWriter {}
-
-#[cfg(feature = "opus")]
-fn ogg_crc32(data: &[u8]) -> u32 {
-    const POLY: u32 = 0x04C11DB7;
-    let mut crc: u32 = 0;
-    for &byte in data {
-        crc ^= (byte as u32) << 24;
-        for _ in 0..8 {
-            if (crc & 0x8000_0000) != 0 {
-                crc = (crc << 1) ^ POLY;
-            } else {
-                crc <<= 1;
-            }
-        }
-    }
-    crc
+    Pcm,
+    Pcmu,
+    Pcma,
+    G722,
 }
 
 impl RecorderFormat {
     pub fn extension(&self) -> &'static str {
-        match self {
-            RecorderFormat::Wav => "wav",
-            RecorderFormat::Ogg => "ogg",
-        }
+        "wav"
     }
 
     pub fn is_supported(&self) -> bool {
-        match self {
-            RecorderFormat::Wav => true,
-            RecorderFormat::Ogg => cfg!(feature = "opus"),
-        }
+        true
     }
 
     pub fn effective(&self) -> RecorderFormat {
-        if self.is_supported() {
-            *self
-        } else {
-            RecorderFormat::Wav
-        }
+        *self
     }
 }
 
@@ -358,25 +110,6 @@ impl Default for RecorderOption {
     }
 }
 
-pub struct G729WavReader {
-    decoder: G729Decoder,
-    file_path: PathBuf,
-}
-
-impl G729WavReader {
-    pub fn new(path: PathBuf) -> Self {
-        Self {
-            decoder: G729Decoder::new(),
-            file_path: path,
-        }
-    }
-
-    pub async fn read_all(&mut self) -> Result<Vec<i16>> {
-        let data = tokio::fs::read(&self.file_path).await?;
-        Ok(self.decoder.decode(&data))
-    }
-}
-
 pub struct Recorder {
     session_id: String,
     option: RecorderOption,
@@ -406,54 +139,65 @@ impl Recorder {
         }
     }
 
-    async fn update_wav_header(&self, file: &mut File) -> Result<()> {
-        // Get total data size (in bytes)
-        let total_samples = self.samples_written.load(Ordering::SeqCst);
-        let data_size = total_samples * 4; // Stereo, 16-bit = 4 bytes per sample
+    async fn update_wav_header(&self, file: &mut File, payload_type: Option<u8>) -> Result<()> {
+        let total = self.samples_written.load(Ordering::SeqCst);
 
-        // Create a WavSpec for the WAV header
-        let spec = WavSpec {
-            channels: 2,
-            sample_rate: self.option.samplerate,
-            bits_per_sample: 16,
-            sample_format: SampleFormat::Int,
+        let (format_tag, sample_rate, channels, bits_per_sample, data_size): (
+            u16,
+            u32,
+            u16,
+            u16,
+            usize,
+        ) = match payload_type {
+            Some(pt) => {
+                let (tag, rate, chan): (u16, u32, u16) = match pt {
+                    0 => (0x0007, 8000, 1),   // PCMU
+                    8 => (0x0006, 8000, 1),   // PCMA
+                    9 => (0x0064, 16000, 1),  // G722
+                    10 => (0x0001, 44100, 2), // L16 Stereo 44.1k
+                    11 => (0x0001, 44100, 1), // L16 Mono 44.1k
+                    _ => (0x0001, 16000, 1),  // Default to PCM 16k Mono
+                };
+                let bits: u16 = match pt {
+                    9 => 4,
+                    0 | 8 => 8,
+                    _ => 16,
+                };
+                (tag, rate, chan, bits, total)
+            }
+            None => (0x0001, self.option.samplerate, 2, 16, total),
         };
-        // Create a memory buffer for the WAV header
-        let mut header_buf = Vec::new();
 
-        // Create a WAV header using standard structure
-        // RIFF header
+        let mut header_buf = Vec::new();
         header_buf.extend_from_slice(b"RIFF");
-        let file_size = data_size + 36; // 36 bytes for header - 8 + data bytes
+        let file_size = data_size + 36;
         header_buf.extend_from_slice(&(file_size as u32).to_le_bytes());
         header_buf.extend_from_slice(b"WAVE");
 
-        // fmt subchunk - use values from WavSpec
         header_buf.extend_from_slice(b"fmt ");
-        header_buf.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
-        header_buf.extend_from_slice(&1u16.to_le_bytes()); // PCM format
-        header_buf.extend_from_slice(&(spec.channels as u16).to_le_bytes());
-        header_buf.extend_from_slice(&(spec.sample_rate).to_le_bytes());
+        header_buf.extend_from_slice(&16u32.to_le_bytes());
+        header_buf.extend_from_slice(&format_tag.to_le_bytes());
+        header_buf.extend_from_slice(&(channels as u16).to_le_bytes());
+        header_buf.extend_from_slice(&sample_rate.to_le_bytes());
 
-        // Bytes per second: sample_rate * num_channels * bytes_per_sample
-        let bytes_per_sec =
-            spec.sample_rate * (spec.channels as u32) * (spec.bits_per_sample as u32 / 8);
+        let bytes_per_sec: u32 = match format_tag {
+            0x0064 => 8000, // G.722 is 64kbps
+            _ => sample_rate * (channels as u32) * (bits_per_sample as u32 / 8),
+        };
         header_buf.extend_from_slice(&bytes_per_sec.to_le_bytes());
 
-        // Block align: num_channels * bytes_per_sample
-        let block_align = (spec.channels as u16) * (spec.bits_per_sample / 8);
+        let block_align: u16 = match format_tag {
+            0x0064 | 0x0007 | 0x0006 => 1 * channels,
+            _ => (bits_per_sample / 8) * channels,
+        };
         header_buf.extend_from_slice(&block_align.to_le_bytes());
-        header_buf.extend_from_slice(&spec.bits_per_sample.to_le_bytes());
+        header_buf.extend_from_slice(&bits_per_sample.to_le_bytes());
 
-        // Data subchunk
         header_buf.extend_from_slice(b"data");
         header_buf.extend_from_slice(&(data_size as u32).to_le_bytes());
 
-        // Seek to beginning of file and write header
         file.seek(std::io::SeekFrom::Start(0)).await?;
         file.write_all(&header_buf).await?;
-
-        // Seek back to end of file for further writing
         file.seek(std::io::SeekFrom::End(0)).await?;
 
         Ok(())
@@ -464,7 +208,6 @@ impl Recorder {
         file_path: &Path,
         mut receiver: UnboundedReceiver<AudioFrame>,
     ) -> Result<()> {
-        // Peek first frame to decide mode
         let first_frame = match receiver.recv().await {
             Some(f) => f,
             None => return Ok(()),
@@ -476,31 +219,7 @@ impl Recorder {
                 .await;
         }
 
-        let requested_format = self.option.format.unwrap_or(RecorderFormat::Wav);
-        let effective_format = requested_format.effective();
-
-        if requested_format != effective_format {
-            warn!(
-                session_id = self.session_id,
-                requested = requested_format.extension(),
-                "Recorder format requires unavailable feature; falling back to wav"
-            );
-        }
-
-        if effective_format == RecorderFormat::Ogg {
-            #[cfg(feature = "opus")]
-            {
-                return self
-                    .process_recording_ogg(file_path, receiver, first_frame)
-                    .await;
-            }
-            #[cfg(not(feature = "opus"))]
-            {
-                unreachable!(
-                    "RecorderFormat::effective() should prevent ogg when opus feature is disabled"
-                );
-            }
-        }
+        let _requested_format = self.option.format.unwrap_or(RecorderFormat::Wav);
 
         self.process_recording_wav(file_path, receiver, first_frame)
             .await
@@ -544,60 +263,6 @@ impl Recorder {
         }
     }
 
-    async fn update_wav_header_rtp(&self, file: &mut File, payload_type: u8) -> Result<()> {
-        let total_bytes = self.samples_written.load(Ordering::SeqCst);
-        let data_size = total_bytes;
-
-        let (format_tag, sample_rate, channels): (u16, u32, u16) = match payload_type {
-            0 => (0x0007, 8000, 1),  // PCMU
-            8 => (0x0006, 8000, 1),  // PCMA
-            9 => (0x0064, 16000, 1), // G722
-            _ => return Ok(()),      // Should not happen for WAV
-        };
-
-        let mut header_buf = Vec::new();
-        header_buf.extend_from_slice(b"RIFF");
-        let file_size = data_size + 36;
-        header_buf.extend_from_slice(&(file_size as u32).to_le_bytes());
-        header_buf.extend_from_slice(b"WAVE");
-
-        header_buf.extend_from_slice(b"fmt ");
-        header_buf.extend_from_slice(&16u32.to_le_bytes());
-        header_buf.extend_from_slice(&format_tag.to_le_bytes());
-        header_buf.extend_from_slice(&(channels as u16).to_le_bytes());
-        header_buf.extend_from_slice(&sample_rate.to_le_bytes());
-
-        // Byte rate
-        let bytes_per_sec: u32 = match payload_type {
-            9 => 8000,                                // G.722 is 64kbps
-            _ => sample_rate * (channels as u32) * 1, // G.711 is 8-bit
-        };
-        header_buf.extend_from_slice(&bytes_per_sec.to_le_bytes());
-
-        // Block align
-        let block_align: u16 = match payload_type {
-            9 => 1,
-            _ => 1,
-        };
-        header_buf.extend_from_slice(&block_align.to_le_bytes());
-
-        // Bits per sample
-        let bits_per_sample: u16 = match payload_type {
-            9 => 4,
-            _ => 8,
-        };
-        header_buf.extend_from_slice(&bits_per_sample.to_le_bytes());
-
-        header_buf.extend_from_slice(b"data");
-        header_buf.extend_from_slice(&(data_size as u32).to_le_bytes());
-
-        file.seek(std::io::SeekFrom::Start(0)).await?;
-        file.write_all(&header_buf).await?;
-        file.seek(std::io::SeekFrom::End(0)).await?;
-
-        Ok(())
-    }
-
     async fn process_recording_rtp(
         &self,
         file_path: &Path,
@@ -606,27 +271,14 @@ impl Recorder {
     ) -> Result<()> {
         let (payload_type, mut file) =
             if let Samples::RTP { payload_type, .. } = &first_frame.samples {
-                let mut path = file_path.to_path_buf();
-                // Adjust extension if needed
-                if *payload_type == 18 {
-                    path.set_extension("g729");
-                } else if matches!(payload_type, 0 | 8 | 9) {
-                    path.set_extension("wav");
-                }
-
-                let file = self.create_output_file(&path).await?;
+                let file = self.create_output_file(file_path).await?;
                 (*payload_type, file)
             } else {
                 return Err(anyhow!("Invalid frame type for RTP recording"));
             };
 
-        // Write header if needed
-        match payload_type {
-            0 | 8 | 9 => {
-                self.write_wav_header_rtp(&mut file, payload_type).await?;
-            }
-            _ => {}
-        }
+        self.update_wav_header(&mut file, Some(payload_type))
+            .await?;
 
         if let Samples::RTP { payload, .. } = first_frame.samples {
             file.write_all(&payload).await?;
@@ -647,22 +299,12 @@ impl Recorder {
             }
         }
 
-        // Finalize
-        match payload_type {
-            0 | 8 | 9 => {
-                self.update_wav_header_rtp(&mut file, payload_type).await?;
-            }
-            _ => {}
-        }
+        self.update_wav_header(&mut file, Some(payload_type))
+            .await?;
 
         file.sync_all().await?;
 
         Ok(())
-    }
-
-    // Helper for initial header write (just placeholders)
-    async fn write_wav_header_rtp(&self, file: &mut File, payload_type: u8) -> Result<()> {
-        self.update_wav_header_rtp(file, payload_type).await
     }
 
     async fn process_recording_wav(
@@ -672,7 +314,7 @@ impl Recorder {
         first_frame: AudioFrame,
     ) -> Result<()> {
         let mut file = self.create_output_file(file_path).await?;
-        self.update_wav_header(&mut file).await?;
+        self.update_wav_header(&mut file, None).await?;
 
         self.append_frame(first_frame).await.ok();
 
@@ -697,132 +339,17 @@ impl Recorder {
                 _ = interval.next() => {
                     let (mono_buf, stereo_buf) = self.pop(chunk_size).await;
                     self.process_buffers(&mut file, mono_buf, stereo_buf).await?;
-                    self.update_wav_header(&mut file).await?;
+                    self.update_wav_header(&mut file, None).await?;
                 }
                 _ = self.cancel_token.cancelled() => {
                     self.flush_buffers(&mut file).await?;
-                    self.update_wav_header(&mut file).await?;
+                    self.update_wav_header(&mut file, None).await?;
                     return Ok(());
                 }
             }
         }
     }
 
-    #[cfg(feature = "opus")]
-    async fn process_recording_ogg(
-        &self,
-        file_path: &Path,
-        mut receiver: UnboundedReceiver<AudioFrame>,
-        first_frame: AudioFrame,
-    ) -> Result<()> {
-        let mut file = self.create_output_file(file_path).await?;
-        let mut writer = OggStreamWriter::new(self.option.samplerate)?;
-        if writer.sample_rate() != self.option.samplerate {
-            warn!(
-                session_id = self.session_id,
-                requested = self.option.samplerate,
-                using = writer.sample_rate(),
-                "Adjusted recorder samplerate to Opus-compatible value"
-            );
-        }
-        writer.write_headers(&mut file).await?;
-
-        self.append_frame(first_frame).await.ok();
-
-        let chunk_size = (self.option.samplerate / 1000 * self.option.ptime) as usize;
-        info!(
-            session_id = self.session_id,
-            format = "ogg",
-            "Recording to {} ptime: {}ms chunk_size: {}",
-            file_path.display(),
-            self.option.ptime,
-            chunk_size
-        );
-
-        let frame_samples = std::cmp::max(1, (writer.sample_rate() / 50) as usize);
-        let frame_step = frame_samples * 2; // stereo samples
-        let mut pending: Vec<i16> = Vec::new();
-
-        let mut interval = IntervalStream::new(tokio::time::interval(Duration::from_millis(
-            self.option.ptime as u64,
-        )));
-
-        loop {
-            select! {
-                Some(frame) = receiver.recv() => {
-                    self.append_frame(frame).await.ok();
-                }
-                _ = interval.next() => {
-                    let (mono_buf, stereo_buf) = self.pop(chunk_size).await;
-                    if mono_buf.is_empty() && stereo_buf.is_empty() {
-                        continue;
-                    }
-
-                    let mix = Self::mix_buffers(&mono_buf, &stereo_buf);
-                    pending.extend_from_slice(&mix);
-
-                    let encoded_samples = self
-                        .encode_pending_frames(&mut pending, frame_step, &mut writer, &mut file, false)
-                        .await?;
-                    if encoded_samples > 0 {
-                        self.samples_written.fetch_add(encoded_samples, Ordering::SeqCst);
-                    }
-                }
-                _ = self.cancel_token.cancelled() => {
-                    let (mono_buf, stereo_buf) = self.pop(usize::MAX).await;
-                    if !mono_buf.is_empty() || !stereo_buf.is_empty() {
-                        let mix = Self::mix_buffers(&mono_buf, &stereo_buf);
-                        pending.extend_from_slice(&mix);
-                    }
-
-                    let encoded_samples = self
-                        .encode_pending_frames(&mut pending, frame_step, &mut writer, &mut file, true)
-                        .await?;
-                    if encoded_samples > 0 {
-                        self.samples_written.fetch_add(encoded_samples, Ordering::SeqCst);
-                    }
-
-                    writer.finalize(&mut file).await?;
-                    return Ok(());
-                }
-            }
-        }
-    }
-
-    #[cfg(feature = "opus")]
-    async fn encode_pending_frames(
-        &self,
-        pending: &mut Vec<i16>,
-        frame_step: usize,
-        writer: &mut OggStreamWriter,
-        file: &mut File,
-        pad_final: bool,
-    ) -> Result<usize> {
-        let mut total_samples = 0usize;
-        let samples_per_channel = frame_step / 2;
-        while pending.len() >= frame_step {
-            let frame: Vec<i16> = pending.drain(..frame_step).collect();
-            let packet = writer.encode_frame(&frame)?;
-            writer
-                .write_audio_packet(file, &packet, samples_per_channel)
-                .await?;
-            total_samples += samples_per_channel;
-        }
-
-        if pad_final && !pending.is_empty() {
-            let mut frame: Vec<i16> = pending.drain(..).collect();
-            frame.resize(frame_step, 0);
-            let packet = writer.encode_frame(&frame)?;
-            writer
-                .write_audio_packet(file, &packet, samples_per_channel)
-                .await?;
-            total_samples += samples_per_channel;
-        }
-
-        Ok(total_samples)
-    }
-
-    /// Get or assign channel index for a track
     fn get_channel_index(&self, track_id: &str) -> usize {
         let mut channels = self.channels.lock().unwrap();
         if let Some(&channel_idx) = channels.get(track_id) {
@@ -846,15 +373,11 @@ impl Recorder {
             _ => return Ok(()), // ignore non-PCM frames
         };
 
-        // Validate audio data
         if buffer.is_empty() {
             return Ok(());
         }
 
-        // Get channel assignment
         let channel_idx = self.get_channel_index(&frame.track_id);
-
-        // Add to appropriate buffer
         match channel_idx {
             0 => {
                 let mut mono_buf = self.mono_buf.lock().unwrap();
@@ -870,7 +393,6 @@ impl Recorder {
         Ok(())
     }
 
-    /// Extract samples from a buffer without padding
     pub(crate) fn extract_samples(buffer: &mut PcmBuf, extract_size: usize) -> PcmBuf {
         if extract_size > 0 && !buffer.is_empty() {
             let take_size = extract_size.min(buffer.len());
@@ -884,23 +406,18 @@ impl Recorder {
         let mut mono_buf = self.mono_buf.lock().unwrap();
         let mut stereo_buf = self.stereo_buf.lock().unwrap();
 
-        // Limit chunk_size to prevent capacity overflow
-        let safe_chunk_size = chunk_size.min(16000 * 10); // Max 10 seconds at 16kHz
+        let safe_chunk_size = chunk_size.min(16000 * 10);
 
         let mono_result = if mono_buf.len() >= safe_chunk_size {
-            // Sufficient data, extract complete chunk
             Self::extract_samples(&mut mono_buf, safe_chunk_size)
         } else if !mono_buf.is_empty() {
-            // Partial data, extract all and pad with silence
-            let available_len = mono_buf.len(); // Store length before mutable borrow
+            let available_len = mono_buf.len();
             let mut result = Self::extract_samples(&mut mono_buf, available_len);
             if chunk_size != usize::MAX {
-                // Don't pad when flushing
-                result.resize(safe_chunk_size, 0); // Pad with silence to chunk_size
+                result.resize(safe_chunk_size, 0);
             }
             result
         } else {
-            // No data, output silence (only when not flushing)
             if chunk_size != usize::MAX {
                 vec![0; safe_chunk_size]
             } else {
@@ -909,19 +426,15 @@ impl Recorder {
         };
 
         let stereo_result = if stereo_buf.len() >= safe_chunk_size {
-            // Sufficient data, extract complete chunk
             Self::extract_samples(&mut stereo_buf, safe_chunk_size)
         } else if !stereo_buf.is_empty() {
-            // Partial data, extract all and pad with silence
-            let available_len = stereo_buf.len(); // Store length before mutable borrow
+            let available_len = stereo_buf.len();
             let mut result = Self::extract_samples(&mut stereo_buf, available_len);
             if chunk_size != usize::MAX {
-                // Don't pad when flushing
-                result.resize(safe_chunk_size, 0); // Pad with silence to chunk_size
+                result.resize(safe_chunk_size, 0);
             }
             result
         } else {
-            // No data, output silence (only when not flushing)
             if chunk_size != usize::MAX {
                 vec![0; safe_chunk_size]
             } else {
@@ -929,7 +442,6 @@ impl Recorder {
             }
         };
 
-        // Ensure buffers have equal length when flushing
         if chunk_size == usize::MAX {
             let max_len = mono_result.len().max(stereo_result.len());
             let mut mono_final = mono_result;
@@ -947,9 +459,7 @@ impl Recorder {
         Ok(())
     }
 
-    /// Mix mono and stereo buffers into interleaved stereo output
     pub(crate) fn mix_buffers(mono_buf: &PcmBuf, stereo_buf: &PcmBuf) -> Vec<i16> {
-        // Ensure both buffers have equal length (guaranteed by pop() method)
         assert_eq!(
             mono_buf.len(),
             stereo_buf.len(),
@@ -960,14 +470,13 @@ impl Recorder {
         let mut mix_buff = Vec::with_capacity(len * 2);
 
         for i in 0..len {
-            mix_buff.push(mono_buf[i]); // Left channel
-            mix_buff.push(stereo_buf[i]); // Right channel
+            mix_buff.push(mono_buf[i]);
+            mix_buff.push(stereo_buf[i]);
         }
 
         mix_buff
     }
 
-    /// Write mixed audio data to file
     async fn write_audio_data(
         &self,
         file: &mut File,
@@ -987,27 +496,23 @@ impl Recorder {
         Ok(max_len)
     }
 
-    /// Process buffers with quality checks and write to file
     async fn process_buffers(
         &self,
         file: &mut File,
         mono_buf: PcmBuf,
         stereo_buf: PcmBuf,
     ) -> Result<()> {
-        // Skip if no data
         if mono_buf.is_empty() && stereo_buf.is_empty() {
             return Ok(());
         }
-        // Write audio data
         let samples_written = self.write_audio_data(file, &mono_buf, &stereo_buf).await?;
         if samples_written > 0 {
             self.samples_written
-                .fetch_add(samples_written, Ordering::SeqCst);
+                .fetch_add(samples_written * 4, Ordering::SeqCst);
         }
         Ok(())
     }
 
-    /// Flush all remaining buffer content
     async fn flush_buffers(&self, file: &mut File) -> Result<()> {
         loop {
             let (mono_buf, stereo_buf) = self.pop(usize::MAX).await;
@@ -1019,7 +524,7 @@ impl Recorder {
             let samples_written = self.write_audio_data(file, &mono_buf, &stereo_buf).await?;
             if samples_written > 0 {
                 self.samples_written
-                    .fetch_add(samples_written, Ordering::SeqCst);
+                    .fetch_add(samples_written * 4, Ordering::SeqCst);
             }
         }
 

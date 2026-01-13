@@ -112,7 +112,7 @@ sequenceDiagram
     Client->>RustPBX: Set Remote Description
     
     Note over Client,RustPBX: WebRTC Media Flow
-    Client->>RustPBX: RTP Audio Packets (Opus/PCMA/PCMU/G722)
+    Client->>RustPBX: RTP Audio Packets (PCM/PCMA/PCMU/G722)
     RustPBX->>Client: RTP Audio Response
     
     Client->>RustPBX: Send TTS/Play Commands
@@ -140,7 +140,7 @@ sequenceDiagram
     Client->>RustPBX: Set Remote Description
     
     Note over SIP UA,SIP Server: SIP/RTP Media Flow
-    SIP UA->>SIP Server: RTP Audio Packets (PCMA/PCMU/G722/Opus)
+    SIP UA->>SIP Server: RTP Audio Packets (PCM/PCMA/PCMU/G722)
     SIP Server->>SIP UA: RTP Audio Response
     
     Client->>RustPBX: Send TTS/Play Commands
@@ -156,13 +156,13 @@ sequenceDiagram
 - **Advantages:** Simple, low latency, works through firewalls
 
 ### 2. WebRTC Audio Stream (`/call/webrtc`)
-- **Audio Format:** Opus, PCMA, PCMU, G722
+- **Audio Format:** PCM, PCMA, PCMU, G722
 - **Transport:** WebRTC RTP over UDP
 - **Usage:** Browser-compatible, NAT traversal
 - **Advantages:** Browser native support, adaptive bitrate
 
 ### 3. SIP Audio Stream (`/call/sip`)
-- **Audio Format:** PCMA, PCMU, G722, Opus
+- **Audio Format:** PCM, PCMA, PCMU, G722
 - **Transport:** SIP/RTP over UDP
 - **Usage:** Traditional telephony integration
 - **Advantages:** Standard telephony protocol, PBX integration

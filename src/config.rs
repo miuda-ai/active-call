@@ -96,10 +96,7 @@ impl RecordingPolicy {
             self.path = Some(default_config_recorder_path());
         }
 
-        let original = self.format.unwrap_or_default();
-        let effective = original.effective();
-        self.format = Some(effective);
-        original != effective
+        false
     }
 }
 
@@ -241,14 +238,9 @@ impl Clone for Config {
 
 impl Config {
     pub fn load(path: &str) -> Result<Self, Error> {
-        let mut config: Self = toml::from_str(
+        let config: Self = toml::from_str(
             &std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("{}: {}", e, path))?,
         )?;
-        if config.ensure_recording_defaults() {
-            tracing::warn!(
-                "recorder_format=ogg requires compiling with the 'opus' feature; falling back to wav"
-            );
-        }
         Ok(config)
     }
 
