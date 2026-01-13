@@ -355,10 +355,7 @@ async fn test_tts_track_configuration() -> Result<()> {
     let frame = frame.unwrap();
 
     // Verify the sample rate matches our configuration
-    assert_eq!(
-        frame.sample_rate, 16000,
-        "Sample rate mismatch"
-    );
+    assert_eq!(frame.sample_rate, 16000, "Sample rate mismatch");
 
     // Stop the track
     tts_track.stop().await?;

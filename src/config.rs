@@ -1,4 +1,4 @@
-use crate::media::recorder::RecorderFormat;
+use crate::media::{ambiance::AmbianceOption, recorder::RecorderFormat};
 use crate::useragent::RegisterOption;
 use anyhow::{Error, Result};
 use clap::Parser;
@@ -151,6 +151,7 @@ pub struct Config {
     pub callrecord: Option<CallRecordConfig>,
     #[serde(default = "default_config_media_cache_path")]
     pub media_cache_path: String,
+    pub ambiance: Option<AmbianceOption>,
     pub ice_servers: Option<Vec<IceServer>>,
     #[serde(default)]
     pub recording: Option<RecordingPolicy>,
@@ -233,6 +234,7 @@ impl Default for Config {
             handler: None,
             accept_timeout: Some("50s".to_string()),
             media_cache_path: default_config_media_cache_path(),
+            ambiance: None,
             callrecord: None,
             ice_servers: None,
             codecs: None,

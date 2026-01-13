@@ -5,7 +5,10 @@ use serde_with::skip_serializing_none;
 use std::collections::HashMap;
 
 use crate::{
-    media::{recorder::RecorderOption, track::media_pass::MediaPassOption, vad::VADOption},
+    media::{
+        ambiance::AmbianceOption, recorder::RecorderOption, track::media_pass::MediaPassOption,
+        vad::VADOption,
+    },
     synthesis::SynthesisOption,
     transcription::TranscriptionOption,
 };
@@ -54,7 +57,9 @@ pub struct CallOption {
     pub sip: Option<SipOption>,
     pub extra: Option<HashMap<String, String>>,
     pub codec: Option<String>, // pcmu, pcma, g722, pcm, only for websocket call
+    pub ambiance: Option<AmbianceOption>,
     pub eou: Option<EouOption>,
+    pub realtime: Option<RealtimeOption>,
 }
 
 impl Default for CallOption {
@@ -75,7 +80,9 @@ impl Default for CallOption {
             sip: None,
             extra: None,
             codec: None,
+            ambiance: None,
             eou: None,
+            realtime: None,
         }
     }
 }
@@ -87,6 +94,9 @@ impl CallOption {
         }
         if let Some(asr) = &mut self.asr {
             asr.check_default();
+        }
+        if let Some(realtime) = &mut self.realtime {
+            realtime.check_default();
         }
     }
 
@@ -150,4 +160,50 @@ pub struct EouOption {
     /// max timeout in milliseconds
     pub timeout: Option<u32>,
     pub extra: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Hash, Eq, PartialEq)]
+pub enum RealtimeType {
+    #[serde(rename = "openai")]
+    OpenAI,
+    #[serde(rename = "azure")]
+    Azure,
+    Other(String),
+}
+
+impl<'de> Deserialize<'de> for RealtimeType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        match value.as_str() {
+            "openai" => Ok(RealtimeType::OpenAI),
+            "azure" => Ok(RealtimeType::Azure),
+            _ => Ok(RealtimeType::Other(value)),
+        }
+    }
+}
+
+#[skip_serializing_none]
+#[derive(Clone, Debug, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RealtimeOption {
+    pub provider: Option<RealtimeType>,
+    pub model: Option<String>,
+    #[serde(alias = "apiKey")]
+    pub secret_key: Option<String>,
+    pub secret_id: Option<String>,
+    pub endpoint: Option<String>,
+    pub turn_detection: Option<serde_json::Value>,
+    pub tools: Option<Vec<serde_json::Value>>,
+    pub extra: Option<HashMap<String, String>>,
+}
+
+impl RealtimeOption {
+    pub fn check_default(&mut self) {
+        if self.secret_key.is_none() {
+            self.secret_key = std::env::var("OPENAI_API_KEY").ok();
+        }
+    }
 }

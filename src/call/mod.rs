@@ -1,11 +1,9 @@
+use crate::{CallOption, ReferOption, media::recorder::RecorderOption, synthesis::SynthesisOption};
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
-};
-use crate::{
-    CallOption, ReferOption, media::recorder::RecorderOption, synthesis::SynthesisOption,
 };
 
 pub mod active_call;
@@ -67,6 +65,7 @@ pub enum Command {
     },
     Interrupt {
         graceful: Option<bool>,
+        fade_out_ms: Option<u32>,
     },
     Pause {},
     Resume {},

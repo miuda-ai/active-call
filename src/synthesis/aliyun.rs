@@ -52,6 +52,10 @@ impl Command {
         let sample_rate = option.samplerate.unwrap_or(16000) as u32;
         let volume = option.volume.unwrap_or(50) as u32;
         let rate = option.speed.unwrap_or(1.0);
+        let model = option
+            .model
+            .clone()
+            .unwrap_or_else(|| "cosyvoice-v2".to_string());
 
         Command {
             header: CommandHeader {
@@ -63,7 +67,7 @@ impl Command {
                 task_group: "audio".to_string(),
                 task: "tts".to_string(),
                 function: "SpeechSynthesizer".to_string(),
-                model: "cosyvoice-v2".to_string(),
+                model,
                 parameters: RunTaskParameters {
                     text_type: "PlainText".to_string(),
                     voice,

@@ -243,6 +243,8 @@ impl VoiceApiAsrClientInner {
                                         index: result.idx,
                                         start_time: None,
                                         end_time: None,
+                                        is_filler: None,
+                                        confidence: None,
                                     }
                                 } else {
                                     SessionEvent::AsrDelta {
@@ -252,6 +254,8 @@ impl VoiceApiAsrClientInner {
                                         start_time: None,
                                         end_time: None,
                                         text: result.text.clone(),
+                                        is_filler: None,
+                                        confidence: None,
                                     }
                                 };
                                 if let Err(e) = event_sender.send(evt) {

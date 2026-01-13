@@ -9,13 +9,36 @@ use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use tracing::{info, warn};
 
 static RE_HANGUP: Lazy<Regex> = Lazy::new(|| Regex::new(r"<hangup\s*/>").unwrap());
 static RE_REFER: Lazy<Regex> = Lazy::new(|| Regex::new(r#"<refer\s+to="([^"]+)"\s*/>"#).unwrap());
+static RE_PLAY: Lazy<Regex> = Lazy::new(|| Regex::new(r#"<play\s+file="([^"]+)"\s*/>"#).unwrap());
+static RE_GOTO: Lazy<Regex> = Lazy::new(|| Regex::new(r#"<goto\s+scene="([^"]+)"\s*/>"#).unwrap());
 static RE_SENTENCE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?m)[.!?。！？\n]\s*").unwrap());
+static FILLERS: Lazy<std::collections::HashSet<String>> = Lazy::new(|| {
+    let mut s = std::collections::HashSet::new();
+    let default_fillers = ["嗯", "啊", "哦", "那个", "那个...", "uh", "um", "ah"];
+
+    if let Ok(content) = std::fs::read_to_string("config/fillers.txt") {
+        for line in content.lines() {
+            let trimmed = line.trim().to_lowercase();
+            if !trimmed.is_empty() {
+                s.insert(trimmed);
+            }
+        }
+    }
+
+    if s.is_empty() {
+        for f in default_fillers {
+            s.insert(f.to_string());
+        }
+    }
+    s
+});
 
 use super::InterruptionStrategy;
 use super::LlmConfig;
@@ -37,6 +60,22 @@ pub trait LlmProvider: Send + Sync {
         config: &LlmConfig,
         history: &[ChatMessage],
     ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>>;
+}
+
+pub struct RealtimeResponse {
+    pub audio_delta: Option<Vec<u8>>,
+    pub text_delta: Option<String>,
+    pub function_call: Option<ToolInvocation>,
+    pub speech_started: bool,
+}
+
+#[async_trait]
+pub trait RealtimeProvider: Send + Sync {
+    async fn connect(&self, config: &LlmConfig) -> Result<()>;
+    async fn send_audio(&self, audio: &[i16]) -> Result<()>;
+    async fn subscribe(
+        &self,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<RealtimeResponse>> + Send>>>;
 }
 
 struct DefaultLlmProvider {
@@ -187,9 +226,9 @@ struct StructuredResponse {
     tools: Option<Vec<ToolInvocation>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(tag = "name", rename_all = "lowercase")]
-enum ToolInvocation {
+pub enum ToolInvocation {
     #[serde(rename_all = "camelCase")]
     Hangup {
         reason: Option<String>,
@@ -217,23 +256,36 @@ enum ToolInvocation {
 
 pub struct LlmHandler {
     config: LlmConfig,
+    interruption_config: super::InterruptionConfig,
+    dtmf_config: Option<HashMap<String, super::DtmfAction>>,
     history: Vec<ChatMessage>,
     provider: Arc<dyn LlmProvider>,
     rag_retriever: Arc<dyn RagRetriever>,
     is_speaking: bool,
     event_sender: Option<crate::event::EventSender>,
     last_asr_final_at: Option<std::time::Instant>,
-    interruption: InterruptionStrategy,
+    last_tts_start_at: Option<std::time::Instant>,
     call: Option<crate::call::ActiveCallRef>,
+    scenes: HashMap<String, super::Scene>,
+    current_scene_id: Option<String>,
 }
 
 impl LlmHandler {
-    pub fn new(config: LlmConfig, interruption: InterruptionStrategy) -> Self {
+    pub fn new(
+        config: LlmConfig,
+        interruption: super::InterruptionConfig,
+        scenes: HashMap<String, super::Scene>,
+        dtmf: Option<HashMap<String, super::DtmfAction>>,
+        initial_scene_id: Option<String>,
+    ) -> Self {
         Self::with_provider(
             config,
             Arc::new(DefaultLlmProvider::new()),
             Arc::new(NoopRagRetriever),
             interruption,
+            scenes,
+            dtmf,
+            initial_scene_id,
         )
     }
 
@@ -241,19 +293,14 @@ impl LlmHandler {
         config: LlmConfig,
         provider: Arc<dyn LlmProvider>,
         rag_retriever: Arc<dyn RagRetriever>,
-        interruption: InterruptionStrategy,
+        interruption: super::InterruptionConfig,
+        scenes: HashMap<String, super::Scene>,
+        dtmf: Option<HashMap<String, super::DtmfAction>>,
+        initial_scene_id: Option<String>,
     ) -> Self {
         let mut history = Vec::new();
         let prompt = config.prompt.clone().unwrap_or_default();
-        let system_prompt = format!(
-            "{}\n\n\
-            Tool usage instructions:\n\
-            - To hang up the call, use: <hangup/>\n\
-            - To transfer the call, use: <refer to=\"sip:xxxx\"/>\n\
-            Use these XML-like tags instead of JSON. Efficiency is key. \
-            Output your response in short sentences. Each sentence will be played as soon as it is finished.",
-            prompt
-        );
+        let system_prompt = Self::build_system_prompt(&prompt);
 
         history.push(ChatMessage {
             role: "system".to_string(),
@@ -262,15 +309,124 @@ impl LlmHandler {
 
         Self {
             config,
+            interruption_config: interruption,
+            dtmf_config: dtmf,
             history,
             provider,
             rag_retriever,
             is_speaking: false,
             event_sender: None,
             last_asr_final_at: None,
-            interruption,
+            last_tts_start_at: None,
             call: None,
+            scenes,
+            current_scene_id: initial_scene_id,
         }
+    }
+
+    fn build_system_prompt(prompt: &str) -> String {
+        format!(
+            "{}\n\n\
+            Tool usage instructions:\n\
+            - To hang up the call, use: <hangup/>\n\
+            - To transfer the call, use: <refer to=\"sip:xxxx\"/>\n\
+            - To play an audio file, use: <play file=\"path/to/file.wav\"/>\n\
+            - To switch to another scene, use: <goto scene=\"scene_id\"/>\n\
+            Use these XML-like tags instead of JSON. Efficiency is key. \
+            Output your response in short sentences. Each sentence will be played as soon as it is finished.",
+            prompt
+        )
+    }
+
+    fn get_dtmf_action(&self, digit: &str) -> Option<super::DtmfAction> {
+        // 1. Check current scene
+        if let Some(scene_id) = &self.current_scene_id {
+            if let Some(scene) = self.scenes.get(scene_id) {
+                if let Some(dtmf) = &scene.dtmf {
+                    if let Some(action) = dtmf.get(digit) {
+                        return Some(action.clone());
+                    }
+                }
+            }
+        }
+
+        // 2. Check global
+        if let Some(dtmf) = &self.dtmf_config {
+            if let Some(action) = dtmf.get(digit) {
+                return Some(action.clone());
+            }
+        }
+
+        None
+    }
+
+    async fn handle_dtmf_action(&mut self, action: super::DtmfAction) -> Result<Vec<Command>> {
+        match action {
+            super::DtmfAction::Goto { scene } => {
+                info!("DTMF action: switch to scene {}", scene);
+                self.switch_to_scene(&scene, true).await
+            }
+            super::DtmfAction::Transfer { target } => {
+                info!("DTMF action: transfer to {}", target);
+                Ok(vec![Command::Refer {
+                    caller: String::new(),
+                    callee: target,
+                    options: None,
+                }])
+            }
+            super::DtmfAction::Hangup => {
+                info!("DTMF action: hangup");
+                Ok(vec![Command::Hangup {
+                    reason: Some("DTMF Hangup".to_string()),
+                    initiator: Some("ai".to_string()),
+                }])
+            }
+        }
+    }
+
+    async fn switch_to_scene(
+        &mut self,
+        scene_id: &str,
+        trigger_response: bool,
+    ) -> Result<Vec<Command>> {
+        if let Some(scene) = self.scenes.get(scene_id).cloned() {
+            info!("Switching to scene: {}", scene_id);
+            self.current_scene_id = Some(scene_id.to_string());
+            // Update system prompt in history
+            let system_prompt = Self::build_system_prompt(&scene.prompt);
+            if let Some(first_msg) = self.history.get_mut(0) {
+                if first_msg.role == "system" {
+                    first_msg.content = system_prompt;
+                }
+            }
+
+            let mut commands = Vec::new();
+            if let Some(url) = &scene.play {
+                commands.push(Command::Play {
+                    url: url.clone(),
+                    play_id: None,
+                    auto_hangup: None,
+                    wait_input_timeout: None,
+                });
+            }
+
+            if trigger_response {
+                let response_cmds = self.generate_response().await?;
+                commands.extend(response_cmds);
+            }
+            Ok(commands)
+        } else {
+            warn!("Scene not found: {}", scene_id);
+            Ok(vec![])
+        }
+    }
+
+    pub fn get_history(&self) -> &[ChatMessage] {
+        &self.history
+    }
+
+    pub fn get_current_scene_id(&self) -> Option<String> {
+        self.current_scene_id.clone()
     }
 
     pub fn set_call(&mut self, call: crate::call::ActiveCallRef) {
@@ -446,13 +602,14 @@ impl LlmHandler {
                     content: full_content,
                 });
                 self.is_speaking = true;
+                self.last_tts_start_at = Some(std::time::Instant::now());
             }
             Ok(commands)
         }
     }
 
     fn extract_streaming_commands(
-        &self,
+        &mut self,
         buffer: &mut String,
         play_id: &str,
         is_final: bool,
@@ -462,6 +619,8 @@ impl LlmHandler {
         loop {
             let hangup_pos = RE_HANGUP.find(buffer);
             let refer_pos = RE_REFER.captures(buffer);
+            let play_pos = RE_PLAY.captures(buffer);
+            let goto_pos = RE_GOTO.captures(buffer);
             let sentence_pos = RE_SENTENCE.find(buffer);
 
             // Find the first occurrence
@@ -471,6 +630,12 @@ impl LlmHandler {
             }
             if let Some(caps) = &refer_pos {
                 positions.push((caps.get(0).unwrap().start(), 1));
+            }
+            if let Some(caps) = &play_pos {
+                positions.push((caps.get(0).unwrap().start(), 3));
+            }
+            if let Some(caps) = &goto_pos {
+                positions.push((caps.get(0).unwrap().start(), 4));
             }
             if let Some(m) = sentence_pos {
                 positions.push((m.start(), 2));
@@ -518,6 +683,59 @@ impl LlmHandler {
                             callee,
                             options: None,
                         });
+                        buffer.drain(..mat.end());
+                    }
+                    3 => {
+                        // Play audio
+                        let caps = RE_PLAY.captures(buffer).unwrap();
+                        let mat = caps.get(0).unwrap();
+                        let url = caps.get(1).unwrap().as_str().to_string();
+
+                        let prefix = buffer[..pos].to_string();
+                        if !prefix.trim().is_empty() {
+                            commands.push(self.create_tts_command_with_id(
+                                prefix,
+                                play_id.to_string(),
+                                None,
+                            ));
+                        }
+                        commands.push(Command::Play {
+                            url,
+                            play_id: None,
+                            auto_hangup: None,
+                            wait_input_timeout: None,
+                        });
+                        buffer.drain(..mat.end());
+                    }
+                    4 => {
+                        // Goto Scene
+                        let caps = RE_GOTO.captures(buffer).unwrap();
+                        let mat = caps.get(0).unwrap();
+                        let scene_id = caps.get(1).unwrap().as_str().to_string();
+
+                        let prefix = buffer[..pos].to_string();
+                        if !prefix.trim().is_empty() {
+                            commands.push(self.create_tts_command_with_id(
+                                prefix,
+                                play_id.to_string(),
+                                None,
+                            ));
+                        }
+
+                        info!("Switching to scene (from stream): {}", scene_id);
+                        if let Some(scene) = self.scenes.get(&scene_id) {
+                            self.current_scene_id = Some(scene_id);
+                            // Update system prompt in history
+                            let system_prompt = Self::build_system_prompt(&scene.prompt);
+                            if let Some(first_msg) = self.history.get_mut(0) {
+                                if first_msg.role == "system" {
+                                    first_msg.content = system_prompt;
+                                }
+                            }
+                        } else {
+                            warn!("Scene not found: {}", scene_id);
+                        }
+
                         buffer.drain(..mat.end());
                     }
                     2 => {
@@ -741,6 +959,7 @@ impl LlmHandler {
                     role: "assistant".to_string(),
                     content: text.clone(),
                 });
+                self.last_tts_start_at = Some(std::time::Instant::now());
                 self.is_speaking = true;
 
                 // If we have text and a hangup command, use auto_hangup on the TTS command
@@ -763,6 +982,11 @@ impl LlmHandler {
 fn parse_structured_response(raw: &str) -> Option<StructuredResponse> {
     let payload = extract_json_block(raw)?;
     serde_json::from_str(payload).ok()
+}
+
+fn is_likely_filler(text: &str) -> bool {
+    let trimmed = text.trim().to_lowercase();
+    FILLERS.contains(&trimmed)
 }
 
 fn extract_json_block(raw: &str) -> Option<&str> {
@@ -794,16 +1018,46 @@ fn extract_json_block(raw: &str) -> Option<&str> {
 #[async_trait]
 impl DialogueHandler for LlmHandler {
     async fn on_start(&mut self) -> Result<Vec<Command>> {
-        if let Some(greeting) = &self.config.greeting {
-            self.is_speaking = true;
-            return Ok(vec![self.create_tts_command(greeting.clone(), None, None)]);
+        self.last_tts_start_at = Some(std::time::Instant::now());
+
+        let mut commands = Vec::new();
+
+        // Check if current scene has an audio file to play
+        if let Some(scene_id) = &self.current_scene_id {
+            if let Some(scene) = self.scenes.get(scene_id) {
+                if let Some(audio_file) = &scene.play {
+                    commands.push(Command::Play {
+                        url: audio_file.clone(),
+                        play_id: None,
+                        auto_hangup: None,
+                        wait_input_timeout: None,
+                    });
+                }
+            }
         }
 
-        self.generate_response().await
+        if let Some(greeting) = &self.config.greeting {
+            self.is_speaking = true;
+            commands.push(self.create_tts_command(greeting.clone(), None, None));
+            return Ok(commands);
+        }
+
+        let response_commands = self.generate_response().await?;
+        commands.extend(response_commands);
+        Ok(commands)
     }
 
     async fn on_event(&mut self, event: &SessionEvent) -> Result<Vec<Command>> {
         match event {
+            SessionEvent::Dtmf { digit, .. } => {
+                info!("DTMF received: {}", digit);
+                let action = self.get_dtmf_action(digit);
+                if let Some(action) = action {
+                    return self.handle_dtmf_action(action).await;
+                }
+                Ok(vec![])
+            }
+
             SessionEvent::AsrFinal { text, .. } => {
                 if text.trim().is_empty() {
                     return Ok(vec![]);
@@ -820,8 +1074,9 @@ impl DialogueHandler for LlmHandler {
                 self.generate_response().await
             }
 
-            SessionEvent::AsrDelta { .. } | SessionEvent::Speaking { .. } => {
-                let should_interrupt = match (self.interruption, event) {
+            SessionEvent::AsrDelta { is_filler, .. } | SessionEvent::Speaking { is_filler, .. } => {
+                let strategy = self.interruption_config.strategy;
+                let should_check = match (strategy, event) {
                     (InterruptionStrategy::None, _) => false,
                     (InterruptionStrategy::Vad, SessionEvent::Speaking { .. }) => true,
                     (InterruptionStrategy::Asr, SessionEvent::AsrDelta { .. }) => true,
@@ -829,21 +1084,49 @@ impl DialogueHandler for LlmHandler {
                     _ => false,
                 };
 
-                if self.is_speaking && should_interrupt {
-                    // Ignore interruptions that occur very shortly after the last ASR final.
-                    // This prevents stale VAD events from cancelling the newly generated response.
-                    if let Some(last_final) = self.last_asr_final_at {
-                        if last_final.elapsed().as_millis() < 800 {
-                            tracing::debug!("Ignoring interruption event too close to AsrFinal");
+                if self.is_speaking && should_check {
+                    // 1. Protection Period Check
+                    if let Some(last_start) = self.last_tts_start_at {
+                        let ignore_ms = self.interruption_config.ignore_first_ms.unwrap_or(800);
+                        if last_start.elapsed().as_millis() < ignore_ms as u128 {
                             return Ok(vec![]);
                         }
                     }
 
-                    info!("Interruption detected, stopping playback");
+                    // 2. Filler Word Check
+                    if self.interruption_config.filler_word_filter.unwrap_or(false) {
+                        if let Some(true) = is_filler {
+                            return Ok(vec![]);
+                        }
+                        // Secondary text-based filler check for ASR Delta
+                        if let SessionEvent::AsrDelta { text, .. } = event {
+                            if is_likely_filler(text) {
+                                return Ok(vec![]);
+                            }
+                        }
+                    }
+
+                    // 3. Stale event check (already had one in original code)
+                    if let Some(last_final) = self.last_asr_final_at {
+                        if last_final.elapsed().as_millis() < 500 {
+                            return Ok(vec![]);
+                        }
+                    }
+
+                    info!("Smart interruption detected, stopping playback");
                     self.is_speaking = false;
                     return Ok(vec![Command::Interrupt {
                         graceful: Some(true),
+                        fade_out_ms: self.interruption_config.volume_fade_ms,
                     }]);
+                }
+                Ok(vec![])
+            }
+
+            SessionEvent::Eou { completed, .. } => {
+                if *completed && self.is_speaking == false {
+                    info!("EOU detected, triggering early response");
+                    return self.generate_response().await;
                 }
                 Ok(vec![])
             }
@@ -856,6 +1139,42 @@ impl DialogueHandler for LlmHandler {
             SessionEvent::TrackEnd { .. } => {
                 self.is_speaking = false;
                 Ok(vec![])
+            }
+
+            SessionEvent::FunctionCall { name, arguments, .. } => {
+                info!("Function call from Realtime: {} with args {}", name, arguments);
+                let args: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
+                match name.as_str() {
+                    "hangup_call" => {
+                        Ok(vec![Command::Hangup {
+                            reason: args["reason"].as_str().map(|s| s.to_string()),
+                            initiator: Some("ai".to_string()),
+                        }])
+                    }
+                    "transfer_call" | "refer_call" => {
+                        if let Some(callee) = args["callee"].as_str().or_else(|| args["callee_uri"].as_str()) {
+                             Ok(vec![Command::Refer {
+                                caller: String::new(),
+                                callee: callee.to_string(),
+                                options: None,
+                            }])
+                        } else {
+                            warn!("No callee provided for transfer_call");
+                             Ok(vec![])
+                        }
+                    }
+                    "goto_scene" => {
+                        if let Some(scene) = args["scene"].as_str() {
+                            self.switch_to_scene(scene, false).await
+                        } else {
+                            Ok(vec![])
+                        }
+                    }
+                    _ => {
+                        warn!("Unhandled function call: {}", name);
+                        Ok(vec![])
+                    }
+                }
             }
 
             _ => Ok(vec![]),
@@ -946,7 +1265,10 @@ mod tests {
             LlmConfig::default(),
             provider,
             Arc::new(NoopRagRetriever),
-            InterruptionStrategy::Both,
+            crate::playbook::InterruptionConfig::default(),
+            HashMap::new(),
+            None,
+            None,
         );
 
         let event = SessionEvent::AsrFinal {
@@ -956,6 +1278,8 @@ mod tests {
             start_time: None,
             end_time: None,
             text: "hello".to_string(),
+            is_filler: None,
+            confidence: None,
         };
 
         let commands = handler.on_event(&event).await?;
@@ -992,7 +1316,10 @@ mod tests {
             LlmConfig::default(),
             provider,
             rag.clone(),
-            InterruptionStrategy::Both,
+            crate::playbook::InterruptionConfig::default(),
+            HashMap::new(),
+            None,
+            None,
         );
 
         let event = SessionEvent::AsrFinal {
@@ -1002,6 +1329,8 @@ mod tests {
             start_time: None,
             end_time: None,
             text: "reep".to_string(),
+            is_filler: None,
+            confidence: None,
         };
 
         let commands = handler.on_event(&event).await?;
@@ -1038,7 +1367,10 @@ mod tests {
             config,
             provider,
             Arc::new(NoopRagRetriever),
-            InterruptionStrategy::Both,
+            crate::playbook::InterruptionConfig::default(),
+            HashMap::new(),
+            None,
+            None,
         );
 
         // 1. Start the dialogue
@@ -1058,6 +1390,8 @@ mod tests {
             start_time: None,
             end_time: None,
             text: "I need help".to_string(),
+            is_filler: None,
+            confidence: None,
         };
         let commands = handler.on_event(&event).await?;
         // "Hello! How can I help you today?" -> split into two
@@ -1076,6 +1410,8 @@ mod tests {
             start_time: None,
             end_time: None,
             text: "Tell me a joke".to_string(),
+            is_filler: None,
+            confidence: None,
         };
         let commands = handler.on_event(&event).await?;
         assert_eq!(commands.len(), 1);
@@ -1099,6 +1435,8 @@ mod tests {
             start_time: None,
             end_time: None,
             text: "That's all, thanks".to_string(),
+            is_filler: None,
+            confidence: None,
         };
         let commands = handler.on_event(&event).await?;
         // Should have Tts with auto_hangup
@@ -1128,7 +1466,10 @@ mod tests {
             LlmConfig::default(),
             provider,
             Arc::new(NoopRagRetriever),
-            InterruptionStrategy::Both,
+            crate::playbook::InterruptionConfig::default(),
+            HashMap::new(),
+            None,
+            None,
         );
 
         let event = SessionEvent::AsrFinal {
@@ -1138,6 +1479,8 @@ mod tests {
             start_time: None,
             end_time: None,
             text: "hi".to_string(),
+            is_filler: None,
+            confidence: None,
         };
 
         let commands = handler.on_event(&event).await?;
@@ -1195,7 +1538,10 @@ mod tests {
             LlmConfig::default(),
             provider,
             Arc::new(NoopRagRetriever),
-            InterruptionStrategy::Both,
+            crate::playbook::InterruptionConfig::default(),
+            HashMap::new(),
+            None,
+            None,
         );
 
         // 1. Trigger a response
@@ -1206,6 +1552,8 @@ mod tests {
             start_time: None,
             end_time: None,
             text: "hello".to_string(),
+            is_filler: None,
+            confidence: None,
         };
         handler.on_event(&event).await?;
         assert!(handler.is_speaking);
@@ -1221,6 +1569,8 @@ mod tests {
             start_time: None,
             end_time: None,
             text: "I...".to_string(),
+            is_filler: None,
+            confidence: None,
         };
         let commands = handler.on_event(&event).await?;
         assert_eq!(commands.len(), 1);
@@ -1246,7 +1596,10 @@ mod tests {
             LlmConfig::default(),
             provider,
             Arc::new(RecordingRag::new()),
-            InterruptionStrategy::Both,
+            crate::playbook::InterruptionConfig::default(),
+            HashMap::new(),
+            None,
+            None,
         );
 
         let event = SessionEvent::AsrFinal {
@@ -1256,6 +1609,8 @@ mod tests {
             start_time: None,
             end_time: None,
             text: "loop".to_string(),
+            is_filler: None,
+            confidence: None,
         };
 
         let commands = handler.on_event(&event).await?;
@@ -1263,6 +1618,156 @@ mod tests {
         assert_eq!(commands.len(), 1);
         if let Command::Tts { text, .. } = &commands[0] {
             assert_eq!(text, rag_instruction);
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_interruption_protection_period() -> Result<()> {
+        let provider = Arc::new(TestProvider::new(vec!["Some long response".to_string()]));
+        let mut config = crate::playbook::InterruptionConfig::default();
+        config.ignore_first_ms = Some(800);
+
+        let mut handler = LlmHandler::with_provider(
+            LlmConfig::default(),
+            provider,
+            Arc::new(NoopRagRetriever),
+            config,
+            HashMap::new(),
+            None,
+            None,
+        );
+
+        // 1. Trigger a response
+        let event = SessionEvent::AsrFinal {
+            track_id: "test".to_string(),
+            timestamp: 0,
+            index: 0,
+            start_time: None,
+            end_time: None,
+            text: "hello".to_string(),
+            is_filler: None,
+            confidence: None,
+        };
+        handler.on_event(&event).await?;
+        assert!(handler.is_speaking);
+
+        // 2. Simulate user starting to speak immediately (AsrDelta)
+        let event = SessionEvent::AsrDelta {
+            track_id: "test".to_string(),
+            timestamp: 0,
+            index: 0,
+            start_time: None,
+            end_time: None,
+            text: "I...".to_string(),
+            is_filler: None,
+            confidence: None,
+        };
+        let commands = handler.on_event(&event).await?;
+        // Should be ignored due to protection period
+        assert_eq!(commands.len(), 0);
+        assert!(handler.is_speaking);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_interruption_filler_word() -> Result<()> {
+        let provider = Arc::new(TestProvider::new(vec!["Some long response".to_string()]));
+        let mut config = crate::playbook::InterruptionConfig::default();
+        config.filler_word_filter = Some(true);
+        config.ignore_first_ms = Some(0); // Disable protection period for this test
+
+        let mut handler = LlmHandler::with_provider(
+            LlmConfig::default(),
+            provider,
+            Arc::new(NoopRagRetriever),
+            config,
+            HashMap::new(),
+            None,
+            None,
+        );
+
+        // 1. Trigger a response
+        let event = SessionEvent::AsrFinal {
+            track_id: "test".to_string(),
+            timestamp: 0,
+            index: 0,
+            start_time: None,
+            end_time: None,
+            text: "hello".to_string(),
+            is_filler: None,
+            confidence: None,
+        };
+        handler.on_event(&event).await?;
+        assert!(handler.is_speaking);
+
+        // Sleep to bypass the 500ms stale event guard
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+        // 2. Simulate user saying "uh" (filler)
+        let event = SessionEvent::AsrDelta {
+            track_id: "test".to_string(),
+            timestamp: 0,
+            index: 0,
+            start_time: None,
+            end_time: None,
+            text: "uh".to_string(),
+            is_filler: Some(true),
+            confidence: None,
+        };
+        let commands = handler.on_event(&event).await?;
+        // Should be ignored
+        assert_eq!(commands.len(), 0);
+        assert!(handler.is_speaking);
+
+        // 3. Simulate user saying "Wait" (not filler)
+        let event = SessionEvent::AsrDelta {
+            track_id: "test".to_string(),
+            timestamp: 0,
+            index: 0,
+            start_time: None,
+            end_time: None,
+            text: "Wait".to_string(),
+            is_filler: Some(false),
+            confidence: None,
+        };
+        let commands = handler.on_event(&event).await?;
+        // Should trigger interruption
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(commands[0], Command::Interrupt { .. }));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_eou_early_response() -> Result<()> {
+        let provider = Arc::new(TestProvider::new(vec![
+            "End of Utterance response".to_string(),
+        ]));
+        let mut handler = LlmHandler::with_provider(
+            LlmConfig::default(),
+            provider,
+            Arc::new(NoopRagRetriever),
+            crate::playbook::InterruptionConfig::default(),
+            HashMap::new(),
+            None,
+            None,
+        );
+
+        // 1. Receive EOU
+        let event = SessionEvent::Eou {
+            track_id: "test".to_string(),
+            timestamp: 0,
+            completed: true,
+        };
+        let commands = handler.on_event(&event).await?;
+        assert_eq!(commands.len(), 1);
+        if let Command::Tts { text, .. } = &commands[0] {
+            assert_eq!(text, "End of Utterance response");
+        } else {
+            panic!("Expected Tts");
         }
 
         Ok(())

@@ -7,3 +7,4 @@ Cargo.lock
 .env
 *.decoded
 *.encoded
+.DS_Store

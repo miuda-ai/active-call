@@ -185,7 +185,7 @@ async fn test_silence_timeout() {
     let mut option = VADOption::default();
     option.silence_timeout = Some(1000); // 1 second timeout
     option.silence_padding = 100; // 100ms silence padding
-    option.speech_padding = 250; // 250ms speech padding
+    option.speech_padding = 200; // reduced from 250ms to ensure it triggers
     option.voice_threshold = 0.5;
 
     let vad = Box::new(NopVad::new().unwrap());

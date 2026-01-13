@@ -88,6 +88,7 @@ pub struct SynthesisOption {
     pub speaker: Option<String>,
     pub codec: Option<String>,
     pub subtitle: Option<bool>,
+    pub model: Option<String>,
     /// emotion: neutral、sad、happy、angry、fear、news、story、radio、poetry、
     /// call、sajiao、disgusted、amaze、peaceful、exciting、aojiao、jieshuo
     pub emotion: Option<String>,
@@ -110,6 +111,7 @@ impl SynthesisOption {
                 speaker: other.speaker.or(self.speaker.clone()),
                 codec: other.codec.or(self.codec.clone()),
                 subtitle: other.subtitle.or(self.subtitle),
+                model: other.model.or(self.model.clone()),
                 emotion: other.emotion.or(self.emotion.clone()),
                 endpoint: other.endpoint.or(self.endpoint.clone()),
                 extra: other.extra.or(self.extra.clone()),
@@ -199,6 +201,7 @@ impl Default for SynthesisOption {
             speaker: None,
             codec: Some("pcm".to_string()),
             subtitle: None,
+            model: None,
             emotion: None,
             endpoint: None,
             extra: None,

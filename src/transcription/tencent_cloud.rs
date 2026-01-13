@@ -381,6 +381,8 @@ impl TencentCloudAsrClient {
                                             timestamp: crate::media::get_timestamp(),
                                             start_time: Some(begin_time + result.start_time as u64),
                                             end_time: Some(begin_time + result.end_time as u64),
+                                            is_filler: None,
+                                            confidence: None,
                                         }
                                     } else {
                                         SessionEvent::AsrDelta {
@@ -390,6 +392,8 @@ impl TencentCloudAsrClient {
                                             timestamp: crate::media::get_timestamp(),
                                             start_time: Some(begin_time + result.start_time as u64),
                                             end_time: Some(begin_time + result.end_time as u64),
+                                            is_filler: None,
+                                            confidence: None,
                                         }
                                     };
                                     event_sender.send(event).ok()?;

@@ -1,13 +1,16 @@
 use serde::{Deserialize, Serialize};
 
+pub mod ambiance;
 pub mod asr_processor;
 pub mod cache;
 pub mod denoiser;
 pub mod dtmf;
 pub mod engine;
 pub mod inactivity;
+pub mod loader;
 pub mod negotiate;
 pub mod processor;
+pub mod realtime_processor;
 pub mod recorder;
 pub mod stream;
 #[cfg(test)]

@@ -1,10 +1,10 @@
 use super::{
+    INTERNAL_SAMPLERATE,
     asr_processor::AsrProcessor,
     denoiser::NoiseReducer,
-    INTERNAL_SAMPLERATE,
     processor::Processor,
     track::{
-        Track,
+        Track, TrackPacketSender,
         tts::{SynthesisHandle, TtsTrack},
     },
     vad::{VADOption, VadProcessor, VadType},
@@ -60,6 +60,7 @@ pub type CreateProcessorsHook = Box<
             &dyn Track,
             CancellationToken,
             EventSender,
+            TrackPacketSender,
             CallOption,
         ) -> Pin<Box<dyn Future<Output = Result<Vec<Box<dyn Processor>>>> + Send>>
         + Send
@@ -219,6 +220,7 @@ impl StreamEngine {
         track: &dyn Track,
         cancel_token: CancellationToken,
         event_sender: EventSender,
+        packet_sender: TrackPacketSender,
         option: &CallOption,
     ) -> Result<Vec<Box<dyn Processor>>> {
         (engine.clone().create_processors_hook)(
@@ -226,6 +228,7 @@ impl StreamEngine {
             track,
             cancel_token,
             event_sender,
+            packet_sender,
             option.clone(),
         )
         .await
@@ -260,12 +263,29 @@ impl StreamEngine {
         track: &dyn Track,
         cancel_token: CancellationToken,
         event_sender: EventSender,
+        packet_sender: TrackPacketSender,
         option: CallOption,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Box<dyn Processor>>>> + Send>> {
         let track_id = track.id().clone();
         Box::pin(async move {
             let mut processors = vec![];
             debug!(track_id = %track_id, "Creating processors for track");
+
+            if let Some(realtime_option) = option.realtime {
+                debug!(track_id = %track_id, "Adding RealtimeProcessor");
+                let realtime_processor = crate::media::realtime_processor::RealtimeProcessor::new(
+                    track_id.clone(),
+                    cancel_token.child_token(),
+                    event_sender.clone(),
+                    packet_sender.clone(),
+                    realtime_option,
+                )?;
+                processors.push(Box::new(realtime_processor) as Box<dyn Processor>);
+                // In realtime mode, we usually don't need separate VAD or ASR processors
+                // as they are handled by the realtime service (OpenAI/Azure)
+                return Ok(processors);
+            }
+
             match option.denoise {
                 Some(true) => {
                     debug!(track_id = %track_id, "Adding NoiseReducer processor");

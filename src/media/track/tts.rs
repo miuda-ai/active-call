@@ -238,13 +238,12 @@ impl TtsTask {
                         }
                     }
 
-                    // waiting for first chunk
-                    if i == 0 && self.cur_seq == 0 && self.metadatas.get(&self.cur_seq).map(|entry| entry.emitted_bytes).unwrap_or(0) == 0 {
-                        continue;
-                    }
-
-                    let samples = Samples::PCM{
-                        samples: bytes_to_samples(&samples[..]),
+                    let samples = if i == 0 {
+                        Samples::Empty
+                    } else {
+                        Samples::PCM {
+                            samples: bytes_to_samples(&samples[..]),
+                        }
                     };
 
                     let mut frame = AudioFrame {

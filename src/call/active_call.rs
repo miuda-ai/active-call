@@ -2,8 +2,9 @@ use super::Command;
 use crate::{
     CallOption, ReferOption,
     event::{EventReceiver, EventSender, SessionEvent},
-    media::TrackId,
     media::{
+        TrackId,
+        ambiance::AmbianceProcessor,
         engine::StreamEngine,
         negotiate::strip_ipv6_candidates,
         recorder::RecorderOption,
@@ -346,6 +347,17 @@ impl ActiveCall {
                             *input_timeout_expire_ref.lock().await = expire;
                         }
                     }
+                    SessionEvent::Interrupt { receiver } => {
+                        let track_id =
+                            receiver.unwrap_or_else(|| self.server_side_track_id.clone());
+                        if track_id == self.server_side_track_id {
+                            debug!(
+                                session_id = self.session_id,
+                                "received interrupt event, stopping playback"
+                            );
+                            self.do_interrupt(true).await.ok();
+                        }
+                    }
                     SessionEvent::Inactivity { track_id, .. } => {
                         info!(
                             session_id = self.session_id,
@@ -479,9 +491,10 @@ impl ActiveCall {
             Command::Unmute { track_id } => self.do_unmute(track_id).await,
             Command::Pause {} => self.do_pause().await,
             Command::Resume {} => self.do_resume().await,
-            Command::Interrupt { graceful: passage } => {
-                self.do_interrupt(passage.unwrap_or_default()).await
-            }
+            Command::Interrupt {
+                graceful: passage,
+                fade_out_ms: _,
+            } => self.do_interrupt(passage.unwrap_or_default()).await,
             Command::History { speaker, text } => self.do_history(speaker, text).await,
         }
     }
@@ -1391,6 +1404,7 @@ impl ActiveCall {
             track.as_ref(),
             self.cancel_token.child_token(),
             self.event_sender.clone(),
+            self.media_stream.packet_sender.clone(),
             option,
         )
         .await
@@ -1414,7 +1428,31 @@ impl ActiveCall {
         Ok(())
     }
 
-    pub async fn update_track_wrapper(&self, track: Box<dyn Track>, play_id: Option<String>) {
+    pub async fn update_track_wrapper(&self, mut track: Box<dyn Track>, play_id: Option<String>) {
+        let ambiance_opt = {
+            let state = self.call_state.read().await;
+            let mut opt = state
+                .option
+                .as_ref()
+                .and_then(|o| o.ambiance.clone())
+                .unwrap_or_default();
+
+            if let Some(global) = &self.app_state.config.ambiance {
+                opt.merge(global);
+            }
+            opt
+        };
+        if track.id() == &self.server_side_track_id && ambiance_opt.path.is_some() {
+            match AmbianceProcessor::new(ambiance_opt).await {
+                Ok(ambiance) => {
+                    info!(session_id = self.session_id, "loaded ambiance processor");
+                    track.append_processor(Box::new(ambiance));
+                }
+                Err(e) => {
+                    tracing::error!("failed to load ambiance wav {}", e);
+                }
+            }
+        }
         self.call_state.write().await.current_play_id = play_id.clone();
         self.media_stream.update_track(track, play_id).await;
     }
@@ -1817,6 +1855,9 @@ impl ActiveCallState {
             }
             if option.extra.is_none() {
                 option.extra = existing.extra.clone();
+            }
+            if option.ambiance.is_none() {
+                option.ambiance = existing.ambiance.clone();
             }
         }
         option

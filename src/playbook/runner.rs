@@ -3,9 +3,7 @@ use crate::call::ActiveCallRef;
 use anyhow::{Result, anyhow};
 use tracing::{error, info};
 
-use super::{
-    InterruptionStrategy, Playbook, PlaybookConfig, dialogue::DialogueHandler, handler::LlmHandler,
-};
+use super::{Playbook, PlaybookConfig, dialogue::DialogueHandler, handler::LlmHandler};
 
 pub struct PlaybookRunner {
     handler: Box<dyn DialogueHandler>,
@@ -32,12 +30,16 @@ impl PlaybookRunner {
             if let Some(greeting) = playbook.config.greeting {
                 llm_config.greeting = Some(greeting);
             }
-            let strategy = playbook
-                .config
-                .interruption
-                .unwrap_or(InterruptionStrategy::Both);
+            let interruption_config = playbook.config.interruption.clone().unwrap_or_default();
+            let dtmf_config = playbook.config.dtmf.clone();
 
-            let mut llm_handler = LlmHandler::new(llm_config, strategy);
+            let mut llm_handler = LlmHandler::new(
+                llm_config,
+                interruption_config,
+                playbook.scenes,
+                dtmf_config,
+                playbook.initial_scene_id,
+            );
             // Set event sender for debugging
             llm_handler.set_event_sender(call.event_sender.clone());
             llm_handler.set_call(call.clone());
@@ -137,11 +139,20 @@ pub fn apply_playbook_config(option: &mut CallOption, config: &PlaybookConfig) {
     if let Some(denoise) = config.denoise {
         option.denoise = Some(denoise);
     }
+    if let Some(ambiance) = config.ambiance.clone() {
+        option.ambiance = Some(ambiance);
+    }
     if let Some(recorder) = config.recorder.clone() {
         option.recorder = Some(recorder);
     }
     if let Some(extra) = config.extra.clone() {
         option.extra = Some(extra);
+    }
+    if let Some(mut realtime) = config.realtime.clone() {
+        if realtime.secret_key.is_none() {
+            realtime.secret_key = api_key.clone();
+        }
+        option.realtime = Some(realtime);
     }
     if let Some(mut eou) = config.eou.clone() {
         if eou.secret_key.is_none() {

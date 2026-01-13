@@ -79,10 +79,29 @@ pub enum SessionEvent {
         end_time: u64,
         text: String,
     },
+    Transcription {
+        track_id: String,
+        text: String,
+        is_final: bool,
+        timestamp: u64,
+        extra: Option<serde_json::Value>,
+    },
+    Interrupt {
+        receiver: Option<String>,
+    },
+    FunctionCall {
+        track_id: String,
+        call_id: String,
+        name: String,
+        arguments: String,
+        timestamp: u64,
+    },
     Speaking {
         track_id: String,
         timestamp: u64,
         start_time: u64,
+        is_filler: Option<bool>,
+        confidence: Option<f32>,
     },
     Silence {
         track_id: String,
@@ -133,6 +152,8 @@ pub enum SessionEvent {
         start_time: Option<u64>,
         end_time: Option<u64>,
         text: String,
+        is_filler: Option<bool>,
+        confidence: Option<f32>,
     },
     AsrDelta {
         track_id: String,
@@ -141,6 +162,8 @@ pub enum SessionEvent {
         start_time: Option<u64>,
         end_time: Option<u64>,
         text: String,
+        is_filler: Option<bool>,
+        confidence: Option<f32>,
     },
     Metrics {
         timestamp: u64,

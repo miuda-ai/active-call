@@ -43,7 +43,7 @@ impl Default for VADOption {
         Self {
             r#type: VadType::Silero,
             samplerate: 16000,
-            speech_padding: 200,  // min_speech_duration_ms
+            speech_padding: 100,  // min_speech_duration_ms
             silence_padding: 100, // min_silence_duration_ms
             ratio: 0.5,
             voice_threshold: 0.5,
@@ -106,6 +106,7 @@ struct VadProcessorInner {
     option: VADOption,
     window_bufs: Vec<SpeechBuf>,
     triggered: bool,
+    triggered_event_sent: bool,
     current_speech_start: Option<u64>,
     temp_end: Option<u64>,
 }
@@ -159,12 +160,25 @@ impl VadProcessorInner {
         if is_speaking && !self.triggered {
             self.triggered = true;
             self.current_speech_start = Some(timestamp);
-            let event = SessionEvent::Speaking {
-                track_id: track_id.to_string(),
-                timestamp: crate::media::get_timestamp(),
-                start_time: timestamp,
-            };
-            self.event_sender.send(event).ok();
+            self.triggered_event_sent = false;
+        } else if is_speaking && self.triggered {
+            // Already triggered, check if we need to emit Speaking event for the first time
+            if let Some(start_time) = self.current_speech_start {
+                let duration = timestamp.saturating_sub(start_time);
+                // L1 filter: only emit Speaking if duration is enough (e.g. 200ms)
+                // Use speech_padding as min_speech_duration
+                if duration >= self.option.speech_padding && !self.triggered_event_sent {
+                    let event = SessionEvent::Speaking {
+                        track_id: track_id.to_string(),
+                        timestamp: crate::media::get_timestamp(),
+                        start_time,
+                        is_filler: None, // Will be enriched by MFCC or ASR
+                        confidence: Some(1.0),
+                    };
+                    self.event_sender.send(event).ok();
+                    self.triggered_event_sent = true;
+                }
+            }
         } else if !is_speaking {
             if self.temp_end.is_none() {
                 self.temp_end = Some(timestamp);
@@ -202,6 +216,7 @@ impl VadProcessorInner {
                         }
                     }
                     self.triggered = false;
+                    self.triggered_event_sent = false;
                     self.current_speech_start = None;
                     self.temp_end = Some(timestamp); // Update temp_end for silence timeout tracking
                 }
@@ -224,7 +239,9 @@ impl VadProcessorInner {
                     }
                 }
             }
-        } else if is_speaking && self.temp_end.is_some() {
+        }
+
+        if is_speaking && self.temp_end.is_some() {
             self.temp_end = None;
         }
 
@@ -266,6 +283,7 @@ impl VadProcessor {
             event_sender,
             option,
             window_bufs: Vec::new(),
+            triggered_event_sent: false,
             triggered: false,
             current_speech_start: None,
             temp_end: None,

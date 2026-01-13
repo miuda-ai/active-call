@@ -5,11 +5,12 @@ use active_call::event::SessionEvent;
 use active_call::media::engine::StreamEngine;
 use active_call::media::track::TrackConfig;
 use active_call::playbook::{
-    InterruptionStrategy, LlmConfig, PlaybookRunner,
+    LlmConfig, PlaybookRunner,
     handler::{ChatMessage, LlmHandler, LlmProvider, RagRetriever},
 };
 use anyhow::Result;
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -100,7 +101,8 @@ async fn test_playbook_run_flow() -> Result<()> {
         llm_config.clone(),
         provider,
         Arc::new(NoopRag),
-        InterruptionStrategy::Both,
+        active_call::playbook::InterruptionConfig::default(),
+        HashMap::new(), None, None,
     );
 
     // 4. Create Runner
@@ -138,6 +140,8 @@ async fn test_playbook_run_flow() -> Result<()> {
         start_time: None,
         end_time: None,
         text: "I need help".to_string(),
+        is_filler: None,
+        confidence: None,
     };
 
     // Send event
@@ -213,7 +217,8 @@ async fn test_playbook_hangup_flow() -> Result<()> {
         LlmConfig::default(),
         provider,
         Arc::new(NoopRag),
-        InterruptionStrategy::Both,
+        active_call::playbook::InterruptionConfig::default(),
+        HashMap::new(), None, None,
     );
     let runner = PlaybookRunner::with_handler(Box::new(llm_handler), active_call.clone());
 
@@ -287,7 +292,8 @@ async fn test_playbook_accept_flow() -> Result<()> {
         LlmConfig::default(),
         provider,
         Arc::new(NoopRag),
-        InterruptionStrategy::Both,
+        active_call::playbook::InterruptionConfig::default(),
+        HashMap::new(), None, None,
     );
     let runner = PlaybookRunner::with_handler(Box::new(llm_handler), active_call.clone());
 
@@ -343,7 +349,8 @@ async fn test_playbook_reject_flow() -> Result<()> {
         LlmConfig::default(),
         provider,
         Arc::new(NoopRag),
-        InterruptionStrategy::Both,
+        active_call::playbook::InterruptionConfig::default(),
+        HashMap::new(), None, None,
     );
     let runner = PlaybookRunner::with_handler(Box::new(llm_handler), active_call.clone());
 

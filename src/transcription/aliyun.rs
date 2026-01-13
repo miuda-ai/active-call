@@ -352,6 +352,8 @@ impl AliyunAsrClient {
                                         timestamp: crate::media::get_timestamp(),
                                         start_time: Some(sentence_start_time),
                                         end_time: Some(sentence_end_time),
+                                        is_filler: None,
+                                        confidence: None,
                                     }
                                 } else {
                                     SessionEvent::AsrDelta {
@@ -361,6 +363,8 @@ impl AliyunAsrClient {
                                         timestamp: crate::media::get_timestamp(),
                                         start_time: Some(sentence_start_time),
                                         end_time: Some(sentence_end_time),
+                                        is_filler: None,
+                                        confidence: None,
                                     }
                                 };
                                 event_sender.send(event).ok();

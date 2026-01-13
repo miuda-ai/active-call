@@ -9,11 +9,9 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use audio_codec::Resampler;
 use hound::WavReader;
-use reqwest::Client;
-use rmp3;
 use std::cmp::min;
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::io::BufReader;
 use std::time::Instant;
 use tokio::select;
 use tokio::time::Duration;
@@ -21,29 +19,25 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use url::Url;
 
-// AudioReader trait to unify WAV and MP3 handling
 trait AudioReader: Send {
     fn fill_buffer(&mut self) -> Result<usize>;
 
     fn read_chunk(&mut self, packet_duration_ms: u32) -> Result<Option<(PcmBuf, u32)>> {
         let max_chunk_size = self.sample_rate() as usize * packet_duration_ms as usize / 1000;
 
-        // If we have no samples in buffer, try to fill it
         if self.buffer_size() == 0 || self.position() >= self.buffer_size() {
             let samples_read = self.fill_buffer()?;
             if samples_read == 0 {
-                return Ok(None); // End of file reached with no more samples
+                return Ok(None);
             }
-            self.set_position(0); // Reset position for new buffer
+            self.set_position(0);
         }
 
-        // Calculate how many samples we can return
         let remaining = self.buffer_size() - self.position();
         if remaining == 0 {
             return Ok(None);
         }
 
-        // Use either max_chunk_size or all remaining samples
         let chunk_size = min(max_chunk_size, remaining);
         let end_pos = self.position() + chunk_size;
 
@@ -58,7 +52,6 @@ trait AudioReader: Send {
         let chunk = self.extract_chunk(self.position(), end_pos);
         self.set_position(end_pos);
 
-        // Resample if needed
         let final_chunk =
             if self.sample_rate() != self.target_sample_rate() && self.sample_rate() > 0 {
                 self.resample_chunk(&chunk)
@@ -69,7 +62,6 @@ trait AudioReader: Send {
         Ok(Some((final_chunk, self.target_sample_rate())))
     }
 
-    // Accessor methods for internal properties
     fn buffer_size(&self) -> usize;
     fn position(&self) -> usize;
     fn set_position(&mut self, pos: usize);
@@ -90,87 +82,10 @@ struct WavAudioReader {
 
 impl WavAudioReader {
     fn from_file(file: File, target_sample_rate: u32) -> Result<Self> {
-        let reader = BufReader::new(file);
-        let mut wav_reader = WavReader::new(reader)?;
-        let spec = wav_reader.spec();
-        let sample_rate = spec.sample_rate;
-        let is_stereo = spec.channels == 2;
-
-        info!(
-            "WAV file detected with sample rate: {} Hz, channels: {}, bits: {}",
-            sample_rate, spec.channels, spec.bits_per_sample
-        );
-
-        let mut all_samples = Vec::new();
-
-        // Read all samples based on format and bit depth
-        match spec.sample_format {
-            hound::SampleFormat::Int => match spec.bits_per_sample {
-                16 => {
-                    for sample in wav_reader.samples::<i16>() {
-                        if let Ok(s) = sample {
-                            all_samples.push(s);
-                        } else {
-                            break;
-                        }
-                    }
-                }
-                8 => {
-                    for sample in wav_reader.samples::<i8>() {
-                        if let Ok(s) = sample {
-                            all_samples.push((s as i16) * 256); // Convert 8-bit to 16-bit
-                        } else {
-                            break;
-                        }
-                    }
-                }
-                24 | 32 => {
-                    for sample in wav_reader.samples::<i32>() {
-                        if let Ok(s) = sample {
-                            all_samples.push((s >> 16) as i16); // Convert 24/32-bit to 16-bit
-                        } else {
-                            break;
-                        }
-                    }
-                }
-                _ => {
-                    return Err(anyhow!(
-                        "Unsupported bits per sample: {}",
-                        spec.bits_per_sample
-                    ));
-                }
-            },
-            hound::SampleFormat::Float => {
-                for sample in wav_reader.samples::<f32>() {
-                    if let Ok(s) = sample {
-                        all_samples.push((s * 32767.0) as i16); // Convert float to 16-bit
-                    } else {
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Convert stereo to mono if needed
-        if is_stereo {
-            let mono_samples = all_samples
-                .chunks(2)
-                .map(|chunk| {
-                    if chunk.len() == 2 {
-                        ((chunk[0] as i32 + chunk[1] as i32) / 2) as i16
-                    } else {
-                        chunk[0]
-                    }
-                })
-                .collect();
-            all_samples = mono_samples;
-        }
-
-        info!("Decoded {} samples from WAV file", all_samples.len());
-
+        let all_samples = crate::media::loader::decode_wav(file, target_sample_rate)?;
         Ok(Self {
             buffer: all_samples,
-            sample_rate,
+            sample_rate: target_sample_rate,
             position: 0,
             target_sample_rate,
             resampler: None,
@@ -251,32 +166,10 @@ struct Mp3AudioReader {
 
 impl Mp3AudioReader {
     fn from_file(file: File, target_sample_rate: u32) -> Result<Self> {
-        let mut reader = BufReader::new(file);
-        let mut file_data = Vec::new();
-        reader.read_to_end(&mut file_data)?;
-
-        let mut decoder = rmp3::Decoder::new(&file_data);
-        let mut all_samples = Vec::new();
-        let mut sample_rate = 0;
-
-        while let Some(frame) = decoder.next() {
-            match frame {
-                rmp3::Frame::Audio(audio) => {
-                    if sample_rate == 0 {
-                        sample_rate = audio.sample_rate();
-                        info!("MP3 file detected with sample rate: {} Hz", sample_rate);
-                    }
-                    all_samples.extend_from_slice(audio.samples());
-                }
-                rmp3::Frame::Other(_) => {}
-            }
-        }
-
-        info!("Decoded {} samples from MP3 file", all_samples.len());
-
+        let all_samples = crate::media::loader::decode_mp3(file, target_sample_rate)?;
         Ok(Self {
             buffer: all_samples,
-            sample_rate,
+            sample_rate: target_sample_rate,
             position: 0,
             target_sample_rate,
             resampler: None,
@@ -534,7 +427,7 @@ impl Track for FileTrack {
 
             // Open file or download from URL
             let file = if path.starts_with("http://") || path.starts_with("https://") {
-                download_from_url(&path, use_cache).await
+                crate::media::loader::download_from_url(&path, use_cache).await
             } else {
                 File::open(&path).map_err(|e| anyhow::anyhow!("filetrack: {}", e))
             };
@@ -627,54 +520,6 @@ impl Track for FileTrack {
     async fn send_packet(&mut self, _packet: &AudioFrame) -> Result<()> {
         Ok(())
     }
-}
-
-/// Download a file from URL, with optional caching
-async fn download_from_url(url: &str, use_cache: bool) -> Result<File> {
-    // Check if file is already cached
-    let cache_key = cache::generate_cache_key(url, 0, None, None);
-    if use_cache && cache::is_cached(&cache_key).await? {
-        match cache::get_cache_path(&cache_key) {
-            Ok(path) => return File::open(&path).map_err(|e| anyhow::anyhow!(e)),
-            Err(e) => {
-                warn!("filetrack: Error getting cache path: {}", e);
-                return Err(e);
-            }
-        }
-    }
-
-    // Download file if not cached
-    let start_time = Instant::now();
-    let client = Client::new();
-    let response = client.get(url).send().await?;
-    let bytes = response.bytes().await?;
-    let data = bytes.to_vec();
-    let duration = start_time.elapsed();
-
-    info!(
-        "filetrack: Downloaded {} bytes in {:?} for {}",
-        data.len(),
-        duration,
-        url,
-    );
-
-    // Store in cache if enabled
-    if use_cache {
-        cache::store_in_cache(&cache_key, &data).await?;
-        match cache::get_cache_path(&cache_key) {
-            Ok(path) => return File::open(path).map_err(|e| anyhow::anyhow!(e)),
-            Err(e) => {
-                warn!("filetrack: Error getting cache path: {}", e);
-                return Err(e);
-            }
-        }
-    }
-
-    // Return temporary file with downloaded data
-    let mut temp_file = tempfile::tempfile()?;
-    temp_file.write_all(&data)?;
-    temp_file.seek(SeekFrom::Start(0))?;
-    Ok(temp_file)
 }
 
 // Helper function to stream a WAV or MP3 file

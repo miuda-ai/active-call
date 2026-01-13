@@ -44,6 +44,7 @@ fn create_test_config(sip_port: u16, http_port: u16, webhook_port: u16) -> Confi
         ice_servers: None,
         recording: None,
         rewrites: None,
+        ambiance: None,
     }
 }
 

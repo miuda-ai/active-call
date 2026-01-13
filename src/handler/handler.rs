@@ -114,7 +114,8 @@ pub async fn call_handler(
             let mut pending = app_state.pending_playbooks.lock().await;
             if let Some(name) = pending.remove(&session_id) {
                 let path = PathBuf::from("config/playbook").join(&name);
-                match Playbook::load(path).await {
+                let variables = active_call.call_state.read().await.extras.clone();
+                match Playbook::load(path, variables.as_ref()).await {
                     Ok(playbook) => match PlaybookRunner::new(playbook, active_call.clone()) {
                         Ok(runner) => {
                             tokio::spawn(async move {
@@ -126,6 +127,19 @@ pub async fn call_handler(
                     },
                     Err(e) => {
                         warn!(session_id, "Failed to load playbook {}: {}", name, e);
+                        let event = SessionEvent::Error {
+                            timestamp: crate::media::get_timestamp(),
+                            track_id: session_id,
+                            sender: "playbook".to_string(),
+                            error: format!("{}", e),
+                            code: None,
+                        };
+                        let message = match event.into_ws_message() {
+                            Ok(msg) => msg,
+                            Err(_) => return,
+                        };
+                        ws_sender.send(message).await.ok();
+                        return;
                     }
                 }
             }
