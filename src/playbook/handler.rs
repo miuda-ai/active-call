@@ -42,13 +42,8 @@ static FILLERS: Lazy<std::collections::HashSet<String>> = Lazy::new(|| {
 
 use super::InterruptionStrategy;
 use super::LlmConfig;
+use super::ChatMessage;
 use super::dialogue::DialogueHandler;
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ChatMessage {
-    pub role: String,
-    pub content: String,
-}
 
 const MAX_RAG_ATTEMPTS: usize = 3;
 
@@ -421,7 +416,7 @@ impl LlmHandler {
         }
     }
 
-    pub fn get_history(&self) -> &[ChatMessage] {
+    pub fn get_history_ref(&self) -> &[ChatMessage] {
         &self.history
     }
 
@@ -1180,6 +1175,21 @@ impl DialogueHandler for LlmHandler {
             _ => Ok(vec![]),
         }
     }
+
+    async fn get_history(&self) -> Vec<ChatMessage> {
+        self.history.clone()
+    }
+
+    async fn summarize(&mut self, prompt: &str) -> Result<String> {
+        info!("Generating summary with prompt: {}", prompt);
+        let mut summary_history = self.history.clone();
+        summary_history.push(ChatMessage {
+            role: "user".to_string(),
+            content: prompt.to_string(),
+        });
+
+        self.provider.call(&self.config, &summary_history).await
+    }
 }
 
 #[cfg(test)]
@@ -1769,6 +1779,40 @@ mod tests {
         } else {
             panic!("Expected Tts");
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_summary_and_history() -> Result<()> {
+        let provider = Arc::new(TestProvider::new(vec!["Test summary".to_string()]));
+        let mut handler = LlmHandler::with_provider(
+            LlmConfig::default(),
+            provider,
+            Arc::new(NoopRagRetriever),
+            crate::playbook::InterruptionConfig::default(),
+            HashMap::new(),
+            None,
+            None,
+        );
+
+        // Add some history
+        handler.history.push(ChatMessage {
+            role: "user".to_string(),
+            content: "Hello".to_string(),
+        });
+        handler.history.push(ChatMessage {
+            role: "assistant".to_string(),
+            content: "Hi there".to_string(),
+        });
+
+        // Test get_history
+        let history = handler.get_history().await;
+        assert_eq!(history.len(), 3); // system + user + assistant
+
+        // Test summarize
+        let summary = handler.summarize("Summarize this").await?;
+        assert_eq!(summary, "Test summary");
 
         Ok(())
     }

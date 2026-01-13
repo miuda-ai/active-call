@@ -5,8 +5,8 @@ use active_call::event::SessionEvent;
 use active_call::media::engine::StreamEngine;
 use active_call::media::track::TrackConfig;
 use active_call::playbook::{
-    LlmConfig, PlaybookRunner,
-    handler::{ChatMessage, LlmHandler, LlmProvider, RagRetriever},
+    ChatMessage, LlmConfig, PlaybookConfig, PlaybookRunner,
+    handler::{LlmHandler, LlmProvider, RagRetriever},
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -106,7 +106,11 @@ async fn test_playbook_run_flow() -> Result<()> {
     );
 
     // 4. Create Runner
-    let runner = PlaybookRunner::with_handler(Box::new(llm_handler), active_call.clone());
+    let runner = PlaybookRunner::with_handler(
+        Box::new(llm_handler),
+        active_call.clone(),
+        PlaybookConfig::default(),
+    );
 
     // 5. Run Runner in background
     let join_handle = tokio::spawn(async move {
@@ -220,7 +224,11 @@ async fn test_playbook_hangup_flow() -> Result<()> {
         active_call::playbook::InterruptionConfig::default(),
         HashMap::new(), None, None,
     );
-    let runner = PlaybookRunner::with_handler(Box::new(llm_handler), active_call.clone());
+    let runner = PlaybookRunner::with_handler(
+        Box::new(llm_handler),
+        active_call.clone(),
+        PlaybookConfig::default(),
+    );
 
     tokio::spawn(async move {
         runner.run().await;
@@ -295,7 +303,11 @@ async fn test_playbook_accept_flow() -> Result<()> {
         active_call::playbook::InterruptionConfig::default(),
         HashMap::new(), None, None,
     );
-    let runner = PlaybookRunner::with_handler(Box::new(llm_handler), active_call.clone());
+    let runner = PlaybookRunner::with_handler(
+        Box::new(llm_handler),
+        active_call.clone(),
+        PlaybookConfig::default(),
+    );
 
     tokio::spawn(async move {
         runner.run().await;
@@ -352,7 +364,11 @@ async fn test_playbook_reject_flow() -> Result<()> {
         active_call::playbook::InterruptionConfig::default(),
         HashMap::new(), None, None,
     );
-    let runner = PlaybookRunner::with_handler(Box::new(llm_handler), active_call.clone());
+    let runner = PlaybookRunner::with_handler(
+        Box::new(llm_handler),
+        active_call.clone(),
+        PlaybookConfig::default(),
+    );
 
     tokio::spawn(async move {
         runner.run().await;

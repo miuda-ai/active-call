@@ -20,7 +20,7 @@ The **Playbook** system is our recommended way to build complex, stateful voice 
 - **Markdown-Driven**: Define personas, instructions, and flows in readable Markdown files.
 - **Stateful Scenes**: Manage conversation stages with easy transitions (`Scene` switching).
 - **Tool Integration**: Built-in support for DTMF, SIP Refer (Transfer), and custom Function Calling.
-- **Advanced Interaction**: Smart interruptions, filler word filtering, and background ambiance with auto-ducking.
+- **Advanced Interaction**: Smart interruptions, filler word filtering, background ambiance, and automated post-call summaries via Webhooks.
 
 ### 4. High-Performance Media Core
 - **Low-Latency VAD**: Includes **TinySilero** (optimized Rust implementation), significantly faster than standard ONNX models.
@@ -66,6 +66,12 @@ For detailed information on REST endpoints and WebSocket protocols, please refer
   - **Background Ambiance**: Supports looping background audio (e.g., office noise) with auto-ducking during conversation.
   - **DTMF Support**: Standard IVR functionality. Define global or scene-specific keypress actions (jump to scene, transfer call, or hang up).
   - **Pre-recorded Audio**: Play fixed audio files (`.wav`/`.pcm`) by adding `<play file="path/to/audio.wav" />` at the beginning of a scene.
+  - **Post-hook & Summary**: Automatically generate conversation summaries and send them to a Webhook URL after the call ends. Supports multiple summary templates:
+    - `short`: One or two sentence summary.
+    - `detailed`: Comprehensive summary with key points and decisions.
+    - `intent`: Extracted user intent.
+    - `json`: Structured JSON summary.
+    - `custom`: Fully custom summary prompt.
 
 - **Advanced Voice Interaction**:
   - **Smart Interruption**: Multiple strategies (`vad`, `asr`, or `both`), filler word filtering, and protection periods.
@@ -89,6 +95,10 @@ llm:
   model: "gpt-4-turbo"
 dtmf:
   "0": { action: "hangup" }
+posthook:
+  url: "https://api.example.com/webhook"
+  summary: "detailed"
+  includeHistory: true
 ---
 
 # Scene: greeting

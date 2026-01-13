@@ -1,19 +1,22 @@
+use super::ChatMessage;
 use crate::call::Command;
+use crate::event::SessionEvent;
 use anyhow::Result;
 use async_trait::async_trait;
-use crate::event::SessionEvent;
 
 #[async_trait]
 pub trait DialogueHandler: Send + Sync {
     async fn on_start(&mut self) -> Result<Vec<Command>>;
     async fn on_event(&mut self, event: &SessionEvent) -> Result<Vec<Command>>;
+    async fn get_history(&self) -> Vec<ChatMessage>;
+    async fn summarize(&mut self, prompt: &str) -> Result<String>;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
     use crate::event::SessionEvent;
+    use async_trait::async_trait;
 
     struct RecordingHandler;
 
@@ -35,6 +38,14 @@ mod tests {
             } else {
                 Ok(vec![])
             }
+        }
+
+        async fn get_history(&self) -> Vec<ChatMessage> {
+            vec![]
+        }
+
+        async fn summarize(&mut self, _prompt: &str) -> Result<String> {
+            Ok("summary".to_string())
         }
     }
 

@@ -45,6 +45,44 @@ pub struct PlaybookConfig {
     pub interruption: Option<InterruptionConfig>,
     pub dtmf: Option<HashMap<String, DtmfAction>>,
     pub realtime: Option<RealtimeOption>,
+    pub posthook: Option<PostHookConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "lowercase")]
+pub enum SummaryType {
+    Short,
+    Detailed,
+    Intent,
+    Json,
+    #[serde(untagged)]
+    Custom(String),
+}
+
+impl SummaryType {
+    pub fn prompt(&self) -> &str {
+        match self {
+            Self::Short => "summarize the conversation in one or two sentences.",
+            Self::Detailed => {
+                "summarize the conversation in detail, including key points, decisions, and action items."
+            }
+            Self::Intent => "identify and summarize the user's main intent and needs.",
+            Self::Json => {
+                "output the conversation summary in JSON format with fields: intent, key_points, sentiment."
+            }
+            Self::Custom(p) => p,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PostHookConfig {
+    pub url: String,
+    pub summary: Option<SummaryType>,
+    pub method: Option<String>,
+    pub headers: Option<HashMap<String, String>>,
+    pub include_history: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -64,6 +102,12 @@ pub struct LlmConfig {
     pub api_key: Option<String>,
     pub prompt: Option<String>,
     pub greeting: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -354,6 +398,55 @@ Welcome.
         match scene_dtmf.get("1").unwrap() {
             DtmfAction::Goto { scene } => assert_eq!(scene, "local_dest"),
             _ => panic!("Expected Local Goto action"),
+        }
+    }
+
+    #[test]
+    fn test_posthook_config_parsing() {
+        let content = r#"---
+posthook:
+  url: "http://test.com"
+  summary: "json"
+  includeHistory: true
+  headers:
+    X-API-Key: "secret"
+llm:
+  provider: openai
+---
+# Scene: main
+Hello
+"#;
+        let playbook = Playbook::parse(content, None).unwrap();
+        let posthook = playbook.config.posthook.unwrap();
+        assert_eq!(posthook.url, "http://test.com");
+        match posthook.summary.unwrap() {
+            SummaryType::Json => {}
+            _ => panic!("Expected Json summary type"),
+        }
+        assert_eq!(posthook.include_history, Some(true));
+        assert_eq!(
+            posthook.headers.unwrap().get("X-API-Key").unwrap(),
+            "secret"
+        );
+    }
+
+    #[test]
+    fn test_custom_summary_parsing() {
+        let content = r#"---
+posthook:
+  url: "http://test.com"
+  summary: "Please summarize customly"
+llm:
+  provider: openai
+---
+# Scene: main
+Hello
+"#;
+        let playbook = Playbook::parse(content, None).unwrap();
+        let posthook = playbook.config.posthook.unwrap();
+        match posthook.summary.unwrap() {
+            SummaryType::Custom(s) => assert_eq!(s, "Please summarize customly"),
+            _ => panic!("Expected Custom summary type"),
         }
     }
 }

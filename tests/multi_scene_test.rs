@@ -1,6 +1,6 @@
 use active_call::playbook::{
-    DialogueHandler, LlmConfig, Playbook, Scene,
-    handler::{ChatMessage, LlmHandler, LlmProvider, RagRetriever},
+    ChatMessage, DialogueHandler, LlmConfig, Playbook, Scene,
+    handler::{LlmHandler, LlmProvider, RagRetriever},
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -133,7 +133,7 @@ async fn test_scene_transition_logic() -> Result<()> {
 
     // 1. Initial State
     assert_eq!(
-        handler.get_history()[0]
+        handler.get_history_ref()[0]
             .content
             .contains("You are in intro."),
         true
@@ -169,7 +169,7 @@ async fn test_scene_transition_logic() -> Result<()> {
 
     // Check if history was updated with new system prompt
     assert_eq!(
-        handler.get_history()[0]
+        handler.get_history_ref()[0]
             .content
             .contains("You are in detail."),
         true

@@ -1,18 +1,28 @@
 use crate::CallOption;
 use crate::call::ActiveCallRef;
 use anyhow::{Result, anyhow};
-use tracing::{error, info};
+use serde_json::json;
+use tracing::{error, info, warn};
 
 use super::{Playbook, PlaybookConfig, dialogue::DialogueHandler, handler::LlmHandler};
 
 pub struct PlaybookRunner {
     handler: Box<dyn DialogueHandler>,
     call: ActiveCallRef,
+    config: PlaybookConfig,
 }
 
 impl PlaybookRunner {
-    pub fn with_handler(handler: Box<dyn DialogueHandler>, call: ActiveCallRef) -> Self {
-        Self { handler, call }
+    pub fn with_handler(
+        handler: Box<dyn DialogueHandler>,
+        call: ActiveCallRef,
+        config: PlaybookConfig,
+    ) -> Self {
+        Self {
+            handler,
+            call,
+            config,
+        }
     }
 
     pub fn new(playbook: Playbook, call: ActiveCallRef) -> Result<Self> {
@@ -26,8 +36,9 @@ impl PlaybookRunner {
             }
         }
 
-        let handler: Box<dyn DialogueHandler> = if let Some(mut llm_config) = playbook.config.llm {
-            if let Some(greeting) = playbook.config.greeting {
+        let handler: Box<dyn DialogueHandler> = if let Some(llm_config) = &playbook.config.llm {
+            let mut llm_config = llm_config.clone();
+            if let Some(greeting) = playbook.config.greeting.clone() {
                 llm_config.greeting = Some(greeting);
             }
             let interruption_config = playbook.config.interruption.clone().unwrap_or_default();
@@ -36,9 +47,9 @@ impl PlaybookRunner {
             let mut llm_handler = LlmHandler::new(
                 llm_config,
                 interruption_config,
-                playbook.scenes,
+                playbook.scenes.clone(),
                 dtmf_config,
-                playbook.initial_scene_id,
+                playbook.initial_scene_id.clone(),
             );
             // Set event sender for debugging
             llm_handler.set_event_sender(call.event_sender.clone());
@@ -50,7 +61,11 @@ impl PlaybookRunner {
             ));
         };
 
-        Ok(Self { handler, call })
+        Ok(Self {
+            handler,
+            call,
+            config: playbook.config,
+        })
     }
 
     pub async fn run(mut self) {
@@ -114,6 +129,69 @@ impl PlaybookRunner {
                     }
                 }
             }
+        }
+
+        // Post-hook logic
+        if let Some(posthook) = self.config.posthook.clone() {
+            let mut handler = self.handler;
+            let call = self.call.clone();
+            tokio::spawn(async move {
+                info!("Executing posthook for session {}", call.session_id);
+
+                let summary = if let Some(summary_type) = &posthook.summary {
+                    match handler.summarize(summary_type.prompt()).await {
+                        Ok(s) => Some(s),
+                        Err(e) => {
+                            error!("Failed to generate summary: {}", e);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                let history = if posthook.include_history.unwrap_or(true) {
+                    Some(handler.get_history().await)
+                } else {
+                    None
+                };
+
+                let payload = json!({
+                    "sessionId": call.session_id,
+                    "summary": summary,
+                    "history": history,
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                });
+
+                let client = reqwest::Client::new();
+                let method = posthook
+                    .method
+                    .as_deref()
+                    .unwrap_or("POST")
+                    .parse::<reqwest::Method>()
+                    .unwrap_or(reqwest::Method::POST);
+
+                let mut request = client.request(method, &posthook.url).json(&payload);
+
+                if let Some(headers) = posthook.headers {
+                    for (k, v) in headers {
+                        request = request.header(k, v);
+                    }
+                }
+
+                match request.send().await {
+                    Ok(resp) => {
+                        if resp.status().is_success() {
+                            info!("Posthook sent successfully");
+                        } else {
+                            warn!("Posthook failed with status: {}", resp.status());
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to send posthook: {}", e);
+                    }
+                }
+            });
         }
     }
 }
