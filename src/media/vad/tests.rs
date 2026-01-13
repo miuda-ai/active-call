@@ -35,14 +35,14 @@ async fn test_vad_with_noise_denoise() {
         "Loaded {} samples from WAV file for testing",
         all_samples.len()
     );
-    let nr = NoiseReducer::new(sample_rate as usize);
+    let mut nr = NoiseReducer::new(sample_rate as usize);
     let (event_sender, mut event_receiver) = broadcast::channel(128);
     let track_id = "test_track".to_string();
 
     let mut option = VADOption::default();
     option.r#type = VadType::Silero;
     let token = CancellationToken::new();
-    let vad = VadProcessor::create(token, event_sender.clone(), option)
+    let mut vad = VadProcessor::create(token, event_sender.clone(), option)
         .expect("Failed to create VAD processor");
     let mut total_duration = 0;
     let (frame_size, chunk_duration_ms) = (320, 20);
@@ -131,7 +131,7 @@ async fn test_vad_speech_intervals() {
         option.silence_padding = 100;
 
         let token = CancellationToken::new();
-        let vad = VadProcessor::create(token, event_sender, option).unwrap();
+        let mut vad = VadProcessor::create(token, event_sender, option).unwrap();
 
         let frame_size = 512;
         let mut processed_samples = 0;
@@ -189,7 +189,7 @@ async fn test_silence_timeout() {
     option.voice_threshold = 0.5;
 
     let vad = Box::new(NopVad::new().unwrap());
-    let processor = VadProcessor::new(vad, event_sender, option).unwrap();
+    let mut processor = VadProcessor::new(vad, event_sender, option).unwrap();
 
     // Simulate initial speech
     let mut frame = AudioFrame {

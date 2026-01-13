@@ -84,7 +84,7 @@ impl Track for WebsocketTrack {
     }
 
     async fn start(
-        &self,
+        &mut self,
         event_sender: EventSender,
         packet_sender: TrackPacketSender,
     ) -> Result<()> {
@@ -102,7 +102,7 @@ impl Track for WebsocketTrack {
         let payload_type = self.payload_type;
         let start_time = crate::media::get_timestamp();
         let ssrc = self.ssrc;
-        let processor_chain = self.processor_chain.clone();
+        let mut processor_chain = self.processor_chain.clone();
         tokio::spawn(async move {
             let track_id_clone = track_id.clone();
             let audio_from_ws_loop = async move {
@@ -170,7 +170,7 @@ impl Track for WebsocketTrack {
         Ok(())
     }
 
-    async fn send_packet(&self, packet: &AudioFrame) -> Result<()> {
+    async fn send_packet(&mut self, packet: &AudioFrame) -> Result<()> {
         let packet = packet.clone();
         // Do not run the processor chain for outgoing packets to the user.
         // The processor chain (VAD, ASR, etc.) is intended for audio coming FROM the user.

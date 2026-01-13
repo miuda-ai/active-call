@@ -350,7 +350,7 @@ impl AudioReader for Mp3AudioReader {
 
 // Unified function to process any audio reader and stream audio
 async fn process_audio_reader(
-    processor_chain: ProcessorChain,
+    mut processor_chain: ProcessorChain,
     mut audio_reader: Box<dyn AudioReader>,
     track_id: &str,
     packet_duration_ms: u32,
@@ -495,7 +495,7 @@ impl Track for FileTrack {
     }
 
     async fn start(
-        &self,
+        &mut self,
         event_sender: EventSender,
         packet_sender: TrackPacketSender,
     ) -> Result<()> {
@@ -624,7 +624,7 @@ impl Track for FileTrack {
     }
 
     // Do nothing as we are not sending packets
-    async fn send_packet(&self, _packet: &AudioFrame) -> Result<()> {
+    async fn send_packet(&mut self, _packet: &AudioFrame) -> Result<()> {
         Ok(())
     }
 }
@@ -882,7 +882,7 @@ mod tests {
 
         // Create a FileTrack instance
         let track_id = "test_track".to_string();
-        let file_track = FileTrack::new(track_id.clone())
+        let mut file_track = FileTrack::new(track_id.clone())
             .with_path(file_path.clone())
             .with_sample_rate(16000)
             .with_cache_enabled(true);

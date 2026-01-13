@@ -54,7 +54,7 @@ impl VolumeControlProcessor {
 }
 
 impl Processor for VolumeControlProcessor {
-    fn process_frame(&self, frame: &mut AudioFrame) -> Result<()> {
+    fn process_frame(&mut self, frame: &mut AudioFrame) -> Result<()> {
         // Check if muted
         if self.is_muted() {
             // Mute the audio by zeroing out samples
@@ -116,7 +116,7 @@ impl HoldProcessor {
 }
 
 impl Processor for HoldProcessor {
-    fn process_frame(&self, frame: &mut AudioFrame) -> Result<()> {
+    fn process_frame(&mut self, frame: &mut AudioFrame) -> Result<()> {
         if self.is_on_hold() {
             // When on hold, replace audio with silence or hold music
             if let crate::media::Samples::PCM { samples } = &mut frame.samples {
@@ -155,7 +155,7 @@ mod tests {
 
     #[test]
     fn test_volume_processing() {
-        let processor = VolumeControlProcessor::new();
+        let mut processor = VolumeControlProcessor::new();
         processor.set_volume(0.5);
 
         let mut frame = AudioFrame {
@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn test_mute_processing() {
-        let processor = VolumeControlProcessor::new();
+        let mut processor = VolumeControlProcessor::new();
         processor.set_muted(true);
 
         let mut frame = AudioFrame {

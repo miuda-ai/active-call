@@ -1,3 +1,4 @@
+use super::INTERNAL_SAMPLERATE;
 use super::track::track_codec::TrackCodec;
 use crate::media::{AudioFrame, Samples};
 use anyhow::Result;
@@ -5,7 +6,7 @@ use std::any::Any;
 use std::sync::{Arc, Mutex};
 
 pub trait Processor: Send + Sync + Any {
-    fn process_frame(&self, frame: &mut AudioFrame) -> Result<()>;
+    fn process_frame(&mut self, frame: &mut AudioFrame) -> Result<()>;
 }
 
 pub fn convert_to_mono(samples: &mut Vec<i16>, channels: u16) {
@@ -55,11 +56,11 @@ pub struct ProcessorChain {
 }
 
 impl ProcessorChain {
-    pub fn new(sample_rate: u32) -> Self {
+    pub fn new(_sample_rate: u32) -> Self {
         Self {
             processors: Arc::new(Mutex::new(Vec::new())),
             codec: TrackCodec::new(),
-            sample_rate,
+            sample_rate: INTERNAL_SAMPLERATE,
             force_decode: true,
         }
     }
@@ -82,29 +83,46 @@ impl ProcessorChain {
         processors.retain(|processor| !(processor.as_ref() as &dyn Any).is::<T>());
     }
 
-    pub fn process_frame(&self, frame: &mut AudioFrame) -> Result<()> {
-        let processors = self.processors.lock().unwrap();
+    pub fn process_frame(&mut self, frame: &mut AudioFrame) -> Result<()> {
+        let mut processors = self.processors.lock().unwrap();
         if !self.force_decode && processors.is_empty() {
             return Ok(());
         }
 
-        if let Samples::RTP {
-            payload_type,
-            payload,
-            ..
-        } = &frame.samples
-        {
-            if TrackCodec::is_audio(*payload_type) {
-                let samples =
-                    self.codec
-                        .decode(*payload_type, &payload, frame.channels, self.sample_rate);
-                frame.channels = 1; // Since we converted to mono in decode
-                frame.samples = Samples::PCM { samples };
+        match &mut frame.samples {
+            Samples::RTP {
+                payload_type,
+                payload,
+                ..
+            } => {
+                if TrackCodec::is_audio(*payload_type) {
+                    let (decoded_sample_rate, channels, samples) =
+                        self.codec.decode(*payload_type, &payload, self.sample_rate);
+                    frame.channels = channels;
+                    frame.samples = Samples::PCM { samples };
+                    frame.sample_rate = decoded_sample_rate;
+                }
+            }
+            _ => {}
+        }
+
+        if let Samples::PCM { samples } = &mut frame.samples {
+            if frame.sample_rate != self.sample_rate {
+                let new_samples = self.codec.resample(
+                    std::mem::take(samples),
+                    frame.sample_rate,
+                    self.sample_rate,
+                );
+                *samples = new_samples;
                 frame.sample_rate = self.sample_rate;
+            }
+            if frame.channels == 2 {
+                convert_to_mono(samples, 2);
+                frame.channels = 1;
             }
         }
         // Process the frame with all processors
-        for processor in processors.iter() {
+        for processor in processors.iter_mut() {
             processor.process_frame(frame)?;
         }
         Ok(())

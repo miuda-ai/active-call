@@ -5,7 +5,7 @@ use std::{fs::File, io::Write};
 
 #[test]
 fn test_basic_processing() {
-    let reducer = NoiseReducer::new(16000);
+    let mut reducer = NoiseReducer::new(16000);
     let (all_samples, sample_rate) =
         crate::media::track::file::read_wav_file("fixtures/noise_gating_zh_16k.wav").unwrap();
     let mut out_file = File::create("fixtures/noise_gating_zh_16k_denoised.pcm.decoded").unwrap();
@@ -38,7 +38,7 @@ fn test_denoiser_performance() {
     use std::time::Instant;
     let sample_rate = 16000;
     let frame_size = 320; // 20ms at 16kHz
-    let reducer = NoiseReducer::new(sample_rate);
+    let mut reducer = NoiseReducer::new(sample_rate);
 
     // Create a dummy frame with noise
     let mut samples = Vec::with_capacity(frame_size);

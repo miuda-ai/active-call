@@ -338,8 +338,10 @@ impl AliyunAsrClient {
                                 let sentence = output.sentence;
                                 let words = sentence.words;
                                 let sentence_start_time = begin_time + sentence.begin_time as u64;
-                                let sentence_end_time = sentence_start_time
-                                    + words.last().map(|w| w.end_time as u64).unwrap_or(0);
+                                let sentence_end_time = begin_time
+                                    + sentence.end_time.unwrap_or_else(|| {
+                                        words.last().map(|w| w.end_time).unwrap_or(sentence.begin_time)
+                                    }) as u64;
                                 let text = sentence.text;
 
                                 let event = if sentence.sentence_end {

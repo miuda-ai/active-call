@@ -1,6 +1,7 @@
 use super::{
     asr_processor::AsrProcessor,
     denoiser::NoiseReducer,
+    INTERNAL_SAMPLERATE,
     processor::Processor,
     track::{
         Track,
@@ -262,21 +263,21 @@ impl StreamEngine {
         option: CallOption,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Box<dyn Processor>>>> + Send>> {
         let track_id = track.id().clone();
-        let samplerate = track.config().samplerate as usize;
         Box::pin(async move {
             let mut processors = vec![];
             debug!(track_id = %track_id, "Creating processors for track");
             match option.denoise {
                 Some(true) => {
                     debug!(track_id = %track_id, "Adding NoiseReducer processor");
-                    let noise_reducer = NoiseReducer::new(samplerate);
+                    let noise_reducer = NoiseReducer::new(INTERNAL_SAMPLERATE as usize);
                     processors.push(Box::new(noise_reducer) as Box<dyn Processor>);
                 }
                 _ => {}
             }
             match option.vad {
-                Some(ref option) => {
+                Some(mut option) => {
                     debug!(track_id = %track_id, "Adding VadProcessor processor type={:?}", option.r#type);
+                    option.samplerate = INTERNAL_SAMPLERATE;
                     let vad_processor: Box<dyn Processor + 'static> = engine.create_vad_processor(
                         cancel_token.child_token(),
                         event_sender.clone(),
@@ -287,8 +288,9 @@ impl StreamEngine {
                 None => {}
             }
             match option.asr {
-                Some(ref option) => {
+                Some(mut option) => {
                     debug!(track_id = %track_id, "Adding AsrProcessor processor provider={:?}", option.provider);
+                    option.samplerate = Some(INTERNAL_SAMPLERATE);
                     let asr_processor = engine
                         .create_asr_processor(
                             track_id.clone(),

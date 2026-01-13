@@ -6,7 +6,6 @@ use audio_codec::{
     pcmu::{PcmuDecoder, PcmuEncoder},
     samples_to_bytes,
 };
-use std::cell::RefCell;
 use std::collections::HashMap;
 
 use audio_codec::g729::{G729Decoder, G729Encoder};
@@ -14,34 +13,32 @@ use audio_codec::g729::{G729Decoder, G729Encoder};
 use audio_codec::opus::{OpusDecoder, OpusEncoder};
 
 pub struct TrackCodec {
-    pub pcmu_encoder: RefCell<PcmuEncoder>,
-    pub pcmu_decoder: RefCell<PcmuDecoder>,
-    pub pcma_encoder: RefCell<PcmaEncoder>,
-    pub pcma_decoder: RefCell<PcmaDecoder>,
+    pub pcmu_encoder: PcmuEncoder,
+    pub pcmu_decoder: PcmuDecoder,
+    pub pcma_encoder: PcmaEncoder,
+    pub pcma_decoder: PcmaDecoder,
 
-    pub g722_encoder: RefCell<G722Encoder>,
-    pub g722_decoder: RefCell<G722Decoder>,
+    pub g722_encoder: G722Encoder,
+    pub g722_decoder: G722Decoder,
 
-    pub g729_encoder: RefCell<G729Encoder>,
-    pub g729_decoder: RefCell<G729Decoder>,
+    pub g729_encoder: G729Encoder,
+    pub g729_decoder: G729Decoder,
 
     #[cfg(feature = "opus")]
-    pub opus_encoder: RefCell<Option<OpusEncoder>>,
+    pub opus_encoder: Option<OpusEncoder>,
     #[cfg(feature = "opus")]
-    pub opus_decoder: RefCell<Option<OpusDecoder>>,
+    pub opus_decoder: Option<OpusDecoder>,
 
-    pub resampler: RefCell<Option<Resampler>>,
-    pub resampler_in_rate: RefCell<u32>,
-    pub resampler_out_rate: RefCell<u32>,
-    pub payload_type_map: RefCell<HashMap<u8, CodecType>>,
+    pub resampler: Option<Resampler>,
+    pub resampler_in_rate: u32,
+    pub resampler_out_rate: u32,
+    pub payload_type_map: HashMap<u8, CodecType>,
 }
-unsafe impl Send for TrackCodec {}
-unsafe impl Sync for TrackCodec {}
 
 impl Clone for TrackCodec {
     fn clone(&self) -> Self {
-        let new = Self::new();
-        *new.payload_type_map.borrow_mut() = self.payload_type_map.borrow().clone();
+        let mut new = Self::new();
+        new.payload_type_map = self.payload_type_map.clone();
         new
     }
 }
@@ -57,27 +54,27 @@ impl TrackCodec {
         payload_type_map.insert(111, CodecType::Opus);
 
         Self {
-            pcmu_encoder: RefCell::new(PcmuEncoder::new()),
-            pcmu_decoder: RefCell::new(PcmuDecoder::new()),
-            pcma_encoder: RefCell::new(PcmaEncoder::new()),
-            pcma_decoder: RefCell::new(PcmaDecoder::new()),
-            g722_encoder: RefCell::new(G722Encoder::new()),
-            g722_decoder: RefCell::new(G722Decoder::new()),
-            g729_encoder: RefCell::new(G729Encoder::new()),
-            g729_decoder: RefCell::new(G729Decoder::new()),
+            pcmu_encoder: PcmuEncoder::new(),
+            pcmu_decoder: PcmuDecoder::new(),
+            pcma_encoder: PcmaEncoder::new(),
+            pcma_decoder: PcmaDecoder::new(),
+            g722_encoder: G722Encoder::new(),
+            g722_decoder: G722Decoder::new(),
+            g729_encoder: G729Encoder::new(),
+            g729_decoder: G729Decoder::new(),
             #[cfg(feature = "opus")]
-            opus_encoder: RefCell::new(None),
+            opus_encoder: None,
             #[cfg(feature = "opus")]
-            opus_decoder: RefCell::new(None),
-            resampler: RefCell::new(None),
-            resampler_in_rate: RefCell::new(0),
-            resampler_out_rate: RefCell::new(0),
-            payload_type_map: RefCell::new(payload_type_map),
+            opus_decoder: None,
+            resampler: None,
+            resampler_in_rate: 0,
+            resampler_out_rate: 0,
+            payload_type_map,
         }
     }
 
-    pub fn set_payload_type(&self, pt: u8, codec: CodecType) {
-        self.payload_type_map.borrow_mut().insert(pt, codec);
+    pub fn set_payload_type(&mut self, pt: u8, codec: CodecType) {
+        self.payload_type_map.insert(pt, codec);
     }
 
     pub fn is_audio(payload_type: u8) -> bool {
@@ -89,15 +86,13 @@ impl TrackCodec {
     }
 
     pub fn decode(
-        &self,
+        &mut self,
         payload_type: u8,
         payload: &[u8],
-        channels: u16,
         target_sample_rate: u32,
-    ) -> PcmBuf {
+    ) -> (u32, u16, PcmBuf) {
         let codec = self
             .payload_type_map
-            .borrow()
             .get(&payload_type)
             .cloned()
             .unwrap_or_else(|| match payload_type {
@@ -109,18 +104,17 @@ impl TrackCodec {
                 _ => CodecType::PCMU,
             });
 
-        let mut pcm = match codec {
-            CodecType::PCMU => self.pcmu_decoder.borrow_mut().decode(payload),
-            CodecType::PCMA => self.pcma_decoder.borrow_mut().decode(payload),
-            CodecType::G722 => self.g722_decoder.borrow_mut().decode(payload),
-            CodecType::G729 => self.g729_decoder.borrow_mut().decode(payload),
+        let pcm = match codec {
+            CodecType::PCMU => self.pcmu_decoder.decode(payload),
+            CodecType::PCMA => self.pcma_decoder.decode(payload),
+            CodecType::G722 => self.g722_decoder.decode(payload),
+            CodecType::G729 => self.g729_decoder.decode(payload),
             #[cfg(feature = "opus")]
             CodecType::Opus => {
-                let mut opus_decoder = self.opus_decoder.borrow_mut();
-                if opus_decoder.is_none() {
-                    *opus_decoder = Some(OpusDecoder::new_default());
+                if self.opus_decoder.is_none() {
+                    self.opus_decoder = Some(OpusDecoder::new_default());
                 }
-                if let Some(ref mut decoder) = opus_decoder.as_mut() {
+                if let Some(ref mut decoder) = self.opus_decoder.as_mut() {
                     decoder.decode(payload)
                 } else {
                     bytes_to_samples(payload)
@@ -129,48 +123,46 @@ impl TrackCodec {
             _ => bytes_to_samples(payload),
         };
 
-        if channels == 2 {
-            let mut mono = Vec::with_capacity(pcm.len() / 2);
-            for i in (0..pcm.len()).step_by(2) {
-                if i + 1 < pcm.len() {
-                    let mixed = ((pcm[i] as i32 + pcm[i + 1] as i32) / 2) as i16;
-                    mono.push(mixed);
+        let (in_rate, channels) = match codec {
+            CodecType::PCMU => (8000, 1),
+            CodecType::PCMA => (8000, 1),
+            CodecType::G722 => (16000, 1),
+            CodecType::G729 => (8000, 1),
+            #[cfg(feature = "opus")]
+            CodecType::Opus => {
+                if pcm.len() >= 1920 {
+                    (48000, 2)
                 } else {
-                    mono.push(pcm[i]);
+                    (48000, 1)
                 }
             }
-            pcm = mono;
-        }
-
-        let sample_rate = match codec {
-            CodecType::PCMU => 8000,
-            CodecType::PCMA => 8000,
-            CodecType::G722 => 16000,
-            CodecType::G729 => 8000,
-            #[cfg(feature = "opus")]
-            CodecType::Opus => 48000,
-            _ => 8000,
+            _ => (8000, 1),
         };
 
-        if sample_rate != target_sample_rate {
-            if self.resampler.borrow().is_none()
-                || *self.resampler_in_rate.borrow() != sample_rate
-                || *self.resampler_out_rate.borrow() != target_sample_rate
-            {
-                self.resampler.borrow_mut().replace(Resampler::new(
-                    sample_rate as usize,
-                    target_sample_rate as usize,
-                ));
-                *self.resampler_in_rate.borrow_mut() = sample_rate;
-                *self.resampler_out_rate.borrow_mut() = target_sample_rate;
-            }
-            self.resampler.borrow_mut().as_mut().unwrap().resample(&pcm)
-        } else {
-            pcm
-        }
+        (
+            target_sample_rate,
+            channels,
+            self.resample(pcm, in_rate, target_sample_rate),
+        )
     }
 
-    pub fn encode(&self, payload_type: u8, frame: AudioFrame) -> (u8, Vec<u8>) {
+    pub fn resample(&mut self, pcm: PcmBuf, in_rate: u32, out_rate: u32) -> PcmBuf {
+        if in_rate == out_rate {
+            return pcm;
+        }
+
+        if self.resampler.is_none()
+            || self.resampler_in_rate != in_rate
+            || self.resampler_out_rate != out_rate
+        {
+            self.resampler = Some(Resampler::new(in_rate as usize, out_rate as usize));
+            self.resampler_in_rate = in_rate;
+            self.resampler_out_rate = out_rate;
+        }
+        self.resampler.as_mut().unwrap().resample(&pcm)
+    }
+
+    pub fn encode(&mut self, payload_type: u8, frame: AudioFrame) -> (u8, Vec<u8>) {
         match frame.samples {
             Samples::PCM { samples: mut pcm } => {
                 let target_samplerate = match payload_type {
@@ -183,32 +175,31 @@ impl TrackCodec {
                 };
 
                 if frame.sample_rate != target_samplerate {
-                    if self.resampler.borrow().is_none()
-                        || *self.resampler_in_rate.borrow() != frame.sample_rate
-                        || *self.resampler_out_rate.borrow() != target_samplerate
+                    if self.resampler.is_none()
+                        || self.resampler_in_rate != frame.sample_rate
+                        || self.resampler_out_rate != target_samplerate
                     {
-                        self.resampler.borrow_mut().replace(Resampler::new(
+                        self.resampler = Some(Resampler::new(
                             frame.sample_rate as usize,
                             target_samplerate as usize,
                         ));
-                        *self.resampler_in_rate.borrow_mut() = frame.sample_rate;
-                        *self.resampler_out_rate.borrow_mut() = target_samplerate;
+                        self.resampler_in_rate = frame.sample_rate;
+                        self.resampler_out_rate = target_samplerate;
                     }
-                    pcm = self.resampler.borrow_mut().as_mut().unwrap().resample(&pcm);
+                    pcm = self.resampler.as_mut().unwrap().resample(&pcm);
                 }
 
                 let payload = match payload_type {
-                    0 => self.pcmu_encoder.borrow_mut().encode(&pcm),
-                    8 => self.pcma_encoder.borrow_mut().encode(&pcm),
-                    9 => self.g722_encoder.borrow_mut().encode(&pcm),
-                    18 => self.g729_encoder.borrow_mut().encode(&pcm),
+                    0 => self.pcmu_encoder.encode(&pcm),
+                    8 => self.pcma_encoder.encode(&pcm),
+                    9 => self.g722_encoder.encode(&pcm),
+                    18 => self.g729_encoder.encode(&pcm),
                     #[cfg(feature = "opus")]
                     111 => {
-                        let mut opus_encoder = self.opus_encoder.borrow_mut();
-                        if opus_encoder.is_none() {
-                            *opus_encoder = Some(OpusEncoder::new_default());
+                        if self.opus_encoder.is_none() {
+                            self.opus_encoder = Some(OpusEncoder::new_default());
                         }
-                        if let Some(ref mut encoder) = opus_encoder.as_mut() {
+                        if let Some(ref mut encoder) = self.opus_encoder.as_mut() {
                             encoder.encode(&pcm)
                         } else {
                             samples_to_bytes(&pcm)

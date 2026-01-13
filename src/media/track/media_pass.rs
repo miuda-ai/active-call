@@ -133,7 +133,7 @@ impl Track for MediaPassTrack {
     }
 
     async fn start(
-        &self,
+        &mut self,
         event_sender: EventSender,
         packet_sender: TrackPacketSender,
     ) -> Result<()> {
@@ -167,7 +167,7 @@ impl Track for MediaPassTrack {
         let ptime = self.config.ptime;
         let ptime_ms = ptime.as_millis() as u32;
         let channels = self.config.channels;
-        let processor_chain = self.processor_chain.clone();
+        let mut processor_chain = self.processor_chain.clone();
         tokio::spawn(async move {
             let mut bytes_received = 0u64;
             let mut bytes_emitted = 0u64;
@@ -352,9 +352,9 @@ impl Track for MediaPassTrack {
         Ok(())
     }
 
-    async fn send_packet(&self, packet: &AudioFrame) -> Result<()> {
+    async fn send_packet(&mut self, packet: &AudioFrame) -> Result<()> {
         let mut packet = packet.clone();
-        if let Err(e) = self.processor_chain.clone().process_frame(&mut packet) {
+        if let Err(e) = self.processor_chain.process_frame(&mut packet) {
             warn!(track_id=%self.track_id, "processor_chain process_frame error: {:?}", e);
         }
 

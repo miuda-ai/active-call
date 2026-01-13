@@ -20,15 +20,18 @@ By abstracting these technical hurdles, `active-call` allows developers to focus
 - **Multi-Protocol Support**: Supports SIP, WebRTC, and raw WebSocket audio streams.
 - **Real-time Performance**: Built with Rust for low-latency audio processing.
 
+## Playbook demo
+![Playbook demo](./docs/playbook.png)
+
 ## VAD Performance
 
 Benchmarked on 60 seconds of 16kHz audio (Release mode):
 
-| VAD Engine | Implementation | Time (60s) | RTF (Ratio) | Note |
-|------------|----------------|------------|-------------|------|
-| **TinySilero** | Rust (Optimized) | ~60.0 ms | 0.0010 | >2.5x faster than ONNX |
-| **ONNX Silero** | ONNX Runtime | ~158.3 ms | 0.0026 | Standard baseline |
-| **WebRTC VAD** | C/C++ (Bind) | ~3.1 ms | 0.00005 | Legacy, less accurate |
+| VAD Engine      | Implementation   | Time (60s) | RTF (Ratio) | Note                   |
+| --------------- | ---------------- | ---------- | ----------- | ---------------------- |
+| **TinySilero**  | Rust (Optimized) | ~60.0 ms   | 0.0010      | >2.5x faster than ONNX |
+| **ONNX Silero** | ONNX Runtime     | ~158.3 ms  | 0.0026      | Standard baseline      |
+| **WebRTC VAD**  | C/C++ (Bind)     | ~3.1 ms    | 0.00005     | Legacy, less accurate  |
 
 ## API Documentation
 

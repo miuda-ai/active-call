@@ -71,7 +71,7 @@ pub trait Track: Send + Sync {
     async fn handshake(&mut self, offer: String, timeout: Option<Duration>) -> Result<String>;
     async fn update_remote_description(&mut self, answer: &String) -> Result<()>;
     async fn start(
-        &self,
+        &mut self,
         event_sender: EventSender,
         packet_sender: TrackPacketSender,
     ) -> Result<()>;
@@ -79,5 +79,5 @@ pub trait Track: Send + Sync {
     async fn stop_graceful(&self) -> Result<()> {
         self.stop().await
     }
-    async fn send_packet(&self, packet: &AudioFrame) -> Result<()>;
+    async fn send_packet(&mut self, packet: &AudioFrame) -> Result<()>;
 }

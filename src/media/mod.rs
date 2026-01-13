@@ -17,6 +17,7 @@ pub mod vad;
 pub mod volume_control;
 pub use audio_codec::PcmBuf;
 pub use audio_codec::Sample;
+pub const INTERNAL_SAMPLERATE: u32 = 16000;
 pub type TrackId = String;
 pub type PayloadBuf = Vec<u8>;
 

@@ -46,7 +46,7 @@ mod tests {
 
         // --- Common Components ---
         let mut resampler_8k_to_16k = Resampler::new(8000, 16000);
-        let noise_reducer = NoiseReducer::new(16000);
+        let mut noise_reducer = NoiseReducer::new(16000);
         let vad_config = VADOption {
             samplerate: 16000,
             ..Default::default()

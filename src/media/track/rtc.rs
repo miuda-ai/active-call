@@ -290,7 +290,7 @@ impl RtcTrack {
         // Processing Worker
         let track_id_proc = track_id.clone();
         let packet_sender_proc = packet_sender_arc.clone();
-        let processor_chain_proc = processor_chain.clone();
+        let mut processor_chain_proc = processor_chain.clone();
         let cancel_token_proc = cancel_token.clone();
         tokio::spawn(async move {
             info!(track_id=%track_id_proc, "RtcTrack processing worker started");
@@ -302,7 +302,7 @@ impl RtcTrack {
                     frame,
                     &track_id_proc,
                     &packet_sender_proc,
-                    &processor_chain_proc,
+                    &mut processor_chain_proc,
                     default_payload_type.clone(),
                 )
                 .await;
@@ -334,7 +334,7 @@ impl RtcTrack {
         frame: rustrtc::media::frame::AudioFrame,
         track_id: &TrackId,
         packet_sender: &Arc<Mutex<Option<TrackPacketSender>>>,
-        processor_chain: &ProcessorChain,
+        processor_chain: &mut ProcessorChain,
         default_payload_type: Arc<std::sync::atomic::AtomicU8>,
     ) {
         let packet_sender = packet_sender.lock().await;
@@ -394,7 +394,6 @@ impl RtcTrack {
                     let codec = self
                         .encoder
                         .payload_type_map
-                        .borrow()
                         .get(&pt)
                         .cloned()
                         .or_else(|| CodecType::try_from(pt).ok());
@@ -468,7 +467,7 @@ impl Track for RtcTrack {
     }
 
     async fn start(
-        &self,
+        &mut self,
         event_sender: EventSender,
         packet_sender: TrackPacketSender,
     ) -> Result<()> {
@@ -503,7 +502,7 @@ impl Track for RtcTrack {
         Ok(())
     }
 
-    async fn send_packet(&self, packet: &AudioFrame) -> Result<()> {
+    async fn send_packet(&mut self, packet: &AudioFrame) -> Result<()> {
         let packet = packet.clone();
 
         if let Some(source) = &self.local_source {

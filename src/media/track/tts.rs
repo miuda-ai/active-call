@@ -53,6 +53,7 @@ struct Metadata {
     total_bytes: usize,
     emitted_bytes: usize,
     recv_time: u64,
+    ttfb: u64,
 }
 
 impl Default for Metadata {
@@ -66,6 +67,7 @@ impl Default for Metadata {
             total_bytes: 0,
             emitted_bytes: 0,
             recv_time: 0,
+            ttfb: 0,
         }
     }
 }
@@ -468,6 +470,7 @@ impl TtsTask {
                                     "cmdSeq": cmd_seq,
                                     "length": len,
                                     "cached": true,
+                                    "ttfb": 0,
                             }),
                             duration: 0,
                         })
@@ -502,6 +505,7 @@ impl TtsTask {
                         let _ = chunk.split_to(44);
                     }
                     entry.first_chunk = false;
+                    entry.ttfb = crate::media::get_timestamp() - entry.recv_time;
                 }
 
                 entry.total_bytes += chunk.len();
@@ -545,6 +549,7 @@ impl TtsTask {
                                 "cmdSeq": cmd_seq,
                                 "length": entry.total_bytes,
                                 "cached": false,
+                                "ttfb": entry.ttfb,
                         }),
                         duration: (crate::media::get_timestamp() - entry.recv_time) as u32,
                     })
@@ -773,7 +778,7 @@ impl Track for TtsTrack {
     }
 
     async fn start(
-        &self,
+        &mut self,
         event_sender: EventSender,
         packet_sender: TrackPacketSender,
     ) -> Result<()> {
@@ -832,7 +837,7 @@ impl Track for TtsTrack {
         self.stop().await
     }
 
-    async fn send_packet(&self, _packet: &AudioFrame) -> Result<()> {
+    async fn send_packet(&mut self, _packet: &AudioFrame) -> Result<()> {
         Ok(())
     }
 }

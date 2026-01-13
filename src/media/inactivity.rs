@@ -49,7 +49,7 @@ impl InactivityProcessor {
 }
 
 impl Processor for InactivityProcessor {
-    fn process_frame(&self, _frame: &mut AudioFrame) -> Result<()> {
+    fn process_frame(&mut self, _frame: &mut AudioFrame) -> Result<()> {
         self.last_received.store(get_timestamp(), Ordering::SeqCst);
         Ok(())
     }

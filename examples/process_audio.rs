@@ -53,7 +53,7 @@ async fn main() -> Result<()> {
         audio_duration_secs
     );
 
-    let nr = NoiseReducer::new(sample_rate as usize);
+    let mut nr = NoiseReducer::new(sample_rate as usize);
     let (event_sender, mut event_receiver) = broadcast::channel(128);
 
     let mut option = VADOption::default();
@@ -65,7 +65,7 @@ async fn main() -> Result<()> {
     println!("VAD Config: {:?}", option);
 
     let token = CancellationToken::new();
-    let vad = VadProcessor::create(token, event_sender, option)?;
+    let mut vad = VadProcessor::create(token, event_sender, option)?;
 
     let mut out_file = if let Some(path) = args.output {
         Some(File::create(path)?)

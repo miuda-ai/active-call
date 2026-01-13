@@ -60,14 +60,12 @@ impl Track for TestTrack {
         Ok(())
     }
     async fn start(
-        &self,
+        &mut self,
         _event_sender: EventSender,
         packet_sender: TrackPacketSender,
     ) -> Result<()> {
         // Store the packet sender for later use
-        if let Some(sender) = unsafe { (self as *const _ as *mut TestTrack).as_mut() } {
-            sender.sender = Some(packet_sender);
-        }
+        self.sender = Some(packet_sender);
         Ok(())
     }
 
@@ -75,7 +73,7 @@ impl Track for TestTrack {
         Ok(())
     }
 
-    async fn send_packet(&self, packet: &AudioFrame) -> Result<()> {
+    async fn send_packet(&mut self, packet: &AudioFrame) -> Result<()> {
         {
             let mut received = self.received_packets.lock().await;
             received.push(packet.clone());

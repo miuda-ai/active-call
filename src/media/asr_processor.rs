@@ -9,7 +9,7 @@ pub struct AsrProcessor {
 impl AsrProcessor {}
 
 impl Processor for AsrProcessor {
-    fn process_frame(&self, frame: &mut AudioFrame) -> Result<()> {
+    fn process_frame(&mut self, frame: &mut AudioFrame) -> Result<()> {
         match &frame.samples {
             Samples::PCM { samples } => {
                 if !samples.is_empty() {

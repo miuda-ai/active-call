@@ -205,7 +205,7 @@ async fn start_sending_server(
 #[tokio::test]
 async fn test_media_pass() -> Result<()> {
     let track_id = "media_pass_track".to_string();
-    let sending_sample_rate = 8000;
+    let sending_sample_rate = 16000;
     let receiving_sample_rate = 16000;
     let packet_size = 640;
     let sample = generate_audio_samples(sending_sample_rate);
@@ -221,7 +221,7 @@ async fn test_media_pass() -> Result<()> {
     )
     .await?;
     let url = format!("ws://127.0.0.1:{}/", addr.port());
-    let track = create_track(
+    let mut track = create_track(
         track_id.clone(),
         url,
         sending_sample_rate,
@@ -235,7 +235,7 @@ async fn test_media_pass() -> Result<()> {
 
     track.start(event_sender, packet_sender).await?;
 
-    for i in 0..50 {
+    for i in 0..100 {
         let slice = sample[i * 160..(i + 1) * 160].to_vec();
         let audio_frame = AudioFrame {
             track_id: track_id.clone(),
@@ -262,7 +262,7 @@ async fn test_media_pass() -> Result<()> {
             buffer.extend_from_slice(samples.as_slice());
         }
     }
-    assert_eq!(sample.len() * 2, buffer.len());
+    assert_eq!(sample.len(), buffer.len());
 
     let mut ended = false;
     while let Ok(event) = event_receiver.recv().await {
@@ -295,7 +295,7 @@ async fn test_track_end_on_cancel() -> Result<()> {
     )
     .await?;
     let url = format!("ws://127.0.0.1:{}/", addr.port());
-    let track = create_track(
+    let mut track = create_track(
         track_id.clone(),
         url,
         sending_sample_rate,
@@ -365,7 +365,7 @@ async fn test_resampling_to_output_sample_rate() -> Result<()> {
     )
     .await?;
     let url = format!("ws://127.0.0.1:{}/", addr.port());
-    let track = create_track(
+    let mut track = create_track(
         track_id.clone(),
         url,
         input_sample_rate,
@@ -461,7 +461,7 @@ async fn test_ptime_buffering() -> Result<()> {
     )
     .await?;
     let url = format!("ws://127.0.0.1:{}/", addr.port());
-    let track = create_track(
+    let mut track = create_track(
         track_id.clone(),
         url,
         input_sample_rate,

@@ -5,7 +5,6 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use std::any::Any;
-use std::cell::RefCell;
 use tokio_util::sync::CancellationToken;
 
 pub(crate) mod simd;
@@ -111,10 +110,8 @@ struct VadProcessorInner {
     temp_end: Option<u64>,
 }
 pub struct VadProcessor {
-    inner: RefCell<VadProcessorInner>,
+    inner: VadProcessorInner,
 }
-unsafe impl Send for VadProcessor {}
-unsafe impl Sync for VadProcessor {}
 
 pub trait VadEngine: Send + Sync + Any {
     fn process(&mut self, frame: &mut AudioFrame) -> Vec<(bool, u64)>;
@@ -273,15 +270,13 @@ impl VadProcessor {
             current_speech_start: None,
             temp_end: None,
         };
-        Ok(Self {
-            inner: RefCell::new(inner),
-        })
+        Ok(Self { inner })
     }
 }
 
 impl Processor for VadProcessor {
-    fn process_frame(&self, frame: &mut AudioFrame) -> Result<()> {
-        self.inner.borrow_mut().process_frame(frame)
+    fn process_frame(&mut self, frame: &mut AudioFrame) -> Result<()> {
+        self.inner.process_frame(frame)
     }
 }
 

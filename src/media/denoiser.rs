@@ -2,12 +2,11 @@ use crate::media::{AudioFrame, PcmBuf, Sample, Samples, processor::Processor};
 use anyhow::Result;
 use audio_codec::Resampler;
 use nnnoiseless::DenoiseState;
-use std::cell::RefCell;
 
 pub struct NoiseReducer {
-    resampler_target: RefCell<Resampler>,
-    resampler_source: RefCell<Resampler>,
-    denoiser: RefCell<Box<DenoiseState<'static>>>,
+    resampler_target: Resampler,
+    resampler_source: Resampler,
+    denoiser: Box<DenoiseState<'static>>,
 }
 
 impl NoiseReducer {
@@ -16,9 +15,9 @@ impl NoiseReducer {
         let resampler16k = Resampler::new(input_sample_rate, 48000 as usize);
         let denoiser = DenoiseState::new();
         Self {
-            resampler_target: RefCell::new(resampler48k),
-            resampler_source: RefCell::new(resampler16k),
-            denoiser: RefCell::new(denoiser),
+            resampler_target: resampler48k,
+            resampler_source: resampler16k,
+            denoiser,
         }
     }
 }
@@ -26,7 +25,7 @@ unsafe impl Send for NoiseReducer {}
 unsafe impl Sync for NoiseReducer {}
 
 impl Processor for NoiseReducer {
-    fn process_frame(&self, frame: &mut AudioFrame) -> Result<()> {
+    fn process_frame(&mut self, frame: &mut AudioFrame) -> Result<()> {
         // If empty frame, nothing to do
         if frame.samples.is_empty() {
             return Ok(());
@@ -36,7 +35,7 @@ impl Processor for NoiseReducer {
             Samples::PCM { samples } => samples,
             _ => return Ok(()),
         };
-        let samples = self.resampler_source.borrow_mut().resample(samples);
+        let samples = self.resampler_source.resample(samples);
         let input_size = samples.len();
 
         let output_padding_size = input_size + DenoiseState::FRAME_SIZE;
@@ -60,7 +59,7 @@ impl Processor for NoiseReducer {
             };
 
             // Process the current frame
-            self.denoiser.borrow_mut().process_frame(
+            self.denoiser.process_frame(
                 &mut output_buf[offset..offset + DenoiseState::FRAME_SIZE],
                 &input_chunk,
             );
@@ -74,7 +73,7 @@ impl Processor for NoiseReducer {
             .collect::<PcmBuf>();
 
         frame.samples = Samples::PCM {
-            samples: self.resampler_target.borrow_mut().resample(&samples),
+            samples: self.resampler_target.resample(&samples),
         };
 
         Ok(())

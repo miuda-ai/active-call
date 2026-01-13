@@ -247,7 +247,7 @@ impl RecorderProcessor {
 }
 
 impl Processor for RecorderProcessor {
-    fn process_frame(&self, frame: &mut AudioFrame) -> Result<()> {
+    fn process_frame(&mut self, frame: &mut AudioFrame) -> Result<()> {
         let frame_clone = frame.clone();
         let _ = self.sender.send(frame_clone);
         Ok(())
@@ -313,8 +313,8 @@ impl MediaStream {
                     .contains(&packet.track_id)
             };
             // Process the packet with each track
-            for (track, dtmf_detector) in self.tracks.lock().await.values() {
-                if &packet.track_id == track.id() {
+            for (track, dtmf_detector) in self.tracks.lock().await.values_mut() {
+                if track.id() == &packet.track_id {
                     match &packet.samples {
                         Samples::RTP {
                             payload_type,
@@ -370,7 +370,7 @@ impl MuteProcessor {
 }
 
 impl Processor for MuteProcessor {
-    fn process_frame(&self, frame: &mut AudioFrame) -> Result<()> {
+    fn process_frame(&mut self, frame: &mut AudioFrame) -> Result<()> {
         match &mut frame.samples {
             Samples::PCM { samples } => {
                 samples.fill(0);

@@ -318,6 +318,7 @@ impl LlmHandler {
     }
 
     async fn generate_response(&mut self) -> Result<Vec<Command>> {
+        let start_time = crate::media::get_timestamp();
         // Send debug event - LLM call started
         self.send_debug_event(
             "llm_call_start",
@@ -337,6 +338,7 @@ impl LlmHandler {
         let mut commands = Vec::new();
         let mut is_json_mode = false;
         let mut checked_json_mode = false;
+        let mut first_token_time = None;
 
         while let Some(chunk_result) = stream.next().await {
             let chunk = match chunk_result {
@@ -346,6 +348,10 @@ impl LlmHandler {
                     break;
                 }
             };
+
+            if first_token_time.is_none() && !chunk.trim().is_empty() {
+                first_token_time = Some(crate::media::get_timestamp());
+            }
 
             full_content.push_str(&chunk);
             buffer.push_str(&chunk);
@@ -373,11 +379,14 @@ impl LlmHandler {
         }
 
         // Send debug event - LLM response received
+        let end_time = crate::media::get_timestamp();
         self.send_debug_event(
             "llm_response",
             json!({
                 "response": full_content,
                 "is_json_mode": is_json_mode,
+                "duration": end_time - start_time,
+                "ttfb": first_token_time.map(|t| t - start_time).unwrap_or(0),
             }),
         );
 

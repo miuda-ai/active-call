@@ -29,7 +29,7 @@ impl CountingProcessor {
 }
 
 impl Processor for CountingProcessor {
-    fn process_frame(&self, _frame: &mut AudioFrame) -> Result<()> {
+    fn process_frame(&mut self, _frame: &mut AudioFrame) -> Result<()> {
         self.count.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }

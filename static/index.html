@@ -3,8 +3,24 @@
 
 <head>
     <meta charset="UTF-8">
-    <title>Playbook Debugger</title>
+    <title>Voice AI Debugger</title>
     <style>
+        :root {
+            --bg-color: #0f0f0f;
+            --panel-bg: #1a1a1a;
+            --border-color: #2b2b2b;
+            --text-color: #e0e0e0;
+            --text-muted: #888;
+            --primary-color: #3b82f6;
+            --success-color: #22c55e;
+            --warning-color: #f59e0b;
+            --danger-color: #ef4444;
+            --user-color: #4ec9b0;
+            --bot-color: #569cd6;
+            --llm-color: #c586c0;
+            --asr-color: #9cdcfe;
+        }
+
         * {
             box-sizing: border-box;
             margin: 0;
@@ -12,717 +28,622 @@
         }
 
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
-            background: #1e1e1e;
-            color: #d4d4d4;
-            padding: 20px;
+            font-family: 'Inter', -apple-system, system-ui, sans-serif;
+            background: var(--bg-color);
+            color: var(--text-color);
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
         }
 
-        h1 {
-            font-size: 24px;
-            margin-bottom: 20px;
-            color: #fff;
+        header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 12px 20px;
+            background: var(--panel-bg);
+            border-bottom: 1px solid var(--border-color);
+            gap: 20px;
         }
 
-        h2 {
+        .brand h1 {
             font-size: 18px;
-            margin: 15px 0 10px;
-            color: #4ec9b0;
-        }
-
-        h3 {
-            font-size: 14px;
-            margin: 10px 0 5px;
-            color: #9cdcfe;
-        }
-
-        .container {
-            display: grid;
-            grid-template-columns: 250px 1fr;
-            gap: 15px;
-            max-width: 1800px;
-        }
-
-        .sidebar {
-            background: #252526;
-            border: 1px solid #3c3c3c;
-            border-radius: 6px;
-            padding: 15px;
-        }
-
-        .main-content {
-            display: grid;
-            grid-template-rows: auto 1fr;
-            gap: 15px;
-        }
-
-        .panel {
-            background: #252526;
-            border: 1px solid #3c3c3c;
-            border-radius: 6px;
-            padding: 15px;
-        }
-
-        .debug-panels {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 15px;
+            font-weight: 600;
         }
 
         .controls {
             display: flex;
-            gap: 10px;
-            flex-wrap: wrap;
+            align-items: center;
+            gap: 12px;
+            flex-grow: 1;
+            justify-content: flex-end;
+        }
+
+        select,
+        input {
+            background: #252526;
+            border: 1px solid var(--border-color);
+            color: white;
+            padding: 6px 12px;
+            border-radius: 4px;
+            font-size: 13px;
         }
 
         button {
-            background: #0e639c;
-            color: #fff;
+            padding: 6px 14px;
+            border-radius: 4px;
             border: none;
-            padding: 8px 16px;
-            border-radius: 4px;
-            cursor: pointer;
             font-size: 13px;
-            transition: background 0.2s;
-        }
-
-        button:hover:not(:disabled) {
-            background: #1177bb;
-        }
-
-        button:disabled {
-            background: #3c3c3c;
-            color: #6e6e6e;
-            cursor: not-allowed;
-        }
-
-        button.danger {
-            background: #c72e2e;
-        }
-
-        button.danger:hover:not(:disabled) {
-            background: #e03838;
-        }
-
-        #playbook-list {
-            list-style: none;
-        }
-
-        #playbook-list li {
-            padding: 8px 12px;
-            margin: 4px 0;
+            font-weight: 500;
             cursor: pointer;
-            border-radius: 4px;
-            transition: background 0.2s;
         }
 
-        #playbook-list li:hover {
-            background: #2a2d2e;
+        .btn-primary {
+            background: var(--primary-color);
+            color: white;
         }
 
-        #playbook-list li.active {
-            background: #094771;
-            font-weight: 600;
+        .btn-danger {
+            background: var(--danger-color);
+            color: white;
         }
 
-        .status {
-            display: inline-block;
-            padding: 4px 12px;
-            border-radius: 12px;
-            font-size: 12px;
-            font-weight: 600;
-            margin-left: 10px;
-        }
-
-        .status.idle {
+        .btn-secondary {
             background: #3c3c3c;
-            color: #858585;
+            color: white;
         }
 
-        .status.connected {
-            background: #0e7a0d;
-            color: #d7e5d7;
-        }
-
-        .status.calling {
-            background: #c27d0e;
-            color: #f0e7d6;
-        }
-
-        .log-container {
-            background: #1e1e1e;
-            border: 1px solid #3c3c3c;
-            border-radius: 4px;
-            padding: 10px;
-            height: 300px;
-            overflow-y: auto;
-            font-family: 'Consolas', 'Monaco', monospace;
-            font-size: 12px;
-        }
-
-        .log-entry {
-            padding: 3px 0;
-            border-bottom: 1px solid #2a2a2a;
-        }
-
-        .log-time {
-            color: #6a9955;
+        .status-pill {
+            padding: 4px 10px;
+            border-radius: 99px;
             font-size: 11px;
-        }
-
-        .log-event {
-            color: #9cdcfe;
             font-weight: 600;
         }
 
-        .log-event.asr {
-            color: #4ec9b0;
+        .status-idle {
+            background: #333;
+            color: #888;
         }
 
-        .log-event.tts {
-            color: #dcdcaa;
+        .status-connected {
+            background: #064e3b;
+            color: #34d399;
         }
 
-        .log-event.tool {
-            color: #c586c0;
+        .status-calling {
+            background: #78350f;
+            color: #fbbf24;
         }
 
-        .log-event.llm {
-            color: #569cd6;
+        main {
+            display: grid;
+            grid-template-columns: 1fr 400px;
+            grid-template-rows: auto 1fr;
+            flex-grow: 1;
+            overflow: hidden;
         }
 
-        .log-event.error {
-            color: #f48771;
+        .timeline-container {
+            grid-column: 1 / -1;
+            background: #141414;
+            border-bottom: 1px solid var(--border-color);
+            height: 140px;
+            overflow-x: auto;
+            position: relative;
         }
 
-        .log-data {
-            color: #ce9178;
-            margin-left: 10px;
+        .timeline-ruler {
+            position: absolute;
+            top: 0;
+            left: 60px;
+            height: 20px;
+            border-bottom: 1px solid #333;
+            pointer-events: none;
+            z-index: 5;
         }
 
-        .tool-call {
+        .ruler-mark {
+            position: absolute;
+            border-left: 1px solid #333;
+            height: 100%;
+            font-size: 9px;
+            color: #555;
+            padding-left: 4px;
+            white-space: nowrap;
+        }
+
+        .timeline-rows {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            width: fit-content;
+            min-width: 100%;
+            position: relative;
+            padding-top: 25px;
+        }
+
+        .timeline-row {
+            height: 20px;
+            display: flex;
+            align-items: center;
+            position: relative;
+        }
+
+        .timeline-label {
+            position: sticky;
+            left: 0;
+            font-size: 10px;
+            font-weight: 700;
+            color: #666;
+            width: 60px;
+            height: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 10;
+            background: #141414;
+            border-right: 1px solid #222;
+        }
+
+        .timeline-bar {
+            position: absolute;
+            height: 14px;
+            border-radius: 3px;
+            min-width: 2px;
+            cursor: pointer;
+            transition: transform 0.1s;
+        }
+
+        .timeline-bar:hover {
+            transform: scaleY(1.2);
+            filter: brightness(1.2);
+        }
+
+        .bar-vad {
+            background: var(--user-color);
+            opacity: 0.8;
+        }
+
+        .bar-asr {
+            background: var(--asr-color);
+            opacity: 0.8;
+        }
+
+        .bar-llm {
+            background: var(--llm-color);
+            opacity: 0.8;
+        }
+
+        .bar-tts {
+            background: var(--bot-color);
+            opacity: 0.8;
+        }
+
+        .content-area {
+            overflow-y: auto;
+            border-right: 1px solid var(--border-color);
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+
+        .sidebar-area {
+            background: #161616;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .panel-header {
+            padding: 10px 15px;
             background: #1e1e1e;
-            border-left: 3px solid #c586c0;
-            padding: 10px;
-            margin: 8px 0;
-            border-radius: 4px;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            position: sticky;
+            top: 0;
+            z-index: 5;
         }
 
-        .tool-name {
-            color: #c586c0;
-            font-weight: 600;
-            font-size: 14px;
-        }
-
-        .tool-params {
-            color: #9cdcfe;
-            font-size: 12px;
-            margin-top: 5px;
-            font-family: 'Consolas', 'Monaco', monospace;
-        }
-
-        .conversation-entry {
-            background: #1e1e1e;
-            padding: 10px;
-            margin: 8px 0;
-            border-radius: 4px;
-            border-left: 3px solid #858585;
-        }
-
-        .conversation-entry.user {
-            border-left-color: #4ec9b0;
-        }
-
-        .conversation-entry.assistant {
-            border-left-color: #569cd6;
-        }
-
-        .conversation-entry.system {
-            border-left-color: #dcdcaa;
-        }
-
-        .conversation-role {
-            font-weight: 600;
+        .panel-header h2 {
             font-size: 12px;
             text-transform: uppercase;
-            margin-bottom: 5px;
+            color: var(--text-muted);
         }
 
-        .conversation-role.user {
-            color: #4ec9b0;
+        .chat-container {
+            flex-grow: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
         }
 
-        .conversation-role.assistant {
-            color: #569cd6;
-        }
-
-        .conversation-role.system {
-            color: #dcdcaa;
-        }
-
-        .conversation-text {
-            color: #d4d4d4;
-            font-size: 13px;
+        .message {
+            max-width: 80%;
+            padding: 10px 14px;
+            border-radius: 12px;
+            font-size: 14px;
             line-height: 1.5;
         }
 
-        .clear-btn {
-            background: #3c3c3c;
-            color: #d4d4d4;
-            font-size: 11px;
-            padding: 4px 10px;
+        .message.user {
+            align-self: flex-start;
+            background: #2a2a2a;
+            border-left: 3px solid var(--user-color);
         }
 
-        .clear-btn:hover {
-            background: #505050;
+        .message.assistant {
+            align-self: flex-end;
+            background: #1e3a8a33;
+            border-right: 3px solid var(--bot-color);
+        }
+
+        .msg-info {
+            font-size: 10px;
+            color: var(--text-muted);
+            margin-bottom: 4px;
+        }
+
+        .msg-metrics {
+            margin-top: 6px;
+            display: flex;
+            gap: 8px;
+            font-size: 10px;
+            color: var(--text-muted);
+            border-top: 1px border #333;
+            padding-top: 4px;
+        }
+
+        .metric {
+            background: #252526;
+            padding: 2px 6px;
+            border-radius: 4px;
+        }
+
+        .log-container {
+            padding: 10px;
+            font-family: monospace;
+            font-size: 11px;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .log-entry {
+            display: flex;
+            gap: 8px;
+            border-bottom: 1px solid #222;
+            padding: 2px 0;
+        }
+
+        .log-k {
+            font-weight: 600;
+            width: 80px;
+        }
+
+        .type-asr {
+            color: var(--asr-color);
+        }
+
+        .type-tts {
+            color: var(--bot-color);
+        }
+
+        .type-llm {
+            color: var(--llm-color);
+        }
+
+        .type-err {
+            color: var(--danger-color);
         }
 
         ::-webkit-scrollbar {
-            width: 10px;
-        }
-
-        ::-webkit-scrollbar-track {
-            background: #1e1e1e;
+            width: 6px;
+            height: 6px;
         }
 
         ::-webkit-scrollbar-thumb {
-            background: #424242;
-            border-radius: 5px;
-        }
-
-        ::-webkit-scrollbar-thumb:hover {
-            background: #4e4e4e;
-        }
-
-        @media (max-width: 1200px) {
-            .container {
-                grid-template-columns: 1fr;
-            }
-
-            .debug-panels {
-                grid-template-columns: 1fr;
-            }
+            background: #333;
+            border-radius: 10px;
         }
     </style>
 </head>
 
 <body>
-    <h1>🎭 Playbook Debugger</h1>
-    <div class="container">
-        <div class="sidebar">
-            <h2>Playbooks</h2>
-            <ul id="playbook-list"></ul>
-        </div>
-        <div class="main-content">
-            <div class="panel">
-                <h2>Controls</h2>
-                <div class="controls">
-                    <button id="run-btn" disabled>▶ Run Selected (WebRTC)</button>
-                    <button id="hangup-btn" class="danger" disabled>⏹ Hangup</button>
-                    <span id="status" class="status idle">Idle</span>
-                </div>
-                <div class="controls" style="margin-top: 15px; border-top: 1px solid #3c3c3c; padding-top: 15px;">
-                    <input type="text" id="sip-uri" placeholder="sip:user@host"
-                        style="background: #1e1e1e; color: #fff; border: 1px solid #3c3c3c; padding: 8px; border-radius: 4px; flex-grow: 1; min-width: 250px;">
-                    <button id="sip-call-btn" disabled>📞 SIP Call</button>
-                </div>
-            </div>
-            <div class="debug-panels">
-                <div class="panel">
-                    <div style="display: flex; justify-content: space-between; align-items: center;">
-                        <h2>🛠️ Tool Invocations</h2>
-                        <button class="clear-btn" onclick="clearToolCalls()">Clear</button>
-                    </div>
-                    <div id="tool-calls" class="log-container"></div>
-                </div>
-                <div class="panel">
-                    <div style="display: flex; justify-content: space-between; align-items: center;">
-                        <h2>💬 LLM Conversation</h2>
-                        <button class="clear-btn" onclick="clearConversation()">Clear</button>
-                    </div>
-                    <div id="conversation" class="log-container"></div>
-                </div>
-                <div class="panel" style="grid-column: 1 / -1;">
-                    <div style="display: flex; justify-content: space-between; align-items: center;">
-                        <h2>📡 Event Stream</h2>
-                        <button class="clear-btn" onclick="clearEvents()">Clear</button>
-                    </div>
-                    <div id="events" class="log-container"></div>
-                </div>
+    <header>
+        <div class="brand">
+            <h1>🎭 Playbook Debugger</h1>
+            <div style="font-size: 10px; color: var(--text-muted); margin-top: 2px;">
+                Power By <a href="https://miuda.ai" target="_blank"
+                    style="color: var(--primary-color); text-decoration: none;">miuda.ai</a>
             </div>
         </div>
-    </div>
-
+        <div class="controls">
+            <a href="https://github.com/restsend/active-call" target="_blank" title="GitHub Repository"
+                style="margin-right: 15px; color: var(--text-muted); transition: color 0.2s;">
+                <svg height="22" viewBox="0 0 16 16" width="22" std=""
+                    style="fill: currentColor; vertical-align: middle;">
+                    <path
+                        d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z">
+                    </path>
+                </svg>
+            </a>
+            <select id="playbook-list">
+                <option value="" disabled selected>Select Playbook...</option>
+            </select>
+            <input type="text" id="sip-uri" placeholder="sip:user@host" style="width: 200px;">
+            <button id="run-btn" class="btn-primary" disabled>WebRTC</button>
+            <button id="sip-call-btn" class="btn-primary" disabled>SIP</button>
+            <button id="hangup-btn" class="btn-danger" disabled>Hangup</button>
+            <span id="status" class="status-pill status-idle">Idle</span>
+        </div>
+    </header>
+    <main>
+        <div id="timeline-box" class="timeline-container">
+            <div id="timeline-ruler" class="timeline-ruler"></div>
+            <div id="timeline-rows" class="timeline-rows">
+                <div class="timeline-row" data-lane="USER">
+                    <div class="timeline-label">USER</div>
+                </div>
+                <div class="timeline-row" data-lane="ASR">
+                    <div class="timeline-label">ASR</div>
+                </div>
+                <div class="timeline-row" data-lane="LLM">
+                    <div class="timeline-label">LLM</div>
+                </div>
+                <div class="timeline-row" data-lane="BOT">
+                    <div class="timeline-label">BOT</div>
+                </div>
+            </div>
+        </div>
+        <div class="content-area">
+            <div class="panel-header">
+                <h2>Conversation</h2><button class="btn-secondary" style="font-size: 10px;"
+                    onclick="clearUI()">Clear</button>
+            </div>
+            <div id="conversation" class="chat-container"></div>
+        </div>
+        <div class="sidebar-area">
+            <div class="panel-header">
+                <h2>Events</h2>
+            </div>
+            <div id="events" class="log-container"></div>
+        </div>
+    </main>
     <script>
-        let selectedPlaybook = null;
-        let ws = null;
-        let pc = null;
+        let selectedPlaybook = null, ws = null, pc = null, timelineStart = null;
+        const PIXEL_PER_MS = 0.05; // 1s = 50px
+        const timelineLanes = {
+            USER: document.querySelector('[data-lane="USER"]'),
+            ASR: document.querySelector('[data-lane="ASR"]'),
+            LLM: document.querySelector('[data-lane="LLM"]'),
+            BOT: document.querySelector('[data-lane="BOT"]')
+        };
+        let activeBars = { USER: null, ASR: null, LLM: null, BOT: null };
+        let rulerMarksSet = new Set();
+        let messageMetrics = {};
+        let latestAssistantTs = null;
 
         async function loadPlaybooks() {
             try {
                 const res = await fetch('/api/playbooks');
                 const playbooks = await res.json();
                 const list = document.getElementById('playbook-list');
-                list.innerHTML = '';
                 playbooks.forEach(p => {
-                    const li = document.createElement('li');
-                    li.textContent = p.name;
-                    li.onclick = () => {
-                        selectedPlaybook = p.name;
-                        document.querySelectorAll('#playbook-list li').forEach(el => el.classList.remove('active'));
-                        li.classList.add('active');
-                        document.getElementById('run-btn').disabled = false;
-                        document.getElementById('sip-call-btn').disabled = false;
-                    };
-                    list.appendChild(li);
+                    const opt = document.createElement('option');
+                    opt.value = p.name; opt.textContent = p.name;
+                    list.appendChild(opt);
                 });
-            } catch (e) {
-                logEvent('ERROR', 'Failed to load playbooks: ' + e);
+                list.onchange = (e) => {
+                    selectedPlaybook = e.target.value;
+                    document.getElementById('run-btn').disabled = false;
+                    document.getElementById('sip-call-btn').disabled = false;
+                };
+            } catch (e) { logEntry('ERROR', e); }
+        }
+
+        function updateRuler(ts) {
+            if (!timelineStart) timelineStart = ts;
+            const elapsedSec = Math.floor((ts - timelineStart) / 1000);
+            for (let s = 0; s <= elapsedSec + 10; s++) {
+                if (!rulerMarksSet.has(s)) {
+                    const mark = document.createElement('div');
+                    mark.className = 'ruler-mark';
+                    mark.style.left = (s * 1000 * PIXEL_PER_MS) + 'px';
+                    mark.textContent = s + 's';
+                    document.getElementById('timeline-ruler').appendChild(mark);
+                    rulerMarksSet.add(s);
+                }
+            }
+            const totalWidth = (elapsedSec + 12) * 1000 * PIXEL_PER_MS + 100;
+            document.getElementById('timeline-rows').style.width = totalWidth + 'px';
+            document.getElementById('timeline-ruler').style.width = totalWidth + 'px';
+        }
+
+        function createBar(laneName, startTime, colorClass) {
+            if (!timelineStart) timelineStart = startTime;
+            updateRuler(startTime);
+            const bar = document.createElement('div');
+            bar.className = `timeline-bar ${colorClass}`;
+            const left = (startTime - timelineStart) * PIXEL_PER_MS + 60;
+            bar.style.left = left + 'px';
+            bar.style.width = '2px';
+            timelineLanes[laneName].appendChild(bar);
+            const barObj = { el: bar, start: startTime, jumpTs: null };
+            bar.onclick = () => { if (barObj.jumpTs) jumpToMessage(barObj.jumpTs); };
+            return barObj;
+        }
+
+        function endBar(barObj, endTime) {
+            if (!barObj) return;
+            updateRuler(endTime);
+            const width = Math.max(2, (endTime - barObj.start) * PIXEL_PER_MS);
+            barObj.el.style.width = width + 'px';
+        }
+
+        function handleEvent(event) {
+            const type = (event.event || 'metrics').toLowerCase();
+            const ts = event.timestamp;
+            logEntry(type, JSON.stringify(event));
+            updateRuler(ts);
+            if (type === 'speaking') {
+                activeBars.USER = createBar('USER', ts, 'bar-vad');
+                activeBars.ASR = createBar('ASR', ts, 'bar-asr');
+                activeBars.lastUserBars = [activeBars.USER, activeBars.ASR];
+            } else if (type === 'silence') {
+                endBar(activeBars.USER, ts); activeBars.USER = null;
+            } else if (type === 'asrfinal') {
+                endBar(activeBars.ASR, ts); activeBars.ASR = null;
+                const asrLatency = event.endTime ? Math.max(0, event.timestamp - event.endTime) : null;
+                addMessage('user', event.text, ts, asrLatency ? { asr: asrLatency } : null);
+                if (activeBars.lastUserBars) activeBars.lastUserBars.forEach(b => b.jumpTs = ts);
+            } else if (type === 'trackstart') {
+                activeBars.BOT = createBar('BOT', ts, 'bar-tts');
+                if (latestAssistantTs) activeBars.BOT.jumpTs = latestAssistantTs;
+            } else if (type === 'trackend') {
+                endBar(activeBars.BOT, ts); activeBars.BOT = null;
+            } else if (type === 'metrics') {
+                if (event.key === 'llm_call_start') activeBars.LLM = createBar('LLM', ts, 'bar-llm');
+                else if (event.key === 'llm_response') {
+                    endBar(activeBars.LLM, ts);
+                    addMessage('assistant', event.data.response, ts, {
+                        llm: event.data.duration,
+                        llm_ttfb: event.data.ttfb
+                    });
+                    if (activeBars.LLM) activeBars.LLM.jumpTs = ts;
+                    if (activeBars.BOT) activeBars.BOT.jumpTs = ts;
+                    activeBars.LLM = null;
+                } else if (event.key.startsWith('completed.tts.')) {
+                    const msgTs = (activeBars.BOT && activeBars.BOT.jumpTs) || latestAssistantTs;
+                    if (msgTs) {
+                        addMessage('assistant', null, msgTs, {
+                            tts: event.duration,
+                            tts_ttfb: event.data.ttfb
+                        });
+                    }
+                }
+            } else if (type === 'addhistory') {
+                addMessage(event.speaker === 'user' ? 'user' : 'assistant', event.text, ts);
             }
         }
 
-        document.getElementById('run-btn').onclick = async () => {
-            if (!selectedPlaybook) return;
-            logEvent('INFO', 'Starting playbook: ' + selectedPlaybook);
-
-            try {
-                const res = await fetch('/api/playbook/run', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ playbook: selectedPlaybook, type: 'webrtc' })
-                });
-                const data = await res.json();
-                const sessionId = data.session_id;
-                logEvent('INFO', 'Session ID: ' + sessionId);
-
-                startCall(sessionId);
-            } catch (e) {
-                logEvent('ERROR', 'Failed to start playbook: ' + e);
+        function jumpToMessage(ts) {
+            const el = document.getElementById(`msg-${ts}`);
+            if (el) {
+                el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                el.style.boxShadow = '0 0 0 3px var(--primary-color)';
+                setTimeout(() => el.style.boxShadow = 'none', 2000);
             }
-        };
+        }
 
-        document.getElementById('hangup-btn').onclick = () => {
-            if (ws) ws.close();
-            if (pc) pc.close();
-            ws = null;
-            pc = null;
-            updateStatus('idle');
-            document.getElementById('hangup-btn').disabled = true;
-            document.getElementById('run-btn').disabled = false;
-            document.getElementById('sip-call-btn').disabled = false;
+        function addMessage(role, text, ts, metrics = null) {
+            if (role === 'assistant') latestAssistantTs = ts;
+            if (metrics) {
+                messageMetrics[ts] = { ...(messageMetrics[ts] || {}), ...metrics };
+            }
+            const currentMetrics = messageMetrics[ts];
+
+            const container = document.getElementById('conversation');
+            let div = document.getElementById(`msg-${ts}`);
+            if (!div) {
+                div = document.createElement('div');
+                div.className = `message ${role}`;
+                div.id = `msg-${ts}`;
+                container.appendChild(div);
+            }
+
+            if (text !== null) {
+                div.dataset.text = text;
+            }
+            const displayText = div.dataset.text || '';
+
+            let metricsHtml = '';
+            if (currentMetrics) {
+                metricsHtml = `<div class="msg-metrics">` +
+                    (currentMetrics.asr ? `<span class="metric">ASR: ${currentMetrics.asr}ms</span>` : '') +
+                    (currentMetrics.llm ? `<span class="metric">LLM: ${currentMetrics.llm}ms</span>` : '') +
+                    (currentMetrics.llm_ttfb ? `<span class="metric">LLM TTFB: ${currentMetrics.llm_ttfb}ms</span>` : '') +
+                    (currentMetrics.tts ? `<span class="metric">TTS: ${currentMetrics.tts}ms</span>` : '') +
+                    (currentMetrics.tts_ttfb ? `<span class="metric">TTS TTFB: ${currentMetrics.tts_ttfb}ms</span>` : '') +
+                    `</div>`;
+            }
+
+            div.innerHTML = `<div class="msg-info">${role.toUpperCase()} • ${new Date(ts).toLocaleTimeString()}</div><div class="msg-text">${displayText}</div>${metricsHtml}`;
+            if (text !== null) container.scrollTop = container.scrollHeight;
+        }
+
+        function logEntry(key, val) {
+            const container = document.getElementById('events');
+            const entry = document.createElement('div');
+            entry.className = 'log-entry';
+            entry.innerHTML = `<span class="log-k">${key}</span><span class="log-v">${val}</span>`;
+            container.prepend(entry);
+        }
+
+        function updateStatus(status) {
+            const el = document.getElementById('status');
+            el.className = `status-pill status-${status}`;
+            el.textContent = status;
+        }
+
+        function clearUI() {
+            document.getElementById('conversation').innerHTML = '';
+            document.getElementById('events').innerHTML = '';
+            document.getElementById('timeline-ruler').innerHTML = '';
+            rulerMarksSet.clear();
+            Object.values(timelineLanes).forEach(lane => {
+                lane.querySelectorAll('.timeline-bar').forEach(b => b.remove());
+            });
+            timelineStart = null;
+            activeBars = { USER: null, ASR: null, LLM: null, BOT: null };
+        }
+
+        document.getElementById('run-btn').onclick = async () => {
+            const res = await fetch('/api/playbook/run', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ playbook: selectedPlaybook, type: 'webrtc' })
+            });
+            const data = await res.json(); startCall(data.session_id);
         };
 
         document.getElementById('sip-call-btn').onclick = async () => {
             const callee = document.getElementById('sip-uri').value;
-            if (!selectedPlaybook || !callee) {
-                alert('Please select a playbook and enter a SIP URI');
-                return;
-            }
-            logEvent('INFO', 'Starting SIP call for playbook: ' + selectedPlaybook + ' to ' + callee);
-
-            try {
-                const res = await fetch('/api/playbook/run', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ playbook: selectedPlaybook, type: 'sip', to: callee })
-                });
-                const data = await res.json();
-                const sessionId = data.session_id;
-                logEvent('INFO', 'Session ID: ' + sessionId);
-
-                startSipCall(sessionId, callee);
-            } catch (e) {
-                logEvent('ERROR', 'Failed to start SIP call: ' + e);
-            }
+            const res = await fetch('/api/playbook/run', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ playbook: selectedPlaybook, type: 'sip', to: callee })
+            });
+            const data = await res.json(); startSipCall(data.session_id, callee);
         };
+
+        document.getElementById('hangup-btn').onclick = () => { if (ws) ws.close(); if (pc) pc.close(); };
 
         async function startSipCall(sessionId, callee) {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            const url = `${protocol}//${window.location.host}/call/sip?id=${sessionId}`;
-            ws = new WebSocket(url);
-
-            ws.onopen = () => {
-                logEvent('WS', 'WebSocket connected to server (SIP monitoring)');
-                updateStatus('connected');
-                document.getElementById('hangup-btn').disabled = false;
-                document.getElementById('run-btn').disabled = true;
-                document.getElementById('sip-call-btn').disabled = true;
-
-                const inviteCmd = {
-                    command: 'invite',
-                    option: { callee: callee }
-                };
-                logEvent('WS', 'Sending invite command for callee: ' + callee);
-                ws.send(JSON.stringify(inviteCmd));
-            };
-
-            ws.onmessage = (event) => {
-                try {
-                    const msg = JSON.parse(event.data);
-                    logEvent('WS', 'Received event: ' + (msg.event || 'unknown'));
-                    handleEvent(msg);
-
-                    if (msg.event === 'answer') {
-                        updateStatus('calling');
-                    }
-                } catch (e) {
-                    logEvent('ERROR', 'Failed to handle message: ' + e.message);
-                }
-            };
-
-            ws.onerror = (error) => {
-                logEvent('ERROR', 'WebSocket error');
-            };
-
-            ws.onclose = () => {
-                logEvent('WS', 'Disconnected');
-                updateStatus('idle');
-                document.getElementById('hangup-btn').disabled = true;
-                document.getElementById('run-btn').disabled = false;
-                document.getElementById('sip-call-btn').disabled = false;
-            };
+            ws = new WebSocket(`${protocol}//${window.location.host}/call/sip?id=${sessionId}`);
+            ws.onopen = () => { updateStatus('connected'); document.getElementById('hangup-btn').disabled = false; ws.send(JSON.stringify({ command: 'invite', option: { callee: callee } })); };
+            ws.onmessage = (e) => { const msg = JSON.parse(e.data); handleEvent(msg); if (msg.event === 'answer') updateStatus('calling'); };
+            ws.onclose = () => { updateStatus('idle'); document.getElementById('hangup-btn').disabled = true; };
         }
 
         async function startCall(sessionId) {
-            let offer;
-
-            try {
-                // Request microphone access
-                logEvent('MEDIA', 'Requesting microphone access...');
-                const stream = await navigator.mediaDevices.getUserMedia({
-                    audio: {
-                        echoCancellation: true,
-                        noiseSuppression: true,
-                        autoGainControl: true
-                    }
-                });
-                logEvent('MEDIA', 'Microphone access granted');
-
-                // Get ICE servers
-                const iceServers = await fetch('/iceservers').then(r => r.json());
-                logEvent('WEBRTC', 'ICE servers: ' + JSON.stringify(iceServers));
-
-                pc = new RTCPeerConnection({ iceServers });
-
-                // Add local audio track
-                stream.getTracks().forEach(track => {
-                    pc.addTrack(track, stream);
-                    logEvent('WEBRTC', 'Added local audio track: ' + track.kind);
-                });
-
-                pc.ontrack = (event) => {
-                    logEvent('WEBRTC', 'Received remote audio track');
-                    const audio = new Audio();
-                    audio.srcObject = event.streams[0];
-                    audio.autoplay = true;
-                    audio.play().then(() => {
-                        logEvent('AUDIO', 'Audio playback started');
-                    }).catch(e => {
-                        logEvent('ERROR', 'Audio play failed: ' + e.message);
-                    });
-                };
-
-                pc.oniceconnectionstatechange = () => {
-                    logEvent('WEBRTC', 'ICE connection state: ' + pc.iceConnectionState);
-                };
-
-                pc.onconnectionstatechange = () => {
-                    logEvent('WEBRTC', 'Connection state: ' + pc.connectionState);
-                };
-
-                offer = await pc.createOffer();
-                await pc.setLocalDescription(offer);
-                logEvent('WEBRTC', 'Created SDP offer (length: ' + offer.sdp.length + ')');
-            } catch (e) {
-                logEvent('ERROR', 'Failed to setup WebRTC: ' + e.message);
-                updateStatus('idle');
-                return;
-            }
-
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            const iceServers = await fetch('/iceservers').then(r => r.json());
+            pc = new RTCPeerConnection({ iceServers });
+            stream.getTracks().forEach(t => pc.addTrack(t, stream));
+            pc.ontrack = (e) => { const audio = new Audio(); audio.srcObject = e.streams[0]; audio.autoplay = true; };
+            const offer = await pc.createOffer(); await pc.setLocalDescription(offer);
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            const url = `${protocol}//${window.location.host}/call/webrtc?id=${sessionId}`;
-            ws = new WebSocket(url);
-
-            ws.onopen = () => {
-                logEvent('WS', 'WebSocket connected to server');
-                updateStatus('connected');
-                document.getElementById('hangup-btn').disabled = false;
-                document.getElementById('run-btn').disabled = true;
-
-                const inviteCmd = {
-                    command: 'invite',
-                    option: { offer: offer.sdp }
-                };
-                logEvent('WS', 'Sending invite command (SDP length: ' + offer.sdp.length + ')');
-                ws.send(JSON.stringify(inviteCmd));
-                logEvent('WS', 'Invite command sent');
+            ws = new WebSocket(`${protocol}//${window.location.host}/call/webrtc?id=${sessionId}`);
+            ws.onopen = () => { updateStatus('connected'); document.getElementById('hangup-btn').disabled = false; ws.send(JSON.stringify({ command: 'invite', option: { offer: offer.sdp } })); };
+            ws.onmessage = async (e) => {
+                const msg = JSON.parse(e.data); handleEvent(msg);
+                if (msg.event === 'answer') { await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp }); updateStatus('calling'); }
             };
-
-            ws.onmessage = async (event) => {
-                try {
-                    const msg = JSON.parse(event.data);
-                    logEvent('WS', 'Received message: ' + msg.event);
-                    handleEvent(msg);
-
-                    if (msg.event === 'answer') {
-                        logEvent('WEBRTC', 'Received SDP answer (length: ' + msg.sdp.length + ')');
-                        await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
-                        logEvent('WEBRTC', 'Remote description set, call established');
-                        updateStatus('calling');
-                    }
-                } catch (e) {
-                    logEvent('ERROR', 'Failed to handle message: ' + e.message);
-                    console.error('Message handling error:', e, event.data);
-                }
-            };
-
-            ws.onerror = (error) => {
-                logEvent('ERROR', 'WebSocket error: ' + error.message);
-                console.error('WebSocket error:', error);
-            };
-
-            ws.onclose = () => {
-                logEvent('WS', 'Disconnected');
-                updateStatus('idle');
-                document.getElementById('hangup-btn').disabled = true;
-                document.getElementById('run-btn').disabled = false;
-            };
+            ws.onclose = () => { updateStatus('idle'); document.getElementById('hangup-btn').disabled = true; };
         }
-
-        function handleEvent(event) {
-            const eventType = event.event || 'unknown';
-
-            // Log all events
-            logEvent(eventType.toUpperCase(), JSON.stringify(event, null, 2));
-
-            // Handle specific event types
-            switch (eventType) {
-                case 'asrFinal':
-                    addConversation('user', event.text, event.timestamp);
-                    break;
-
-                case 'trackStart':
-                    if (event.play_id) {
-                        // TTS started
-                        addConversation('assistant', '🔊 Speaking...', event.timestamp);
-                    }
-                    break;
-
-                case 'metrics':
-                    handleMetricsEvent(event);
-                    break;
-
-                case 'addHistory':
-                    addConversation(event.speaker, event.text, event.timestamp);
-                    break;
-            }
-        }
-
-        function handleMetricsEvent(event) {
-            const key = event.key;
-            const data = event.data;
-
-            switch (key) {
-                case 'tool_invocation':
-                    addToolCall(data.tool, data.params, event.timestamp);
-                    break;
-
-                case 'llm_response':
-                    addConversation('assistant', data.response, event.timestamp);
-                    break;
-
-                case 'rag_result':
-                    logEvent('RAG', `Query: ${data.query}\nResult: ${data.result}`);
-                    break;
-
-                case 'llm_call_start':
-                    logEvent('LLM', `Starting LLM call (history: ${data.history_length} messages)`);
-                    break;
-            }
-        }
-
-        function addToolCall(tool, params, timestamp) {
-            const container = document.getElementById('tool-calls');
-            const entry = document.createElement('div');
-            entry.className = 'tool-call';
-            entry.innerHTML = `
-                <div class="tool-name">🔧 ${tool}</div>
-                <div class="log-time">${formatTimestamp(timestamp)}</div>
-                <div class="tool-params">${JSON.stringify(params, null, 2)}</div>
-            `;
-            container.appendChild(entry);
-            container.scrollTop = container.scrollHeight;
-        }
-
-        function addConversation(role, text, timestamp) {
-            const container = document.getElementById('conversation');
-            const entry = document.createElement('div');
-            entry.className = `conversation-entry ${role}`;
-            entry.innerHTML = `
-                <div class="conversation-role ${role}">${role}</div>
-                <div class="log-time">${formatTimestamp(timestamp)}</div>
-                <div class="conversation-text">${escapeHtml(text)}</div>
-            `;
-            container.appendChild(entry);
-            container.scrollTop = container.scrollHeight;
-        }
-
-        function logEvent(type, message) {
-            const container = document.getElementById('events');
-            const entry = document.createElement('div');
-            entry.className = 'log-entry';
-
-            const typeClass = getEventClass(type);
-            entry.innerHTML = `
-                <span class="log-time">${new Date().toLocaleTimeString()}</span>
-                <span class="log-event ${typeClass}">[${type}]</span>
-                <span class="log-data">${escapeHtml(message)}</span>
-            `;
-            container.appendChild(entry);
-            container.scrollTop = container.scrollHeight;
-        }
-
-        function getEventClass(type) {
-            const lower = type.toLowerCase();
-            if (lower.includes('asr')) return 'asr';
-            if (lower.includes('tts') || lower.includes('track')) return 'tts';
-            if (lower.includes('tool')) return 'tool';
-            if (lower.includes('llm')) return 'llm';
-            if (lower.includes('error')) return 'error';
-            return '';
-        }
-
-        function updateStatus(status) {
-            const statusEl = document.getElementById('status');
-            statusEl.className = `status ${status}`;
-            statusEl.textContent = status.charAt(0).toUpperCase() + status.slice(1);
-        }
-
-        function formatTimestamp(timestamp) {
-            if (!timestamp) return new Date().toLocaleTimeString();
-            // timestamp is in microseconds
-            const date = new Date(timestamp / 1000);
-            return date.toLocaleTimeString();
-        }
-
-        function escapeHtml(text) {
-            const div = document.createElement('div');
-            div.textContent = text;
-            return div.innerHTML;
-        }
-
-        function clearToolCalls() {
-            document.getElementById('tool-calls').innerHTML = '';
-        }
-
-        function clearConversation() {
-            document.getElementById('conversation').innerHTML = '';
-        }
-
-        function clearEvents() {
-            document.getElementById('events').innerHTML = '';
-        }
-
         loadPlaybooks();
     </script>
 </body>
