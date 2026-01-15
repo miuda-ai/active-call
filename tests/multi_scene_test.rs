@@ -97,7 +97,8 @@ async fn test_scene_transition_logic() -> Result<()> {
         Scene {
             id: "intro".to_string(),
             prompt: "You are in intro.".to_string(),
-            dtmf: None, play: None,
+            dtmf: None,
+            play: None,
         },
     );
     scenes.insert(
@@ -105,7 +106,8 @@ async fn test_scene_transition_logic() -> Result<()> {
         Scene {
             id: "detail".to_string(),
             prompt: "You are in detail.".to_string(),
-            dtmf: None, play: None,
+            dtmf: None,
+            play: None,
         },
     );
 
@@ -129,7 +131,10 @@ async fn test_scene_transition_logic() -> Result<()> {
         provider,
         Arc::new(NoopRag),
         Default::default(),
-        scenes, None, None, );
+        scenes,
+        None,
+        None,
+    );
 
     // 1. Initial State
     assert_eq!(

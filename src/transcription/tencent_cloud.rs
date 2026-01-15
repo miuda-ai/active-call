@@ -174,7 +174,10 @@ impl TencentCloudAsrClientBuilder {
                             timestamp: crate::media::get_timestamp(),
                             track_id: track_id.clone(),
                             sender: "TencentCloudAsrClient".to_string(),
-                            error: format!("Failed to connect to TencentCloud ASR WebSocket: {}", e),
+                            error: format!(
+                                "Failed to connect to TencentCloud ASR WebSocket: {}",
+                                e
+                            ),
                             code: Some(500),
                         });
                         return Err(e);

@@ -1,18 +1,15 @@
 use super::processor::Processor;
 use crate::{
-    event::{EventSender, SessionEvent},
-    media::{AudioFrame, Samples, INTERNAL_SAMPLERATE, TrackId},
     RealtimeOption, RealtimeType,
+    event::{EventSender, SessionEvent},
+    media::{AudioFrame, INTERNAL_SAMPLERATE, Samples, TrackId},
 };
-use anyhow::{anyhow, Result};
-use base64::{engine::general_purpose, Engine as _};
+use anyhow::{Result, anyhow};
+use base64::{Engine as _, engine::general_purpose};
 use futures::{SinkExt, StreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
-use tokio_tungstenite::{
-    connect_async,
-    tungstenite::protocol::Message,
-};
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
@@ -69,23 +66,31 @@ async fn run_realtime_loop(
     option: RealtimeOption,
 ) -> Result<()> {
     let provider = option.provider.unwrap_or(RealtimeType::OpenAI);
-    let model = option.model.unwrap_or_else(|| "gpt-4o-realtime-preview-2024-10-01".to_string());
-    
+    let model = option
+        .model
+        .unwrap_or_else(|| "gpt-4o-realtime-preview-2024-10-01".to_string());
+
     let url = match provider {
         RealtimeType::OpenAI => {
             format!("wss://api.openai.com/v1/realtime?model={}", model)
         }
         RealtimeType::Azure => {
-            let endpoint = option.endpoint.ok_or_else(|| anyhow!("Azure endpoint missing"))?;
-            format!("{}/openai/realtime?api-version=2024-10-01-preview&deployment={}", endpoint, model)
+            let endpoint = option
+                .endpoint
+                .ok_or_else(|| anyhow!("Azure endpoint missing"))?;
+            format!(
+                "{}/openai/realtime?api-version=2024-10-01-preview&deployment={}",
+                endpoint, model
+            )
         }
         RealtimeType::Other(ref u) => u.clone(),
     };
 
-    let api_key = option.secret_key.ok_or_else(|| anyhow!("API key missing"))?;
+    let api_key = option
+        .secret_key
+        .ok_or_else(|| anyhow!("API key missing"))?;
 
-    let mut request_builder = http::Request::builder()
-        .uri(&url);
+    let mut request_builder = http::Request::builder().uri(&url);
 
     match provider {
         RealtimeType::OpenAI => {
@@ -123,10 +128,12 @@ async fn run_realtime_loop(
             "tools": option.tools.unwrap_or_default(),
         }
     });
-    ws_tx.send(Message::Text(session_update.to_string().into())).await?;
+    ws_tx
+        .send(Message::Text(session_update.to_string().into()))
+        .await?;
 
     let mut event_rx = event_sender.subscribe();
-    
+
     loop {
         tokio::select! {
             _ = cancel_token.cancelled() => break,
@@ -163,7 +170,7 @@ async fn run_realtime_loop(
                                     let samples: Vec<i16> = data.chunks_exact(2)
                                         .map(|c| i16::from_le_bytes([c[0], c[1]]))
                                         .collect();
-                                    
+
                                     packet_sender.send(AudioFrame {
                                         track_id: "server-side-track".to_string(),
                                         samples: Samples::PCM { samples },
@@ -183,7 +190,7 @@ async fn run_realtime_loop(
                                 timestamp: crate::media::get_timestamp(),
                                 extra: Some(json!({ "event": "speech_started" })),
                             }).ok();
-                            
+
                             // Immediately signal interruption to stop current local playback
                             event_sender.send(SessionEvent::Interrupt {
                                 receiver: Some(track_id.clone()),

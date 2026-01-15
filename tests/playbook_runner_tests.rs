@@ -102,7 +102,9 @@ async fn test_playbook_run_flow() -> Result<()> {
         provider,
         Arc::new(NoopRag),
         active_call::playbook::InterruptionConfig::default(),
-        HashMap::new(), None, None,
+        HashMap::new(),
+        None,
+        None,
     );
 
     // 4. Create Runner
@@ -222,7 +224,9 @@ async fn test_playbook_hangup_flow() -> Result<()> {
         provider,
         Arc::new(NoopRag),
         active_call::playbook::InterruptionConfig::default(),
-        HashMap::new(), None, None,
+        HashMap::new(),
+        None,
+        None,
     );
     let runner = PlaybookRunner::with_handler(
         Box::new(llm_handler),
@@ -301,7 +305,9 @@ async fn test_playbook_accept_flow() -> Result<()> {
         provider,
         Arc::new(NoopRag),
         active_call::playbook::InterruptionConfig::default(),
-        HashMap::new(), None, None,
+        HashMap::new(),
+        None,
+        None,
     );
     let runner = PlaybookRunner::with_handler(
         Box::new(llm_handler),
@@ -362,7 +368,9 @@ async fn test_playbook_reject_flow() -> Result<()> {
         provider,
         Arc::new(NoopRag),
         active_call::playbook::InterruptionConfig::default(),
-        HashMap::new(), None, None,
+        HashMap::new(),
+        None,
+        None,
     );
     let runner = PlaybookRunner::with_handler(
         Box::new(llm_handler),

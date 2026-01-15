@@ -40,9 +40,9 @@ static FILLERS: Lazy<std::collections::HashSet<String>> = Lazy::new(|| {
     s
 });
 
+use super::ChatMessage;
 use super::InterruptionStrategy;
 use super::LlmConfig;
-use super::ChatMessage;
 use super::dialogue::DialogueHandler;
 
 const MAX_RAG_ATTEMPTS: usize = 3;
@@ -1136,26 +1136,32 @@ impl DialogueHandler for LlmHandler {
                 Ok(vec![])
             }
 
-            SessionEvent::FunctionCall { name, arguments, .. } => {
-                info!("Function call from Realtime: {} with args {}", name, arguments);
+            SessionEvent::FunctionCall {
+                name, arguments, ..
+            } => {
+                info!(
+                    "Function call from Realtime: {} with args {}",
+                    name, arguments
+                );
                 let args: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
                 match name.as_str() {
-                    "hangup_call" => {
-                        Ok(vec![Command::Hangup {
-                            reason: args["reason"].as_str().map(|s| s.to_string()),
-                            initiator: Some("ai".to_string()),
-                        }])
-                    }
+                    "hangup_call" => Ok(vec![Command::Hangup {
+                        reason: args["reason"].as_str().map(|s| s.to_string()),
+                        initiator: Some("ai".to_string()),
+                    }]),
                     "transfer_call" | "refer_call" => {
-                        if let Some(callee) = args["callee"].as_str().or_else(|| args["callee_uri"].as_str()) {
-                             Ok(vec![Command::Refer {
+                        if let Some(callee) = args["callee"]
+                            .as_str()
+                            .or_else(|| args["callee_uri"].as_str())
+                        {
+                            Ok(vec![Command::Refer {
                                 caller: String::new(),
                                 callee: callee.to_string(),
                                 options: None,
                             }])
                         } else {
                             warn!("No callee provided for transfer_call");
-                             Ok(vec![])
+                            Ok(vec![])
                         }
                     }
                     "goto_scene" => {

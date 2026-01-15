@@ -283,7 +283,7 @@ impl AliyunAsrClient {
     ) -> Result<()> {
         let (mut ws_sender, mut ws_receiver) = ws_stream.split();
         let begin_time = crate::media::get_timestamp();
-        
+
         // Use a UUID for Aliyun task_id to avoid issues with special characters in track_id (like SIP dialog IDs)
         let aliyun_task_id = Uuid::new_v4().to_string();
         let start_msg = RunTaskCommand::new(aliyun_task_id.clone(), &ctx.option);
@@ -340,7 +340,10 @@ impl AliyunAsrClient {
                                 let sentence_start_time = begin_time + sentence.begin_time as u64;
                                 let sentence_end_time = begin_time
                                     + sentence.end_time.unwrap_or_else(|| {
-                                        words.last().map(|w| w.end_time).unwrap_or(sentence.begin_time)
+                                        words
+                                            .last()
+                                            .map(|w| w.end_time)
+                                            .unwrap_or(sentence.begin_time)
                                     }) as u64;
                                 let text = sentence.text;
 
@@ -539,68 +542,69 @@ impl AliyunAsrClientBuilder {
         crate::spawn(async move {
             let res = async move {
                 // Handle wait_for_answer if enabled
-            if event_sender_rx.is_some() {
-                handle_wait_for_answer_with_audio_drop(event_sender_rx, &mut audio_rx, &token)
-                    .await;
+                if event_sender_rx.is_some() {
+                    handle_wait_for_answer_with_audio_drop(event_sender_rx, &mut audio_rx, &token)
+                        .await;
 
-                // Check if cancelled during wait
-                if token.is_cancelled() {
-                    debug!("Cancelled during wait for answer");
-                    return Ok::<(), anyhow::Error>(());
+                    // Check if cancelled during wait
+                    if token.is_cancelled() {
+                        debug!("Cancelled during wait for answer");
+                        return Ok::<(), anyhow::Error>(());
+                    }
                 }
-            }
 
-            let ws_stream = match inner.connect_websocket(&track_id).await {
-                Ok(stream) => stream,
-                Err(e) => {
-                    warn!(track_id, "Failed to connect to Aliyun ASR WebSocket: {}", e);
-                    let _ = event_sender.send(SessionEvent::Error {
-                        timestamp: crate::media::get_timestamp(),
-                        track_id,
-                        sender: "AliyunAsrClient".to_string(),
-                        error: format!("Failed to connect to Aliyun ASR WebSocket: {}", e),
-                        code: Some(500),
-                    });
-                    return Err(e);
-                }
-            };
-
-            info!(%track_id, option=?inner.option, "Starting Aliyun ASR client");
-            let ctx = WebSocketContext {
-                track_id: track_id.clone(),
-                option: self.option,
-            };
-
-            match AliyunAsrClient::handle_websocket_message(
-                ctx,
-                ws_stream,
-                audio_rx,
-                event_sender.clone(),
-                token,
-            )
-            .await
-            {
-                Ok(_) => {
-                    debug!("WebSocket message handling completed");
-                }
-                Err(e) => {
-                    info!("Error in handle_websocket_message: {}", e);
-                    event_sender
-                        .send(SessionEvent::Error {
-                            track_id,
+                let ws_stream = match inner.connect_websocket(&track_id).await {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        warn!(track_id, "Failed to connect to Aliyun ASR WebSocket: {}", e);
+                        let _ = event_sender.send(SessionEvent::Error {
                             timestamp: crate::media::get_timestamp(),
-                            sender: "aliyun_asr".to_string(),
-                            error: e.to_string(),
-                            code: None,
-                        })
-                        .ok();
+                            track_id,
+                            sender: "AliyunAsrClient".to_string(),
+                            error: format!("Failed to connect to Aliyun ASR WebSocket: {}", e),
+                            code: Some(500),
+                        });
+                        return Err(e);
+                    }
+                };
+
+                info!(%track_id, option=?inner.option, "Starting Aliyun ASR client");
+                let ctx = WebSocketContext {
+                    track_id: track_id.clone(),
+                    option: self.option,
+                };
+
+                match AliyunAsrClient::handle_websocket_message(
+                    ctx,
+                    ws_stream,
+                    audio_rx,
+                    event_sender.clone(),
+                    token,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        debug!("WebSocket message handling completed");
+                    }
+                    Err(e) => {
+                        info!("Error in handle_websocket_message: {}", e);
+                        event_sender
+                            .send(SessionEvent::Error {
+                                track_id,
+                                timestamp: crate::media::get_timestamp(),
+                                sender: "aliyun_asr".to_string(),
+                                error: e.to_string(),
+                                code: None,
+                            })
+                            .ok();
+                    }
                 }
+                Ok::<(), anyhow::Error>(())
             }
-            Ok::<(), anyhow::Error>(())
-        }.await;
-        if let Err(e) = res {
-            debug!("Aliyun ASR task finished with error: {:?}", e);
-        }
+            .await;
+            if let Err(e) = res {
+                debug!("Aliyun ASR task finished with error: {:?}", e);
+            }
         });
 
         Ok(client)

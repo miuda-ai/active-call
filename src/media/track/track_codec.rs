@@ -13,25 +13,25 @@ use audio_codec::g729::{G729Decoder, G729Encoder};
 use audio_codec::opus::{OpusDecoder, OpusEncoder};
 
 pub struct TrackCodec {
-    pub pcmu_encoder: PcmuEncoder,
-    pub pcmu_decoder: PcmuDecoder,
-    pub pcma_encoder: PcmaEncoder,
-    pub pcma_decoder: PcmaDecoder,
+    pcmu_encoder: PcmuEncoder,
+    pcmu_decoder: PcmuDecoder,
+    pcma_encoder: PcmaEncoder,
+    pcma_decoder: PcmaDecoder,
 
-    pub g722_encoder: G722Encoder,
-    pub g722_decoder: G722Decoder,
+    g722_encoder: Option<Box<G722Encoder>>,
+    g722_decoder: Option<Box<G722Decoder>>,
 
-    pub g729_encoder: G729Encoder,
-    pub g729_decoder: G729Decoder,
+    g729_encoder: Option<Box<G729Encoder>>,
+    g729_decoder: Option<Box<G729Decoder>>,
 
     #[cfg(feature = "opus")]
-    pub opus_encoder: Option<OpusEncoder>,
+    opus_encoder: Option<OpusEncoder>,
     #[cfg(feature = "opus")]
-    pub opus_decoder: Option<OpusDecoder>,
+    opus_decoder: Option<OpusDecoder>,
 
-    pub resampler: Option<Resampler>,
-    pub resampler_in_rate: u32,
-    pub resampler_out_rate: u32,
+    resampler: Option<Resampler>,
+    resampler_in_rate: u32,
+    resampler_out_rate: u32,
     pub payload_type_map: HashMap<u8, CodecType>,
 }
 
@@ -58,10 +58,10 @@ impl TrackCodec {
             pcmu_decoder: PcmuDecoder::new(),
             pcma_encoder: PcmaEncoder::new(),
             pcma_decoder: PcmaDecoder::new(),
-            g722_encoder: G722Encoder::new(),
-            g722_decoder: G722Decoder::new(),
-            g729_encoder: G729Encoder::new(),
-            g729_decoder: G729Decoder::new(),
+            g722_encoder: None,
+            g722_decoder: None,
+            g729_encoder: None,
+            g729_decoder: None,
             #[cfg(feature = "opus")]
             opus_encoder: None,
             #[cfg(feature = "opus")]
@@ -107,19 +107,19 @@ impl TrackCodec {
         let pcm = match codec {
             CodecType::PCMU => self.pcmu_decoder.decode(payload),
             CodecType::PCMA => self.pcma_decoder.decode(payload),
-            CodecType::G722 => self.g722_decoder.decode(payload),
-            CodecType::G729 => self.g729_decoder.decode(payload),
+            CodecType::G722 => self
+                .g722_decoder
+                .get_or_insert_with(|| Box::new(G722Decoder::new()))
+                .decode(payload),
+            CodecType::G729 => self
+                .g729_decoder
+                .get_or_insert_with(|| Box::new(G729Decoder::new()))
+                .decode(payload),
             #[cfg(feature = "opus")]
-            CodecType::Opus => {
-                if self.opus_decoder.is_none() {
-                    self.opus_decoder = Some(OpusDecoder::new_default());
-                }
-                if let Some(ref mut decoder) = self.opus_decoder.as_mut() {
-                    decoder.decode(payload)
-                } else {
-                    bytes_to_samples(payload)
-                }
-            }
+            CodecType::Opus => self
+                .opus_decoder
+                .get_or_insert_with(OpusDecoder::new_default)
+                .decode(payload),
             _ => bytes_to_samples(payload),
         };
 
@@ -192,19 +192,19 @@ impl TrackCodec {
                 let payload = match payload_type {
                     0 => self.pcmu_encoder.encode(&pcm),
                     8 => self.pcma_encoder.encode(&pcm),
-                    9 => self.g722_encoder.encode(&pcm),
-                    18 => self.g729_encoder.encode(&pcm),
+                    9 => self
+                        .g722_encoder
+                        .get_or_insert_with(|| Box::new(G722Encoder::new()))
+                        .encode(&pcm),
+                    18 => self
+                        .g729_encoder
+                        .get_or_insert_with(|| Box::new(G729Encoder::new()))
+                        .encode(&pcm),
                     #[cfg(feature = "opus")]
-                    111 => {
-                        if self.opus_encoder.is_none() {
-                            self.opus_encoder = Some(OpusEncoder::new_default());
-                        }
-                        if let Some(ref mut encoder) = self.opus_encoder.as_mut() {
-                            encoder.encode(&pcm)
-                        } else {
-                            samples_to_bytes(&pcm)
-                        }
-                    }
+                    111 => self
+                        .opus_encoder
+                        .get_or_insert_with(OpusEncoder::new_default)
+                        .encode(&pcm),
                     _ => samples_to_bytes(&pcm),
                 };
                 (payload_type, payload)

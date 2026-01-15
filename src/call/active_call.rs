@@ -589,7 +589,7 @@ impl ActiveCall {
             "caller with option"
         );
 
-        match self.setup_caller_track(option.clone()).await {
+        match self.setup_caller_track(&option).await {
             Ok(_) => return Ok(option),
             Err(e) => {
                 self.app_state
@@ -991,7 +991,7 @@ impl ActiveCall {
         let refer_call_state = Arc::new(RwLock::new(ActiveCallState {
             start_time: Utc::now(),
             ssrc,
-            option: Some(call_option),
+            option: Some(call_option.clone()),
             is_refer: true,
             ..Default::default()
         }));
@@ -1031,6 +1031,7 @@ impl ActiveCall {
                 refer_call_state.clone(),
                 &track_id,
                 invite_option,
+                &call_option,
                 moh,
                 auto_hangup_requested,
             ),
@@ -1213,7 +1214,7 @@ impl ActiveCall {
                 rtc_config.preferred_codec = Some(codec_types[0].clone());
                 rtc_config.codecs = codec_types;
             }
-        }        
+        }
 
         if rtc_config.preferred_codec.is_none() {
             rtc_config.preferred_codec = Some(self.track_config.codec.clone());
@@ -1242,7 +1243,7 @@ impl ActiveCall {
         Ok(track)
     }
 
-    async fn setup_caller_track(&self, option: CallOption) -> Result<()> {
+    async fn setup_caller_track(&self, option: &CallOption) -> Result<()> {
         self.call_state.write().await.option = Some(option.clone());
         info!(
             session_id = self.session_id,
@@ -1272,20 +1273,14 @@ impl ActiveCall {
                         .await;
                 }
 
-                let invite_option = {
-                    let cs = self.call_state.read().await;
-                    match cs.option.as_ref() {
-                        Some(option) => option.build_invite_option()?,
-                        _ => return Err(anyhow::anyhow!("call option not found")),
-                    }
-                };
-
+                let invite_option = option.build_invite_option()?;
                 match self
                     .create_outgoing_sip_track(
                         self.cancel_token.clone(),
                         self.call_state.clone(),
                         &self.session_id,
                         invite_option,
+                        &option,
                         None,
                         false,
                     )
@@ -1505,7 +1500,7 @@ impl ActiveCall {
         let mut rtc_config = RtcTrackConfig::default();
         rtc_config.mode = rustrtc::TransportMode::WebRtc; // WebRTC
         rtc_config.ice_servers = self.app_state.config.ice_servers.clone();
-        
+
         if let Some(codecs) = &self.app_state.config.codecs {
             let mut codec_types = Vec::new();
             for c in codecs {
@@ -1525,7 +1520,7 @@ impl ActiveCall {
                 rtc_config.preferred_codec = Some(codec_types[0].clone());
                 rtc_config.codecs = codec_types;
             }
-        }        
+        }
 
         if let Some(ref external_ip) = self.app_state.config.external_ip {
             rtc_config.external_ip = Some(external_ip.clone());
@@ -1575,6 +1570,7 @@ impl ActiveCall {
         call_state_ref: ActiveCallStateRef,
         track_id: &String,
         mut invite_option: InviteOption,
+        call_option: &CallOption,
         moh: Option<String>,
         auto_hangup: bool,
     ) -> Result<String, rsipstack::Error> {
@@ -1591,13 +1587,12 @@ impl ActiveCall {
                 .map_err(|e| rsipstack::Error::Error(e.to_string()))?,
         );
 
-        let call_option = {
+        {
             let mut cs = call_state_ref.write().await;
             if let Some(o) = cs.option.as_mut() {
                 o.offer = offer.clone();
             }
             cs.start_time = Utc::now();
-            cs.option.clone().unwrap_or_default()
         };
 
         invite_option.offer = offer.clone().map(|s| s.into());
