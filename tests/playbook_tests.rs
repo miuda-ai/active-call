@@ -1,5 +1,5 @@
 use active_call::playbook::{LlmConfig, Playbook, PlaybookConfig};
-use dotenv::dotenv;
+use dotenvy::dotenv;
 use reqwest::Client;
 use serde_json::json;
 use std::fs;

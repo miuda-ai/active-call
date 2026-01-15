@@ -537,7 +537,7 @@ async fn test_tts_track_end_of_stream() -> Result<()> {
 
 #[tokio::test]
 async fn test_tts_track_base64() -> Result<()> {
-        // Create a command channel
+    // Create a command channel
     let (command_tx, command_rx) = mpsc::unbounded_channel();
 
     // Create a TtsTrack with non-streaming mode

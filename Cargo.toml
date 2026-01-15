@@ -31,7 +31,7 @@ tower-http = { version = "0.6.2", features = ["fs", "trace"] }
 bytes = "1"
 futures = "0.3.31"
 rustls = { version = "0.23.36", features = ["ring"] }
-dotenv = "0.15"
+dotenvy = "0.15.7"
 clap = { version = "4.5.54", features = ["derive"] }
 chrono = { version = "0.4.42", features = ["serde"] }
 tokio = { version = "1.49.0", features = ["full", "tracing"] }
@@ -88,4 +88,4 @@ warp = { version = "0.4.1", features = ["server", "websocket"] }
 tokio-test = "0.4.5"
 mockall = "0.14.0"
 portpicker = "0.1.1"
-dotenv = "0.15"
+dotenvy = "0.15.7"

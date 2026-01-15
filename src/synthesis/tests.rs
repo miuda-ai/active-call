@@ -2,10 +2,8 @@ use crate::synthesis::deepgram::DeepegramTtsClient;
 use crate::synthesis::{
     AliyunTtsClient, SynthesisOption, SynthesisType, tencent_cloud::TencentCloudTtsClient,
 };
-use crate::synthesis::{
-    SynthesisClient, SynthesisEvent, TencentCloudTtsBasicClient,
-};
-use dotenv::dotenv;
+use crate::synthesis::{SynthesisClient, SynthesisEvent, TencentCloudTtsBasicClient};
+use dotenvy::dotenv;
 use futures::StreamExt;
 use std::env;
 use std::time::Duration;

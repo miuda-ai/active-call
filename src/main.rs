@@ -3,7 +3,7 @@ use anyhow::Result;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use clap::Parser;
-use dotenv::dotenv;
+use dotenvy::dotenv;
 use reqwest::StatusCode;
 use std::sync::Arc;
 use tokio::signal;

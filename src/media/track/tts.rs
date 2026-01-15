@@ -1,6 +1,10 @@
 use crate::{
     event::{EventSender, SessionEvent},
-    media::{AudioFrame, Samples, cache, processor::ProcessorChain, track::{Track, TrackConfig, TrackId, TrackPacketSender}},
+    media::{
+        AudioFrame, Samples, cache,
+        processor::ProcessorChain,
+        track::{Track, TrackConfig, TrackId, TrackPacketSender},
+    },
     synthesis::{
         Subtitle, SynthesisClient, SynthesisCommand, SynthesisCommandReceiver,
         SynthesisCommandSender, SynthesisEvent, bytes_size_to_duration,
@@ -12,7 +16,6 @@ use audio_codec::bytes_to_samples;
 use base64::{Engine, prelude::BASE64_STANDARD};
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
-use unic_emoji::char::is_emoji;
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
@@ -26,6 +29,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+use unic_emoji::char::is_emoji;
 
 #[derive(Clone)]
 pub struct SynthesisHandle {

@@ -6,7 +6,7 @@ use crate::{
         tencent_cloud::TencentCloudAsrClientBuilder,
     },
 };
-use dotenv::dotenv;
+use dotenvy::dotenv;
 use once_cell::sync::OnceCell;
 use rustls::crypto::ring::default_provider;
 use std::{collections::HashMap, env};
