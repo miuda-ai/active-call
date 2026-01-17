@@ -618,7 +618,7 @@ impl ActiveCall {
     }
 
     async fn do_accept(&self, mut option: CallOption) -> Result<()> {
-        let has_pending = self.invitation.has_pending_call(&self.session_id).is_some();
+        let has_pending = self.invitation.find_dialog_id_by_session_id(&self.session_id).is_some();
         let ready_to_answer_val = {
             let state = self.call_state.read().await;
             state.ready_to_answer.is_none()
@@ -682,7 +682,7 @@ impl ActiveCall {
         code: Option<rsip::StatusCode>,
         reason: Option<String>,
     ) -> Result<()> {
-        match self.invitation.has_pending_call(&self.session_id) {
+        match self.invitation.find_dialog_id_by_session_id(&self.session_id) {
             Some(id) => {
                 info!(
                     session_id = self.session_id,
@@ -1275,15 +1275,17 @@ impl ActiveCall {
                 }
             }
             ActiveCallType::Sip => {
-                if let Some(pending_dialog) = self.invitation.get_pending_call(&self.session_id) {
-                    return self
-                        .prepare_incoming_sip_track(
-                            self.cancel_token.clone(),
-                            self.call_state.clone(),
-                            &self.session_id,
-                            pending_dialog,
-                        )
-                        .await;
+                if let Some(dialog_id) = self.invitation.find_dialog_id_by_session_id(&self.session_id) {
+                    if let Some(pending_dialog) = self.invitation.get_pending_call(&dialog_id) {
+                        return self
+                            .prepare_incoming_sip_track(
+                                self.cancel_token.clone(),
+                                self.call_state.clone(),
+                                &self.session_id,
+                                pending_dialog,
+                            )
+                            .await;
+                    }
                 }
 
                 let invite_option = option.build_invite_option()?;
@@ -1333,27 +1335,28 @@ impl ActiveCall {
                     }
                 }
             }
-            ActiveCallType::B2bua => match self.invitation.get_pending_call(&self.session_id) {
-                Some(pending_dialog) => {
-                    return self
-                        .prepare_incoming_sip_track(
-                            self.cancel_token.clone(),
-                            self.call_state.clone(),
-                            &self.session_id,
-                            pending_dialog,
-                        )
-                        .await;
+            ActiveCallType::B2bua => {
+                if let Some(dialog_id) = self.invitation.find_dialog_id_by_session_id(&self.session_id) {
+                    if let Some(pending_dialog) = self.invitation.get_pending_call(&dialog_id) {
+                        return self
+                            .prepare_incoming_sip_track(
+                                self.cancel_token.clone(),
+                                self.call_state.clone(),
+                                &self.session_id,
+                                pending_dialog,
+                            )
+                            .await;
+                    }
                 }
-                None => {
-                    warn!(
-                        session_id = self.session_id,
-                        "no pending dialog found for B2BUA call"
-                    );
-                    return Err(anyhow::anyhow!(
-                        "no pending dialog found for session_id: {}",
-                        self.session_id
-                    ));
-                }
+                
+                warn!(
+                    session_id = self.session_id,
+                    "no pending dialog found for B2BUA call"
+                );
+                return Err(anyhow::anyhow!(
+                    "no pending dialog found for session_id: {}",
+                    self.session_id
+                ));
             },
         };
         match track {

@@ -110,6 +110,8 @@ pub struct LlmConfig {
     pub api_key: Option<String>,
     pub prompt: Option<String>,
     pub greeting: Option<String>,
+    pub language: Option<String>,
+    pub features: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -174,7 +176,8 @@ impl Playbook {
         let dtmf_regex =
             regex::Regex::new(r#"<dtmf\s+digit="([^"]+)"\s+action="([^"]+)"(?:\s+scene="([^"]+)")?(?:\s+target="([^"]+)")?\s*/>"#).unwrap();
         let play_regex = regex::Regex::new(r#"<play\s+file="([^"]+)"\s*/>"#).unwrap();
-        let followup_regex = regex::Regex::new(r#"<followup\s+timeout="(\d+)"\s+max="(\d+)"\s*/>"#).unwrap();
+        let followup_regex =
+            regex::Regex::new(r#"<followup\s+timeout="(\d+)"\s+max="(\d+)"\s*/>"#).unwrap();
 
         let parse_scene = |id: String, content: String| -> Scene {
             let mut dtmf_map = HashMap::new();

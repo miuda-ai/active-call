@@ -308,7 +308,7 @@ impl DialogStateReceiverGuard {
 #[derive(Clone)]
 pub struct Invitation {
     pub dialog_layer: Arc<DialogLayer>,
-    pub pending_dialogs: Arc<std::sync::Mutex<HashMap<String, PendingDialog>>>,
+    pub pending_dialogs: Arc<std::sync::Mutex<HashMap<DialogId, PendingDialog>>>,
 }
 
 impl Invitation {
@@ -319,27 +319,34 @@ impl Invitation {
         }
     }
 
-    pub fn add_pending(&self, session_id: String, pending: PendingDialog) {
+    pub fn add_pending(&self, dialog_id: DialogId, pending: PendingDialog) {
         self.pending_dialogs
             .lock()
-            .map(|mut ps| ps.insert(session_id, pending))
+            .map(|mut ps| ps.insert(dialog_id, pending))
             .ok();
     }
 
-    pub fn get_pending_call(&self, session_id: &String) -> Option<PendingDialog> {
+    pub fn get_pending_call(&self, dialog_id: &DialogId) -> Option<PendingDialog> {
         self.pending_dialogs
             .lock()
             .ok()
-            .map(|mut ps| ps.remove(session_id))
-            .flatten()
+            .and_then(|mut ps| ps.remove(dialog_id))
     }
 
-    pub fn has_pending_call(&self, session_id: &str) -> Option<DialogId> {
+    pub fn has_pending_call(&self, dialog_id: &DialogId) -> bool {
         self.pending_dialogs
             .lock()
             .ok()
-            .map(|ps| ps.get(session_id).map(|d| d.dialog.id()))
-            .flatten()
+            .map(|ps| ps.contains_key(dialog_id))
+            .unwrap_or(false)
+    }
+
+    pub fn find_dialog_id_by_session_id(&self, session_id: &str) -> Option<DialogId> {
+        self.pending_dialogs.lock().ok().and_then(|ps| {
+            ps.iter()
+                .find(|(id, _)| id.to_string() == session_id)
+                .map(|(id, _)| id.clone())
+        })
     }
 
     pub async fn hangup(
@@ -348,7 +355,7 @@ impl Invitation {
         code: Option<rsip::StatusCode>,
         reason: Option<String>,
     ) -> Result<()> {
-        if let Some(call) = self.get_pending_call(&dialog_id.to_string()) {
+        if let Some(call) = self.get_pending_call(&dialog_id) {
             call.dialog.reject(code, reason).ok();
             call.token.cancel();
         }
@@ -363,7 +370,7 @@ impl Invitation {
     }
 
     pub async fn reject(&self, dialog_id: DialogId) -> Result<()> {
-        if let Some(call) = self.get_pending_call(&dialog_id.to_string()) {
+        if let Some(call) = self.get_pending_call(&dialog_id) {
             call.dialog.reject(None, None).ok();
             call.token.cancel();
         }

@@ -210,22 +210,26 @@ async fn test_bob_call_alice_webhook_accept() -> Result<()> {
 
             // 7. Alice accepts the call immediately after webhook validation
             if let Some(dialog_id_str) = alice_dialog_id_received {
-                if let Some(pending_call) = alice_ua_arc.invitation.get_pending_call(&dialog_id_str) {
-                    info!("Alice accepting call with dialog_id: {}", dialog_id_str);
+                if let Some(dialog_id) = alice_ua_arc.invitation.find_dialog_id_by_session_id(&dialog_id_str) {
+                    if let Some(pending_call) = alice_ua_arc.invitation.get_pending_call(&dialog_id) {
+                        info!("Alice accepting call with dialog_id: {}", dialog_id_str);
 
                     let answer_sdp = b"v=0\r\no=alice 654321 654321 IN IP4 127.0.0.1\r\ns=Call\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 49171 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
                     let headers = Some(vec![rsip::Header::ContentType("application/sdp".to_string().into())]);
 
-                    match pending_call.dialog.accept(headers, Some(answer_sdp.to_vec())) {
-                        Ok(_) => {
-                            info!("Alice accepted the call successfully");
+                        match pending_call.dialog.accept(headers, Some(answer_sdp.to_vec())) {
+                            Ok(_) => {
+                                info!("Alice accepted the call successfully");
+                            }
+                            Err(e) => {
+                                warn!("Alice failed to accept call: {:?}", e);
+                            }
                         }
-                        Err(e) => {
-                            warn!("Alice failed to accept call: {:?}", e);
-                        }
+                    } else {
+                        warn!("No pending call found for Alice with dialog_id: {}", dialog_id_str);
                     }
                 } else {
-                    warn!("No pending call found for Alice with dialog_id: {}", dialog_id_str);
+                    warn!("No dialog ID found in pending dialogs for: {}", dialog_id_str);
                 }
             } else {
                 warn!("No dialog ID found for Alice");
@@ -383,14 +387,21 @@ async fn test_incoming_call_reject() -> Result<()> {
         }
 
         if let Some(dialog_id_str) = alice_dialog_id_received {
-            if let Some(pending_call) = alice_ua_arc.invitation.get_pending_call(&dialog_id_str) {
-                info!("Alice REJECTING call with dialog_id: {}", dialog_id_str);
-                pending_call
-                    .dialog
-                    .reject(Some(rsip::StatusCode::Decline), None)
-                    .ok();
+            if let Some(dialog_id) = alice_ua_arc
+                .invitation
+                .find_dialog_id_by_session_id(&dialog_id_str)
+            {
+                if let Some(pending_call) = alice_ua_arc.invitation.get_pending_call(&dialog_id) {
+                    info!("Alice REJECTING call with dialog_id: {}", dialog_id_str);
+                    pending_call
+                        .dialog
+                        .reject(Some(rsip::StatusCode::Decline), None)
+                        .ok();
+                } else {
+                    return Err(anyhow::anyhow!("No pending call found for Alice"));
+                }
             } else {
-                return Err(anyhow::anyhow!("No pending call found for Alice"));
+                return Err(anyhow::anyhow!("No dialog ID found in pending dialogs"));
             }
         }
 

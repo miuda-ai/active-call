@@ -312,8 +312,7 @@ impl LlmHandler {
         initial_scene_id: Option<String>,
     ) -> Self {
         let mut history = Vec::new();
-        let prompt = config.prompt.clone().unwrap_or_default();
-        let system_prompt = Self::build_system_prompt(&prompt);
+        let system_prompt = Self::build_system_prompt(&config, None);
 
         history.push(ChatMessage {
             role: "system".to_string(),
@@ -341,9 +340,33 @@ impl LlmHandler {
         }
     }
 
-    fn build_system_prompt(prompt: &str) -> String {
+    fn build_system_prompt(config: &LlmConfig, scene_prompt: Option<&str>) -> String {
+        let base_prompt =
+            scene_prompt.unwrap_or_else(|| config.prompt.as_deref().unwrap_or_default());
+        let mut features_prompt = String::new();
+
+        if let Some(features) = &config.features {
+            let lang = config.language.as_deref().unwrap_or("zh");
+            for feature in features {
+                match Self::load_feature_snippet(feature, lang) {
+                    Ok(snippet) => {
+                        features_prompt.push_str(&format!("\n- {}", snippet));
+                    }
+                    Err(e) => {
+                        warn!("Failed to load feature snippet {}: {}", feature, e);
+                    }
+                }
+            }
+        }
+
+        let features_section = if features_prompt.is_empty() {
+            String::new()
+        } else {
+            format!("\n\n### Enhanced Capabilities:{}\n", features_prompt)
+        };
+
         format!(
-            "{}\n\n\
+            "{}{}\n\n\
             Tool usage instructions:\n\
             - To hang up the call, output: <hangup/>\n\
             - To transfer the call, output: <refer to=\"sip:xxxx\"/>\n\
@@ -351,8 +374,14 @@ impl LlmHandler {
             - To switch to another scene, output: <goto scene=\"scene_id\"/>\n\
             Please use these XML tags for action triggers. They are optimized for streaming playback. \
             Output your response in short sentences. Each sentence will be played as soon as it is finished.",
-            prompt
+            base_prompt, features_section
         )
+    }
+
+    fn load_feature_snippet(feature: &str, lang: &str) -> Result<String> {
+        let path = format!("config/playbook/features/{}.{}.md", feature, lang);
+        let content = std::fs::read_to_string(path)?;
+        Ok(content.trim().to_string())
     }
 
     fn get_dtmf_action(&self, digit: &str) -> Option<super::DtmfAction> {
@@ -410,7 +439,7 @@ impl LlmHandler {
             info!("Switching to scene: {}", scene_id);
             self.current_scene_id = Some(scene_id.to_string());
             // Update system prompt in history
-            let system_prompt = Self::build_system_prompt(&scene.prompt);
+            let system_prompt = Self::build_system_prompt(&self.config, Some(&scene.prompt));
             if let Some(first_msg) = self.history.get_mut(0) {
                 if first_msg.role == "system" {
                     first_msg.content = system_prompt;
@@ -767,7 +796,8 @@ impl LlmHandler {
                         if let Some(scene) = self.scenes.get(&scene_id) {
                             self.current_scene_id = Some(scene_id);
                             // Update system prompt in history
-                            let system_prompt = Self::build_system_prompt(&scene.prompt);
+                            let system_prompt =
+                                Self::build_system_prompt(&self.config, Some(&scene.prompt));
                             if let Some(first_msg) = self.history.get_mut(0) {
                                 if first_msg.role == "system" {
                                     first_msg.content = system_prompt;
@@ -1370,6 +1400,51 @@ mod tests {
             self.queries.lock().unwrap().push(query.to_string());
             Ok(format!("retrieved {}", query))
         }
+    }
+
+    #[test]
+    fn test_build_system_prompt_with_features() {
+        let config = LlmConfig {
+            prompt: Some("Base prompt".to_string()),
+            language: Some("zh".to_string()),
+            features: Some(vec!["intent_clarification".to_string()]),
+            ..Default::default()
+        };
+
+        let prompt = LlmHandler::build_system_prompt(&config, None);
+        assert!(prompt.contains("Base prompt"));
+        assert!(prompt.contains("### Enhanced Capabilities:"));
+        // This is the content of intent_clarification.zh.md
+        assert!(prompt.contains("如果用户意图模糊"));
+        assert!(prompt.contains("<hangup/>"));
+    }
+
+    #[test]
+    fn test_build_system_prompt_missing_feature() {
+        let config = LlmConfig {
+            prompt: Some("Base prompt".to_string()),
+            language: Some("zh".to_string()),
+            features: Some(vec!["non_existent_feature".to_string()]),
+            ..Default::default()
+        };
+
+        // Should not crash, just warn and omit the feature
+        let prompt = LlmHandler::build_system_prompt(&config, None);
+        assert!(prompt.contains("Base prompt"));
+        assert!(!prompt.contains("Enhanced Capabilities"));
+    }
+
+    #[test]
+    fn test_build_system_prompt_en() {
+        let config = LlmConfig {
+            prompt: Some("Base prompt".to_string()),
+            language: Some("en".to_string()),
+            features: Some(vec!["intent_clarification".to_string()]),
+            ..Default::default()
+        };
+
+        let prompt = LlmHandler::build_system_prompt(&config, None);
+        assert!(prompt.contains("If the user's intent is unclear"));
     }
 
     #[tokio::test]

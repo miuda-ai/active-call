@@ -280,7 +280,8 @@ impl AppStateInner {
                         }
                     };
 
-                    let dialog_id_str = dialog.id().to_string();
+                    let dialog_id = dialog.id();
+                    let dialog_id_str = dialog_id.to_string();
                     let token = self.token.child_token();
                     let pending_dialog = PendingDialog {
                         token: token.clone(),
@@ -290,7 +291,7 @@ impl AppStateInner {
 
                     let guard = Arc::new(PendingDialogGuard::new(
                         self.invitation.clone(),
-                        dialog_id_str.clone(),
+                        dialog_id,
                         pending_dialog,
                     ));
 

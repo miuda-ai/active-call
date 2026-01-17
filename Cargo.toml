@@ -46,7 +46,8 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 tracing-appender = "0.2.4"
 toml = "0.9.8"
 rsip = "0.4.0"
-rsipstack = "0.4.2"
+rsipstack = "0.4.3"
+#rsipstack = { path = "../rsipstack" }
 uuid = { version = "1.19.0", features = ["v4"] }
 reqwest = { version = "0.13.1", features = [
     "json",

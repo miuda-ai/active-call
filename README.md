@@ -230,6 +230,11 @@ For detailed information on REST endpoints and WebSocket protocols, please refer
     - `intent`: Extracted user intent.
     - `json`: Structured JSON summary.
     - `custom`: Fully custom summary prompt.
+  - **Built-in Feature Snippets**: Enhances agent capabilities with ready-to-use, multi-language prompt snippets. Support includes:
+    - `intent_clarification`: Automatically guides the LLM to ask for clarification when user intent is ambiguous.
+    - `emotion_resonance`: Enables the LLM to sense and respond to user emotions (anger, joy, etc.) with empathy.
+    - `voice_emotion`: Instructs the LLM to generate emotion tags (e.g., `[happy]`) to drive expressive TTS.
+    - **Multi-language**: Snippets are automatically translated based on the `language` setting (`zh` or `en`).
 
 - **Advanced Voice Interaction**:
   - **Smart Interruption**: Multiple strategies (`vad`, `asr`, or `both`), filler word filtering, and protection periods.
@@ -251,6 +256,8 @@ tts:
 llm:
   provider: "openai"
   model: "gpt-4-turbo"
+  language: "zh"
+  features: ["intent_clarification", "emotion_resonance"]
 dtmf:
   "0": { action: "hangup" }
 followup:
@@ -275,26 +282,28 @@ To speak to a human, I can transfer you: <refer to="sip:human@domain.com" />
 
 ### Configuration Reference
 
-| Section          | Field              | Description                                                 |
-| ---------------- | ------------------ | ----------------------------------------------------------- |
-| **asr**          | `provider`         | Provider name (e.g., `aliyun`, `openai`, `tencent`).        |
-| **tts**          | `provider`         | Provider name.                                              |
-| **llm**          | `provider`         | LLM Provider.                                               |
-|                  | `model`            | Model name (e.g., `gpt-4`, `qwen-plus`).                    |
-| **dtmf**         | `digit`            | Mapping of keys (0-9, *, #) to actions.                     |
-|                  | `action`           | `goto` (scene), `transfer` (SIP), or `hangup`.              |
-| **interruption** | `strategy`         | `both`, `vad`, `asr`, or `none`.                            |
-|                  | `fillerWordFilter` | Enable filler word filtering (true/false).                  |
-| **vad**          | `provider`         | VAD provider (e.g., `silero`).                              |
-| **realtime**     | `provider`         | `openai` or `azure`. Enable low-latency streaming pipeline. |
-|                  | `model`            | Specific realtime model (e.g., `gpt-4o-realtime`).          |
-| **ambiance**     | `path`             | Path to background audio file.                              |
-|                  | `duckLevel`        | Volume level when agent is speaking (0.0-1.0).              |
-| **followup**     | `timeout`          | Silence timeout in ms before triggering follow-up.          |
-|                  | `max`              | Maximum number of follow-up attempts.                       |
-| **recorder**     | `recorderFile`     | Path template for recording (e.g., `call_{id}.wav`).        |
-| **denoise**      | -                  | Enable/Disable noise suppression (true/false).              |
-| **greeting**     | -                  | Initial greeting message.                                   |
+| Section          | Field              | Description                                                                           |
+| ---------------- | ------------------ | ------------------------------------------------------------------------------------- |
+| **asr**          | `provider`         | Provider name (e.g., `aliyun`, `openai`, `tencent`).                                  |
+| **tts**          | `provider`         | Provider name.                                                                        |
+| **llm**          | `provider`         | LLM Provider.                                                                         |
+|                  | `model`            | Model name (e.g., `gpt-4`, `qwen-plus`).                                              |
+|                  | `language`         | Language code for built-in snippets (`zh` or `en`).                                   |
+|                  | `features`         | List of enabled feature snippets (e.g., `["intent_clarification", "voice_emotion"]`). |
+| **dtmf**         | `digit`            | Mapping of keys (0-9, *, #) to actions.                                               |
+|                  | `action`           | `goto` (scene), `transfer` (SIP), or `hangup`.                                        |
+| **interruption** | `strategy`         | `both`, `vad`, `asr`, or `none`.                                                      |
+|                  | `fillerWordFilter` | Enable filler word filtering (true/false).                                            |
+| **vad**          | `provider`         | VAD provider (e.g., `silero`).                                                        |
+| **realtime**     | `provider`         | `openai` or `azure`. Enable low-latency streaming pipeline.                           |
+|                  | `model`            | Specific realtime model (e.g., `gpt-4o-realtime`).                                    |
+| **ambiance**     | `path`             | Path to background audio file.                                                        |
+|                  | `duckLevel`        | Volume level when agent is speaking (0.0-1.0).                                        |
+| **followup**     | `timeout`          | Silence timeout in ms before triggering follow-up.                                    |
+|                  | `max`              | Maximum number of follow-up attempts.                                                 |
+| **recorder**     | `recorderFile`     | Path template for recording (e.g., `call_{id}.wav`).                                  |
+| **denoise**      | -                  | Enable/Disable noise suppression (true/false).                                        |
+| **greeting**     | -                  | Initial greeting message.                                                             |
 
 ## Docker Usage
 

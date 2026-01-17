@@ -8,6 +8,7 @@ use crate::{
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use rsipstack::dialog::{
+    DialogId,
     dialog::{Dialog, DialogStateReceiver},
     server_dialog::ServerInviteDialog,
 };
@@ -20,12 +21,12 @@ pub struct PendingDialog {
     pub state_receiver: DialogStateReceiver,
 }
 pub struct PendingDialogGuard {
-    pub id: String,
+    pub id: DialogId,
     pub invitation: Invitation,
 }
 
 impl PendingDialogGuard {
-    pub fn new(invitation: Invitation, id: String, pending_dialog: PendingDialog) -> Self {
+    pub fn new(invitation: Invitation, id: DialogId, pending_dialog: PendingDialog) -> Self {
         invitation.add_pending(id.clone(), pending_dialog);
         info!(%id, "added pending dialog");
         Self { id, invitation }
