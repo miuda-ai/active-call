@@ -283,7 +283,7 @@ ws.onmessage = async (event) => {
 
 ### 场景2: SIP 呼叫（对接PBX/FS网关）
 
-**使用场景**: 对接企业 PBX 系统、FreeSWITCH、Asterisk 等传统电话网络。
+**使用场景**: 对接企业 PBX 系统、[RustPBX](https://github.com/restsend/rustpbx)、FreeSWITCH、Asterisk 等传统电话网络。
 
 #### 配置要点
 
@@ -345,9 +345,19 @@ ws.onmessage = (event) => {
 };
 ```
 
-#### 与 FreeSWITCH 集成示例
+#### 与 PBX 系统集成示例
 
-FreeSWITCH 拨号计划配置：
+**RustPBX 拨号计划配置**:
+
+```yaml
+# RustPBX dialplan.yml
+rules:
+  - match: "^9999$"
+    actions:
+      - bridge: "sip:agent@active-call-server:13050"
+```
+
+**FreeSWITCH 拨号计划配置**:
 
 ```xml
 <extension name="call_ai_agent">
@@ -438,7 +448,7 @@ WebSocket 呼叫支持以下音频格式：
 
 ### 场景4: SIP 呼入（注册到PBX）
 
-**使用场景**: Active Call 作为 SIP 终端注册到 FreeSWITCH、Asterisk 等 PBX，接听来电。
+**使用场景**: Active Call 作为 SIP 终端注册到 [RustPBX](https://github.com/restsend/rustpbx)、FreeSWITCH、Asterisk 等 PBX，接听来电。
 
 #### 配置 SIP 注册（即将支持）
 
@@ -487,7 +497,20 @@ caller = "^sip:vip.*"
 playbook = "vip_service.md"
 ```
 
-#### FreeSWITCH 配置示例
+#### PBX 系统配置示例
+
+**RustPBX 配置**:
+
+```yaml
+# RustPBX users.yml
+users:
+  - username: "1001"
+    password: "secret123"
+    domain: "pbx.example.com"
+    enabled: true
+```
+
+**FreeSWITCH 配置**:
 
 在 FreeSWITCH 中创建用户：
 

@@ -283,7 +283,7 @@ ws.onmessage = async (event) => {
 
 ### Scenario 2: SIP Calls (PBX/FS Gateway Integration)
 
-**Use Case**: Integration with enterprise PBX systems, FreeSWITCH, Asterisk, and traditional telephony networks.
+**Use Case**: Integration with enterprise PBX systems, [RustPBX](https://github.com/restsend/rustpbx), FreeSWITCH, Asterisk, and traditional telephony networks.
 
 #### Configuration Points
 
@@ -345,9 +345,19 @@ ws.onmessage = (event) => {
 };
 ```
 
-#### FreeSWITCH Integration Example
+#### PBX System Integration Examples
 
-FreeSWITCH dialplan configuration:
+**RustPBX Dialplan Configuration**:
+
+```yaml
+# RustPBX dialplan.yml
+rules:
+  - match: "^9999$"
+    actions:
+      - bridge: "sip:agent@active-call-server:13050"
+```
+
+**FreeSWITCH Dialplan Configuration**:
 
 ```xml
 <extension name="call_ai_agent">
@@ -438,7 +448,7 @@ WebSocket calls support the following audio formats:
 
 ### Scenario 4: SIP Inbound (Register to PBX)
 
-**Use Case**: Active Call registers as a SIP endpoint to FreeSWITCH, Asterisk, or other PBX systems to receive inbound calls.
+**Use Case**: Active Call registers as a SIP endpoint to [RustPBX](https://github.com/restsend/rustpbx), FreeSWITCH, Asterisk, or other PBX systems to receive inbound calls.
 
 #### Configure SIP Registration (Coming Soon)
 
@@ -487,7 +497,20 @@ caller = "^sip:vip.*"
 playbook = "vip_service.md"
 ```
 
-#### FreeSWITCH Configuration Example
+#### PBX System Configuration Examples
+
+**RustPBX Configuration**:
+
+```yaml
+# RustPBX users.yml
+users:
+  - username: "1001"
+    password: "secret123"
+    domain: "pbx.example.com"
+    enabled: true
+```
+
+**FreeSWITCH Configuration**:
 
 Create user in FreeSWITCH:
 

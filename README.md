@@ -15,7 +15,7 @@ For comprehensive guides and tutorials, visit:
 
 ### 1. Multi-Protocol Audio Gateway
 `active-call` supports a wide range of communication protocols, ensuring compatibility with both legacy and modern systems:
-- **SIP (Telephony)**: Supports standard SIP signaling. Can act as a **SIP Client/Extension** to register with PBX systems like **FreeSWITCH** or **Asterisk**, or handle direct SIP incoming/outgoing calls.
+- **SIP (Telephony)**: Supports standard SIP signaling. Can act as a **SIP Client/Extension** to register with PBX systems like **[RustPBX](https://github.com/restsend/rustpbx)**, **FreeSWITCH** or **Asterisk**, or handle direct SIP incoming/outgoing calls.
 - **WebRTC**: Direct browser-to-agent communication with low-latency SRTP.
 - **Voice over WebSocket**: A highly flexible API for custom integrations. Push raw PCM/encoded audio over WebSocket and receive real-time events.
 
@@ -43,7 +43,7 @@ For developers who need full control, `active-call` provides a raw audio-over-we
 
 ### SIP PBX Integration
 `active-call` can be integrated into existing corporate telephony:
-- **As an Extension**: Register `active-call` to your FreeSWITCH or Asterisk PBX like any other VoIP phone. AI agents can then receive calls from internal extensions or external trunks.
+- **As an Extension**: Register `active-call` to your [RustPBX](https://github.com/restsend/rustpbx), FreeSWITCH or Asterisk PBX like any other VoIP phone. AI agents can then receive calls from internal extensions or external trunks.
 - **As a Trunk**: Handle incoming SIP traffic directly from carriers.
 
 ### SIP Invitation Handlers
