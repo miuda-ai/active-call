@@ -2,6 +2,15 @@
 
 `active-call` is a standalone Rust crate designed for building AI Voice Agents. It provides a high-performance infrastructure for bridging AI models with real-word telephony and web communications.
 
+## 📖 Documentation
+
+For comprehensive guides and tutorials, visit:
+- **[Documentation Hub](./docs/README.md)** - Complete documentation index
+- **[Configuration Guide](./docs/config_guide.en.md)** - Detailed configuration for all call scenarios
+- **[配置指南（中文）](./docs/config_guide.zh.md)** - 完整的中文配置指南
+- **[API Documentation](./docs/api.md)** - WebSocket API reference
+- **[Playbook Tutorial](./docs/playbook_tutorial.en.md)** - Building stateful voice agents
+
 ## Key Capabilities
 
 ### 1. Multi-Protocol Audio Gateway
