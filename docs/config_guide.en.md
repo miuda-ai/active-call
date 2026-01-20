@@ -20,12 +20,14 @@ This document provides detailed information about the `active-call` configuratio
 ## Basic Configuration
 
 ```toml
-# HTTP service bind address
+# SIP service bind address
 addr = "0.0.0.0"
+
+# HTTP service address
 http_addr = "0.0.0.0:8080"
 
-# UDP port (for SIP and RTP)
-udp_port = 13050
+# UDP port (for SIP and RTP, default 25060)
+udp_port = 25060
 
 # Enable HTTP Gzip compression (optional)
 # http_gzip = true
@@ -45,8 +47,8 @@ media_cache_path = "./config/mediacache"
 
 ### Configuration Parameters
 
-- **addr**: IP address for HTTP service binding
-- **http_addr**: Full HTTP service address (IP + port)
+- **addr**: SIP service bind address
+- **http_addr**: HTTP service address (IP:Port)
 - **udp_port**: UDP port for SIP signaling and RTP media
 - **log_level**: Logging level, recommend `info` or `warn` for production
 - **media_cache_path**: Cache directory for media files (e.g., TTS audio)
@@ -69,8 +71,8 @@ external_ip = "1.2.3.4"
 
 ```toml
 # RTP port range
-rtp_start_port = 20000
-rtp_end_port = 30000
+rtp_start_port = 12000
+rtp_end_port = 42000
 ```
 
 ### STUN/TURN Server Configuration (WebRTC)
@@ -96,11 +98,11 @@ credential = "turnpass"
 ### SIP Configuration
 
 ```toml
-# SIP service bind address
-sip_addr = "0.0.0.0"
+# SIP service bind address (corresponds to addr in basic config)
+addr = "0.0.0.0"
 
-# SIP service port (avoid using standard port 5060)
-sip_port = 13050
+# SIP service port (corresponds to udp_port in basic config)
+udp_port = 25060
 ```
 
 **Note**: It's recommended not to use port 5060, as many network environments apply special handling to this port.
@@ -116,7 +118,7 @@ Active Call supports two types of SIP inbound call handling:
 Forward inbound requests to an HTTP endpoint for external service decision:
 
 ```toml
-[sip_handler]
+[handler]
 type = "webhook"
 url = "http://localhost:8090/webhook"
 method = "POST"
@@ -138,23 +140,23 @@ method = "POST"
 Automatically route to corresponding Playbook based on caller/callee numbers:
 
 ```toml
-[sip_handler]
+[handler]
 type = "playbook"
 default = "default.md"  # Optional: default playbook when no rules match
 
 # Rule 1: US numbers calling support line
-[[sip_handler.rules]]
+[[handler.rules]]
 caller = "^\\+1\\d{10}$"        # Match US number format
 callee = "^sip:support@.*"      # Match support line
 playbook = "support.md"         # Use support playbook
 
 # Rule 2: Chinese numbers automatically use Chinese playbook
-[[sip_handler.rules]]
+[[handler.rules]]
 caller = "^\\+86\\d+"           # Match Chinese numbers
 playbook = "chinese.md"         # Match caller only
 
 # Rule 3: Sales line
-[[sip_handler.rules]]
+[[handler.rules]]
 callee = "^sip:sales@.*"        # Match callee only
 playbook = "sales.md"
 ```
@@ -289,15 +291,15 @@ ws.onmessage = async (event) => {
 
 ```toml
 # SIP service configuration
-sip_addr = "0.0.0.0"
-sip_port = 13050
+addr = "0.0.0.0"
+udp_port = 25060
 
 # If behind NAT, configure external IP
 external_ip = "1.2.3.4"
 
 # RTP port range
-rtp_start_port = 20000
-rtp_end_port = 30000
+rtp_start_port = 12000
+rtp_end_port = 42000
 ```
 
 #### Initiating SIP Call
@@ -450,27 +452,31 @@ WebSocket calls support the following audio formats:
 
 **Use Case**: Active Call registers as a SIP endpoint to [RustPBX](https://github.com/restsend/rustpbx), FreeSWITCH, Asterisk, or other PBX systems to receive inbound calls.
 
-#### Configure SIP Registration (Coming Soon)
+#### Configure SIP Registration
 
 ```toml
-# SIP service configuration
-sip_addr = "0.0.0.0"
-sip_port = 13050
+# SIP service configuration (use addr and udp_port from basic config)
+addr = "0.0.0.0"
+udp_port = 25060
 
 # SIP registration accounts (multiple accounts supported)
-[[sip_accounts]]
+[[register_users]]
+server = "pbx.example.com:5060"
+username = "1001"
+disabled = false
+[register_users.credential]
 username = "1001"
 password = "secret123"
-domain = "pbx.example.com"
-server = "pbx.example.com:5060"
-enabled = true
+realm = "pbx.example.com"
 
-[[sip_accounts]]
+[[register_users]]
+server = "pbx.example.com:5060"
+username = "1002"
+disabled = false
+[register_users.credential]
 username = "1002"
 password = "secret456"
-domain = "pbx.example.com"
-server = "pbx.example.com:5060"
-enabled = true
+realm = "pbx.example.com"
 ```
 
 #### Configure Inbound Handler
@@ -478,21 +484,21 @@ enabled = true
 Use Playbook handler to automatically route different inbound calls:
 
 ```toml
-[sip_handler]
+[handler]
 type = "playbook"
 default = "default.md"
 
 # Route by callee number
-[[sip_handler.rules]]
+[[handler.rules]]
 callee = "^sip:1001@.*"
 playbook = "tech_support.md"
 
-[[sip_handler.rules]]
+[[handler.rules]]
 callee = "^sip:1002@.*"
 playbook = "sales.md"
 
 # Route by caller number
-[[sip_handler.rules]]
+[[handler.rules]]
 caller = "^sip:vip.*"
 playbook = "vip_service.md"
 ```
@@ -565,25 +571,22 @@ root = "./config/cdr"
 ```toml
 addr = "0.0.0.0"
 http_addr = "0.0.0.0:8080"
-udp_port = 13050
+udp_port = 25060
 log_level = "info"
 external_ip = "203.0.113.1"
 media_cache_path = "./config/mediacache"
 
-rtp_start_port = 20000
-rtp_end_port = 30000
+rtp_start_port = 12000
+rtp_end_port = 42000
 
 [[ice_servers]]
 urls = ["stun:stun.l.google.com:19302"]
 
-sip_addr = "0.0.0.0"
-sip_port = 13050
-
-[sip_handler]
+[handler]
 type = "playbook"
 default = "default.md"
 
-[[sip_handler.rules]]
+[[handler.rules]]
 callee = "^sip:support@.*"
 playbook = "support.md"
 
@@ -601,24 +604,23 @@ root = "./config/cdr"
 ```toml
 addr = "0.0.0.0"
 http_addr = "0.0.0.0:8080"
-udp_port = 13050
+udp_port = 25060
 log_level = "info"
 external_ip = "203.0.113.1"
 media_cache_path = "./config/mediacache"
 
-sip_addr = "0.0.0.0"
-sip_port = 13050
-
 # SIP account registration
-[[sip_accounts]]
+[[register_users]]
+server = "pbx.company.com:5060"
+username = "ai-agent-1"
+disabled = false
+[register_users.credential]
 username = "ai-agent-1"
 password = "ComplexPassword123"
-domain = "pbx.company.com"
-server = "pbx.company.com:5060"
-enabled = true
+realm = "pbx.company.com"
 
 # Webhook handler (external system determines routing)
-[sip_handler]
+[handler]
 type = "webhook"
 url = "http://crm.company.com:8090/call-routing"
 method = "POST"

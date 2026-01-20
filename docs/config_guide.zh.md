@@ -20,15 +20,14 @@
 ## 基础配置
 
 ```toml
-# HTTP 服务监听地址
+# SIP 服务监听地址
 addr = "0.0.0.0"
+
+# HTTP 服务端口地址
 http_addr = "0.0.0.0:8080"
 
-# UDP 端口（用于 SIP 和 RTP）
-udp_port = 13050
-
-# 启用 HTTP Gzip 压缩（可选）
-# http_gzip = true
+# UDP 端口（用于 SIP 和 RTP，默认 25060）
+udp_port = 25060
 
 # 日志级别：trace, debug, info, warn, error
 log_level = "debug"
@@ -45,7 +44,7 @@ media_cache_path = "./config/mediacache"
 
 ### 配置项说明
 
-- **addr**: HTTP 服务绑定的 IP 地址
+- **addr**: SIP 服务绑定的 IP 地址
 - **http_addr**: HTTP 服务完整地址（IP + 端口）
 - **udp_port**: UDP 端口，用于 SIP 信令和 RTP 媒体流
 - **log_level**: 日志级别，建议生产环境使用 `info` 或 `warn`
@@ -69,8 +68,8 @@ external_ip = "1.2.3.4"
 
 ```toml
 # RTP 端口范围
-rtp_start_port = 20000
-rtp_end_port = 30000
+rtp_start_port = 12000
+rtp_end_port = 42000
 ```
 
 ### STUN/TURN 服务器配置（WebRTC）
@@ -96,11 +95,11 @@ credential = "turnpass"
 ### SIP 配置
 
 ```toml
-# SIP 服务监听地址
-sip_addr = "0.0.0.0"
+# SIP 服务监听地址 (对应基础配置中的 addr)
+addr = "0.0.0.0"
 
-# SIP 服务端口（建议不使用标准的 5060）
-sip_port = 13050
+# SIP 服务端口 (对应基础配置中的 udp_port)
+udp_port = 25060
 ```
 
 **注意**: 建议不使用 5060 端口，因为很多网络环境会对该端口进行特殊处理。
@@ -116,7 +115,7 @@ Active Call 支持两种 SIP 呼入处理方式：
 将呼入请求转发到 HTTP 接口，由外部服务决定如何处理：
 
 ```toml
-[sip_handler]
+[handler]
 type = "webhook"
 url = "http://localhost:8090/webhook"
 method = "POST"
@@ -138,23 +137,23 @@ method = "POST"
 根据来电号码和被叫号码自动路由到对应的 Playbook：
 
 ```toml
-[sip_handler]
+[handler]
 type = "playbook"
 default = "default.md"  # 可选：没有匹配规则时使用的默认 Playbook
 
 # 规则1: 美国号码呼叫支持热线
-[[sip_handler.rules]]
+[[handler.rules]]
 caller = "^\\+1\\d{10}$"        # 匹配美国号码格式
 callee = "^sip:support@.*"      # 匹配支持热线
 playbook = "support.md"         # 使用支持 Playbook
 
 # 规则2: 中国号码自动使用中文 Playbook
-[[sip_handler.rules]]
+[[handler.rules]]
 caller = "^\\+86\\d+"           # 匹配中国号码
 playbook = "chinese.md"         # 只匹配来电号码
 
 # 规则3: 销售热线
-[[sip_handler.rules]]
+[[handler.rules]]
 callee = "^sip:sales@.*"        # 只匹配被叫号码
 playbook = "sales.md"
 ```
@@ -289,15 +288,15 @@ ws.onmessage = async (event) => {
 
 ```toml
 # SIP 服务配置
-sip_addr = "0.0.0.0"
-sip_port = 13050
+addr = "0.0.0.0"
+udp_port = 25060
 
 # 如果在 NAT 后面，配置外部 IP
 external_ip = "1.2.3.4"
 
 # RTP 端口范围
-rtp_start_port = 20000
-rtp_end_port = 30000
+rtp_start_port = 12000
+rtp_end_port = 42000
 ```
 
 #### 发起 SIP 呼叫
@@ -450,27 +449,31 @@ WebSocket 呼叫支持以下音频格式：
 
 **使用场景**: Active Call 作为 SIP 终端注册到 [RustPBX](https://github.com/restsend/rustpbx)、FreeSWITCH、Asterisk 等 PBX，接听来电。
 
-#### 配置 SIP 注册（即将支持）
+#### 配置 SIP 注册
 
 ```toml
-# SIP 服务配置
-sip_addr = "0.0.0.0"
-sip_port = 13050
+# SIP 服务配置 (使用基础配置中的 addr 和 udp_port)
+addr = "0.0.0.0"
+udp_port = 25060
 
 # SIP 注册账号（可配置多个）
-[[sip_accounts]]
+[[register_users]]
+server = "pbx.example.com:5060"
+username = "1001"
+disabled = false
+[register_users.credential]
 username = "1001"
 password = "secret123"
-domain = "pbx.example.com"
-server = "pbx.example.com:5060"
-enabled = true
+realm = "pbx.example.com"
 
-[[sip_accounts]]
+[[register_users]]
+server = "pbx.example.com:5060"
+username = "1002"
+disabled = false
+[register_users.credential]
 username = "1002"
 password = "secret456"
-domain = "pbx.example.com"
-server = "pbx.example.com:5060"
-enabled = true
+realm = "pbx.example.com"
 ```
 
 #### 配置呼入处理
@@ -478,21 +481,21 @@ enabled = true
 使用 Playbook 处理器自动路由不同的来电：
 
 ```toml
-[sip_handler]
+[handler]
 type = "playbook"
 default = "default.md"
 
 # 根据被叫号码路由
-[[sip_handler.rules]]
+[[handler.rules]]
 callee = "^sip:1001@.*"
 playbook = "tech_support.md"
 
-[[sip_handler.rules]]
+[[handler.rules]]
 callee = "^sip:1002@.*"
 playbook = "sales.md"
 
 # 根据来电号码路由
-[[sip_handler.rules]]
+[[handler.rules]]
 caller = "^sip:vip.*"
 playbook = "vip_service.md"
 ```
@@ -565,25 +568,22 @@ root = "./config/cdr"
 ```toml
 addr = "0.0.0.0"
 http_addr = "0.0.0.0:8080"
-udp_port = 13050
+udp_port = 25060
 log_level = "info"
 external_ip = "203.0.113.1"
 media_cache_path = "./config/mediacache"
 
-rtp_start_port = 20000
-rtp_end_port = 30000
+rtp_start_port = 12000
+rtp_end_port = 42000
 
 [[ice_servers]]
 urls = ["stun:stun.l.google.com:19302"]
 
-sip_addr = "0.0.0.0"
-sip_port = 13050
-
-[sip_handler]
+[handler]
 type = "playbook"
 default = "default.md"
 
-[[sip_handler.rules]]
+[[handler.rules]]
 callee = "^sip:support@.*"
 playbook = "support.md"
 
@@ -601,24 +601,23 @@ root = "./config/cdr"
 ```toml
 addr = "0.0.0.0"
 http_addr = "0.0.0.0:8080"
-udp_port = 13050
+udp_port = 25060
 log_level = "info"
 external_ip = "203.0.113.1"
 media_cache_path = "./config/mediacache"
 
-sip_addr = "0.0.0.0"
-sip_port = 13050
-
 # SIP 账号注册
-[[sip_accounts]]
+[[register_users]]
+server = "pbx.company.com:5060"
+username = "ai-agent-1"
+disabled = false
+[register_users.credential]
 username = "ai-agent-1"
 password = "ComplexPassword123"
-domain = "pbx.company.com"
-server = "pbx.company.com:5060"
-enabled = true
+realm = "pbx.company.com"
 
 # Webhook 处理器（由外部系统决定路由）
-[sip_handler]
+[handler]
 type = "webhook"
 url = "http://crm.company.com:8090/call-routing"
 method = "POST"
