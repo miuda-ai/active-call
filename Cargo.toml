@@ -81,7 +81,6 @@ unic-emoji = "0.9.0"
 realfft = "3.3"
 rmp3 = "0.3"
 tempfile = "3.24.0"
-# Workaround for cross-compilation - generate bindings at compile time
 aws-lc-rs = "1"
 
 # Math / arrays (keep in sync with ort 2.0.0-rc.10 -> ndarray 0.16)
@@ -93,9 +92,12 @@ hf-hub = { version = "0.4.3", default-features = false, features = [
     "tokio",
     "ureq",
 ] }
-# ONNX Runtime via ort crate (pinned prerelease due to registry mirror)
-ort = { version = "2.0.0-rc.10", features = ["ndarray"] }
-ort-sys = { version = "2.0.0-rc.10" }
+# ONNX Runtime via ort crate - using dynamic linking
+ort = { version = "2.0.0-rc.10", features = [
+    "ndarray",
+    "load-dynamic",
+], default-features = false }
+ort-sys = { version = "2.0.0-rc.10", features = ["tls-rustls"] }
 knf-rs-sys = "0.3.2"
 
 # Audio processing for offline
