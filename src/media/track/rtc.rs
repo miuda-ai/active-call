@@ -64,7 +64,7 @@ pub struct RtcTrack {
     local_source: Option<Arc<SampleStreamSource>>,
     encoder: TrackCodec,
     ssrc: u32,
-    payload_type: u8,
+    payload_type: Option<u8>,
     pub peer_connection: Option<Arc<PeerConnection>>,
     next_rtp_timestamp: u32,
     next_rtp_sequence_number: u16,
@@ -91,7 +91,7 @@ impl RtcTrack {
             local_source: None,
             encoder: TrackCodec::new(),
             ssrc: 0,
-            payload_type: 0,
+            payload_type: None,
             peer_connection: None,
             next_rtp_timestamp: 0,
             next_rtp_sequence_number: 0,
@@ -176,7 +176,7 @@ impl RtcTrack {
             .payload_type
             .unwrap_or_else(|| codec.payload_type());
 
-        self.payload_type = payload_type;
+        self.payload_type = Some(payload_type);
 
         let params = RtpCodecParameters {
             clock_rate: codec.clock_rate(),
@@ -192,7 +192,7 @@ impl RtcTrack {
             peer_connection.clone(),
             self.track_id.clone(),
             self.processor_chain.clone(),
-            self.payload_type,
+            payload_type,
         );
 
         if self.rtc_config.mode == TransportMode::Rtp {
@@ -206,7 +206,7 @@ impl RtcTrack {
                         self.track_id.clone(),
                         self.cancel_token.clone(),
                         self.processor_chain.clone(),
-                        self.payload_type,
+                        self.get_payload_type(),
                     );
                 }
             }
@@ -418,7 +418,7 @@ impl RtcTrack {
                     if let Some(codec) = codec {
                         if codec != CodecType::TelephoneEvent {
                             info!(track_id=%self.track_id, "Negotiated primary audio PT {} ({:?})", pt, codec);
-                            self.payload_type = pt;
+                            self.payload_type = Some(pt);
                             break;
                         }
                     }
@@ -517,7 +517,7 @@ impl RtcTrack {
                             self.track_id.clone(),
                             self.cancel_token.clone(),
                             self.processor_chain.clone(),
-                            self.payload_type,
+                            self.get_payload_type(),
                         );
                     }
                 }
@@ -583,7 +583,7 @@ impl Track for RtcTrack {
                         self.track_id.clone(),
                         self.cancel_token.clone(),
                         self.processor_chain.clone(),
-                        self.payload_type,
+                        self.get_payload_type(),
                     );
                 }
             }
@@ -762,8 +762,7 @@ impl Track for RtcTrack {
 
 impl RtcTrack {
     fn get_payload_type(&self) -> u8 {
-        let pt = self.payload_type;
-        if pt != 0 {
+        if let Some(pt) = self.payload_type {
             return pt;
         }
 
