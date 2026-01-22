@@ -1,6 +1,6 @@
 [package]
 name = "active-call"
-version = "0.3.26"
+version = "0.3.27"
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 description = "A SIP/WebRTC voice agent"
@@ -13,7 +13,7 @@ categories = ["network-programming", "multimedia"]
 [features]
 opus = ["dep:opusic-sys"]
 default = ["opus", "offline", "ort/download-binaries"]
-offline = ["dep:symphonia", "dep:rubato"]
+offline = ["dep:symphonia"]
 not_vad = []
 
 [dependencies]
@@ -92,19 +92,17 @@ hf-hub = { version = "0.4.3", default-features = false, features = [
     "ureq",
 ] }
 
-ort = { version = "2.0.0-rc.11", features = [
-    "std",
-    "ndarray",
-], default-features = false }
-ort-sys = { version = "2.0.0-rc.11", features = ["tls-rustls"] }
+ort = { version = "2.0.0-rc.10", features = ["ndarray"], optional = true }
+ort-sys = { version = "2.0.0-rc.10", optional = true }
+
 knf-rs-sys = "0.3.2"
 
 # Audio processing for offline
 symphonia = { version = "0.5", optional = true, features = ["all"] }
-rubato = { version = "0.16", optional = true }
 unicode-normalization = "0.1"
 rand_distr = "0.4"
 num_cpus = "1.16"
+msedge-tts = "0.2.1"
 
 
 [dev-dependencies]

@@ -178,6 +178,12 @@ You can also quickly configure handlers via command-line parameters:
 
 # Playbook handler (default playbook)
 ./active-call --handler default.md
+
+# Make an outgoing SIP call using a playbook
+./active-call --call sip:1001@127.0.0.1 --handler greeting.md
+
+# Set external IP and supported codecs
+./active-call --external-ip 1.2.3.4 --codecs pcmu,pcma,opus
 ```
 
 ---
@@ -656,11 +662,19 @@ In addition to configuration files, you can quickly start with command-line para
 # Quick setup Playbook handler
 ./active-call --handler default.md
 
+# Make an outgoing SIP call
+./active-call --call sip:1001@127.0.0.1 --handler greeting.md
+
+# Set external IP and supported codecs
+./active-call --external-ip 1.2.3.4 --codecs pcmu,pcma,opus
+
 # Combined usage
 ./active-call --conf active-call.toml \
   --http 0.0.0.0:8080 \
   --sip 0.0.0.0:13050 \
-  --handler https://api.example.com/webhook
+  --handler https://api.example.com/webhook \
+  --external-ip 1.2.3.4 \
+  --codecs pcmu,pcma,opus
 ```
 
 ---

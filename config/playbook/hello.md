@@ -15,10 +15,13 @@ llm:
 tts:
   provider: "supertonic"  # aliyun, tencent, supertonic
   # supertonic is local provider
-  speaker: "M1"           # M1, M2, F1, F2
+  speaker: "F1"           # M1, M2, F1, F2
   speed: 1.0
   language: "en"          # en, ko, es, pt, fr
-  ## see `SynthesisOption` options
+  # provider: "msedge"
+  # speaker: "zh-CN-XiaoxiaoNeural"
+  # see `SynthesisOption` options
+
 vad:
   provider: "silero"
 denoise: true

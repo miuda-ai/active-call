@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 
 mod aliyun;
 mod deepgram;
+mod msedge;
 mod tencent_cloud;
 mod tencent_cloud_basic;
 
@@ -16,6 +17,7 @@ mod supertonic;
 
 pub use aliyun::AliyunTtsClient;
 pub use deepgram::DeepegramTtsClient;
+pub use msedge::MsEdgeTtsClient;
 pub use tencent_cloud::TencentCloudTtsClient;
 pub use tencent_cloud_basic::TencentCloudTtsBasicClient;
 
@@ -43,6 +45,8 @@ pub enum SynthesisType {
     Aliyun,
     #[serde(rename = "deepgram")]
     Deepgram,
+    #[serde(rename = "msedge")]
+    MsEdge,
     #[cfg(feature = "offline")]
     #[serde(rename = "supertonic")]
     Supertonic,
@@ -56,6 +60,7 @@ impl std::fmt::Display for SynthesisType {
             SynthesisType::TencentCloud => write!(f, "tencent"),
             SynthesisType::Aliyun => write!(f, "aliyun"),
             SynthesisType::Deepgram => write!(f, "deepgram"),
+            SynthesisType::MsEdge => write!(f, "msedge"),
             #[cfg(feature = "offline")]
             SynthesisType::Supertonic => write!(f, "supertonic"),
             SynthesisType::Other(provider) => write!(f, "{}", provider),
@@ -73,6 +78,7 @@ impl<'de> Deserialize<'de> for SynthesisType {
             "tencent" => Ok(SynthesisType::TencentCloud),
             "aliyun" => Ok(SynthesisType::Aliyun),
             "deepgram" => Ok(SynthesisType::Deepgram),
+            "msedge" => Ok(SynthesisType::MsEdge),
             #[cfg(feature = "offline")]
             "supertonic" => Ok(SynthesisType::Supertonic),
             _ => Ok(SynthesisType::Other(value)),

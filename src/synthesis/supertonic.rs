@@ -2,13 +2,13 @@ use crate::offline::get_offline_models;
 use crate::synthesis::{SynthesisClient, SynthesisEvent, SynthesisOption, SynthesisType};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use audio_codec::Resampler;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
-use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
 
 pub struct SupertonicTtsClient {
     voice_style: String,
@@ -75,59 +75,25 @@ impl SupertonicTtsClient {
                 );
 
                 match tts.synthesize(&text, &language, Some(&voice_style), Some(speed)) {
-                    Ok(mut samples) => {
+                    Ok(samples) => {
                         if !samples.is_empty() {
+                            let mut samples_i16: Vec<i16> = samples
+                                .iter()
+                                .map(|&s| (s * 32768.0).max(-32768.0).min(32767.0) as i16)
+                                .collect();
+
                             // Resample if needed
                             if tts.sample_rate() != target_rate {
-                                let ratio = target_rate as f64 / tts.sample_rate() as f64;
-                                let chunk_size = 1024;
-                                let params = SincInterpolationParameters {
-                                    sinc_len: 256,
-                                    f_cutoff: 0.95,
-                                    interpolation: SincInterpolationType::Linear,
-                                    window: WindowFunction::BlackmanHarris2,
-                                    oversampling_factor: 128,
-                                };
-                                match SincFixedIn::<f32>::new(
-                                    ratio,
-                                    2.0,
-                                    params,
-                                    chunk_size,
-                                    1,
-                                ) {
-                                    Ok(mut resampler) => {
-                                        let mut output = Vec::with_capacity((samples.len() as f64 * ratio + 100.0) as usize);
-                                        let mut buffer = vec![vec![0.0; chunk_size]; 1]; 
-                                        
-                                        // Pad input
-                                        let padding = if samples.len() % chunk_size != 0 {
-                                            chunk_size - (samples.len() % chunk_size)
-                                        } else {
-                                            0
-                                        };
-                                        for _ in 0..padding {
-                                            samples.push(0.0);
-                                        }
-
-                                        for chunk in samples.chunks(chunk_size) {
-                                            buffer[0].copy_from_slice(chunk);
-                                            if let Ok(out) = resampler.process(&buffer, None) {
-                                               output.extend_from_slice(&out[0]);
-                                            }
-                                        }
-                                        samples = output;
-                                    }
-                                    Err(e) => {
-                                         warn!(error = %e, "Failed to create resampler, using original");
-                                    }
-                                }
+                                let mut resampler = Resampler::new(
+                                    tts.sample_rate() as usize,
+                                    target_rate as usize,
+                                );
+                                samples_i16 = resampler.resample(&samples_i16);
                             }
 
-                            // Convert f32 samples to PCM bytes (i16)
-                            let mut bytes = Vec::with_capacity(samples.len() * 2);
-                            for sample in samples {
-                                // Clip and convert
-                                let s = (sample * 32768.0).max(-32768.0).min(32767.0) as i16;
+                            // Convert i16 samples to PCM bytes
+                            let mut bytes = Vec::with_capacity(samples_i16.len() * 2);
+                            for s in samples_i16 {
                                 bytes.extend_from_slice(&s.to_le_bytes());
                             }
 

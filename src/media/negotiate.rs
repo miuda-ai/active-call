@@ -90,19 +90,24 @@ pub fn intersect_answer(offer: &SessionDescription, answer: &mut SessionDescript
                 }
             }
 
-            // 2. Filter formats
-            let mut new_formats = Vec::new();
-            for fmt in &media.formats {
-                if let Ok(pt) = fmt.parse::<u8>() {
-                    let codec = if let Some(c) = answer_pt_codec.get(&pt) {
-                        Some(*c)
-                    } else {
-                        CodecType::try_from(pt).ok()
-                    };
+            // 2. Filter formats, but following the OFFER'S order
+            let mut new_formats: Vec<String> = Vec::new();
 
-                    if let Some(c) = codec {
-                        if offer_media.codecs.contains(&c) {
-                            new_formats.push(fmt.clone());
+            for offer_codec in &offer_media.codecs {
+                for fmt in &media.formats {
+                    if let Ok(pt) = fmt.parse::<u8>() {
+                        let codec = if let Some(c) = answer_pt_codec.get(&pt) {
+                            Some(*c)
+                        } else {
+                            CodecType::try_from(pt).ok()
+                        };
+
+                        if let Some(c) = codec {
+                            if c == *offer_codec {
+                                if !new_formats.contains(fmt) {
+                                    new_formats.push(fmt.clone());
+                                }
+                            }
                         }
                     }
                 }
@@ -323,5 +328,46 @@ a=rtpmap:101 telephone-event/8000
         assert!(rtpmap_values.iter().any(|v| v.contains("PCMU/8000")));
         assert!(!rtpmap_values.iter().any(|v| v.contains("PCMA/8000")));
         assert!(!rtpmap_values.iter().any(|v| v.contains("G722/8000")));
+    }
+
+    #[test]
+    fn test_answer_intersection_respects_offer_order() {
+        use crate::media::negotiate::intersect_answer;
+        // Offer with PCMA (8) preferred over PCMU (0)
+        let offer_str = r#"v=0
+o=- 123 123 IN IP4 127.0.0.1
+s=-
+t=0 0
+m=audio 9000 RTP/AVP 8 0 101
+c=IN IP4 127.0.0.1
+a=rtpmap:8 PCMA/8000
+a=rtpmap:0 PCMU/8000
+a=rtpmap:101 telephone-event/8000
+"#;
+        let offer = SessionDescription::parse(rustrtc::sdp::SdpType::Offer, offer_str).unwrap();
+
+        // Answer with PCMU (0) preferred over PCMA (8)
+        let answer_str = r#"v=0
+o=- 456 456 IN IP4 127.0.0.1
+s=-
+t=0 0
+m=audio 9000 RTP/AVP 0 8 101
+c=IN IP4 127.0.0.1
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+"#;
+        let mut answer =
+            SessionDescription::parse(rustrtc::sdp::SdpType::Answer, answer_str).unwrap();
+
+        intersect_answer(&offer, &mut answer);
+
+        let media = &answer.media_sections[0];
+
+        // The resulting formats should be in the offerer's preferred order: 8 then 0
+        assert_eq!(
+            media.formats,
+            vec!["8".to_string(), "0".to_string(), "101".to_string()]
+        );
     }
 }

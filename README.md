@@ -147,7 +147,7 @@ For developers who need full control, `active-call` provides a raw audio-over-we
 
 #### Quick CLI Configuration
 
-For rapid setup without editing config files, use the `--handler` CLI parameter:
+For rapid setup without editing config files, use CLI parameters:
 
 ```bash
 # Webhook handler
@@ -155,12 +155,23 @@ For rapid setup without editing config files, use the `--handler` CLI parameter:
 
 # Playbook handler (default playbook)
 ./active-call --handler default.md
+
+# Make an outgoing SIP call using a playbook
+./active-call --call sip:1001@127.0.0.1:5060 --handler greeting.md
+
+# Set external IP and supported codecs
+./active-call --handler default.md --external-ip 1.2.3.4 --codecs pcmu,pcma,opus
 ```
 
 The handler type is automatically detected:
 
 - URLs starting with `http://` or `https://` become **Webhook handlers**
 - Files ending with `.md` become **Playbook handlers** (set as default)
+
+Additional CLI options:
+- `--call <SIP_URI>`: Initiate an outgoing SIP call immediately
+- `--external-ip <IP>`: Set external IP address for SIP/RTP
+- `--codecs <CODECS>`: Comma-separated list of supported codecs (pcmu,pcma,g722,g729,opus,telephone_event)
 
 #### Webhook Handler
 
@@ -243,7 +254,7 @@ Option A: Using CLI (Quick Start):
 
 ```bash
 # Start with playbook handler
-./active-call --handler config/playbook/greeting.md --sip 0.0.0.0:5060
+./active-call --handler config/playbook/greeting.md --sip 0.0.0.0:5060 --external-ip your-server-ip
 ```
 
 Option B: Using Configuration File (`config.toml`):

@@ -1,16 +1,12 @@
 use crate::event::EventSender;
 use crate::event::SessionEvent;
-use crate::media::{Sample, TrackId};
-#[cfg(feature = "offline")]
+use crate::media::vad::{TinySilero, VADOption, VadEngine};
+use crate::media::{AudioFrame, INTERNAL_SAMPLERATE, Sample, Samples, TrackId};
 use crate::offline::get_offline_models;
-#[cfg(feature = "offline")]
 use crate::offline::sensevoice::{FeaturePipeline, FrontendConfig, language_id_from_code};
 use crate::transcription::{TranscriptionClient, TranscriptionOption};
 use anyhow::{Result, anyhow};
-#[cfg(feature = "offline")]
-use rubato::{
-    Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
-};
+use audio_codec::Resampler;
 use std::{future::Future, pin::Pin, sync::Arc};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -38,112 +34,117 @@ impl SensevoiceAsrClientBuilder {
         event_sender: EventSender,
     ) -> TranscriptionClientFuture {
         Box::pin(async move {
-            #[cfg(feature = "offline")]
-            {
-                // Ensure offline models are initialized
-                if get_offline_models().is_none() {
-                    return Err(anyhow!(
-                        "Offline models not initialized. Please initialize with init_offline_models()"
-                    ));
-                }
-
-                let models = get_offline_models().unwrap();
-
-                // Initialize SenseVoice if not already initialized
-                models.init_sensevoice().await?;
-
-                let (audio_tx, audio_rx) = mpsc::unbounded_channel::<Vec<Sample>>();
-
-                let language = option
-                    .language
-                    .clone()
-                    .unwrap_or_else(|| "auto".to_string());
-                let lang_id = language_id_from_code(&language);
-                let track_id_clone = track_id.clone();
-                // Default input sample rate to 8000Hz (standard SIP) if not specified
-                let input_rate = option.samplerate.unwrap_or(8000);
-
-                let silence_threshold = option
-                    .extra
-                    .as_ref()
-                    .and_then(|m| m.get("silence_threshold"))
-                    .and_then(|s| s.parse::<f32>().ok())
-                    .unwrap_or(0.01);
-
-                // Spawn audio processing task
-                tokio::spawn(process_stream(
-                    audio_rx,
-                    track_id_clone,
-                    lang_id,
-                    event_sender,
-                    input_rate,
-                    silence_threshold,
+            // Ensure offline models are initialized
+            if get_offline_models().is_none() {
+                return Err(anyhow!(
+                    "Offline models not initialized. Please initialize with init_offline_models()"
                 ));
-
-                let inner = SensevoiceAsrClientInner {
-                    audio_tx,
-                    _option: option,
-                };
-
-                Ok(Box::new(SensevoiceAsrClient {
-                    inner: Arc::new(inner),
-                }) as Box<dyn TranscriptionClient>)
             }
-            #[cfg(not(feature = "offline"))]
-            {
-                Err(anyhow!("Offline feature is not enabled"))
+
+            let models = get_offline_models().unwrap();
+
+            // Initialize SenseVoice if not already initialized
+            models.init_sensevoice().await?;
+
+            let (audio_tx, audio_rx) = mpsc::unbounded_channel::<Vec<Sample>>();
+
+            let language = option
+                .language
+                .clone()
+                .unwrap_or_else(|| "auto".to_string());
+            let lang_id = language_id_from_code(&language);
+            let track_id_clone = track_id.clone();
+            // Default input sample rate to 8000Hz (standard SIP) if not specified
+            let input_rate = option.samplerate.unwrap_or(8000);
+
+            let mut vad_option = VADOption::default();
+            vad_option.samplerate = INTERNAL_SAMPLERATE;
+
+            if let Some(extra) = &option.extra {
+                if let Some(v) = extra
+                    .get("vad_voice_threshold")
+                    .and_then(|s| s.parse::<f32>().ok())
+                {
+                    vad_option.voice_threshold = v;
+                }
+                if let Some(v) = extra
+                    .get("vad_speech_padding")
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    vad_option.speech_padding = v;
+                }
+                if let Some(v) = extra
+                    .get("vad_silence_padding")
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    vad_option.silence_padding = v;
+                }
+                if let Some(v) = extra
+                    .get("vad_max_buffer_duration_secs")
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    vad_option.max_buffer_duration_secs = v;
+                }
             }
+
+            // Spawn audio processing task
+            tokio::spawn(process_stream(
+                audio_rx,
+                track_id_clone,
+                lang_id,
+                event_sender,
+                input_rate,
+                vad_option,
+            ));
+
+            let inner = SensevoiceAsrClientInner {
+                audio_tx,
+                _option: option,
+            };
+
+            Ok(Box::new(SensevoiceAsrClient {
+                inner: Arc::new(inner),
+            }) as Box<dyn TranscriptionClient>)
         })
     }
 }
 
-#[cfg(feature = "offline")]
 async fn process_stream(
     mut audio_rx: mpsc::UnboundedReceiver<Vec<Sample>>,
     track_id: TrackId,
     lang_id: i32,
     event_sender: EventSender,
     input_rate: u32,
-    silence_threshold: f32,
+    vad_option: VADOption,
 ) {
     // Buffer for accumulating audio samples (target rate 16000)
-    let mut buffer: Vec<f32> = Vec::with_capacity(16000 * 10);
+    let mut buffer: Vec<i16> = Vec::with_capacity(16000 * 10);
 
     // VAD/Segmentation parameters
-    let sample_rate: usize = 16000;
-    let max_segment_len = sample_rate * 15; // 15 seconds
-    // let silence_threshold = 0.01; // RMS threshold
-    let min_silence_duration = sample_rate / 2; // 0.5 seconds
-    let min_segment_len = sample_rate; // 1 second
+    let sample_rate: usize = INTERNAL_SAMPLERATE as usize;
+    let max_segment_samples = vad_option.max_buffer_duration_secs as usize * sample_rate;
+    let min_silence_samples =
+        (vad_option.silence_padding as f32 * sample_rate as f32 / 1000.0) as usize;
+    let min_speech_samples =
+        (vad_option.speech_padding as f32 * sample_rate as f32 / 1000.0) as usize;
 
     // Resampler setup
-    let chunk_size = 128;
     let mut resampler = if input_rate != sample_rate as u32 {
-        let params = SincInterpolationParameters {
-            sinc_len: 128,
-            f_cutoff: 0.95,
-            interpolation: SincInterpolationType::Linear,
-            window: WindowFunction::BlackmanHarris2,
-            oversampling_factor: 128,
-        };
-        match SincFixedIn::<f32>::new(
-            sample_rate as f64 / input_rate as f64,
-            2.0,
-            params,
-            chunk_size,
-            1,
-        ) {
-            Ok(r) => Some(r),
-            Err(e) => {
-                warn!(error = %e, "Failed to create resampler, will process without resampling");
-                None
-            }
-        }
+        Some(Resampler::new(input_rate as usize, sample_rate))
     } else {
         None
     };
-    let mut input_accumulator: Vec<f32> = Vec::with_capacity(chunk_size * 2);
 
+    let mut vad = match TinySilero::new(vad_option.clone()) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "Failed to create TinySilero VAD");
+            return;
+        }
+    };
+
+    let mut current_timestamp = crate::media::get_timestamp();
+    let mut speaking_started = false;
     let mut silence_samples = 0;
 
     // Create frontend feature pipeline
@@ -152,50 +153,58 @@ async fn process_stream(
     debug!(track_id = %track_id, "SenseVoice processing loop started");
 
     while let Some(samples) = audio_rx.recv().await {
-        // Convert i16 samples to f32
-        let samples_f32: Vec<f32> = samples.iter().map(|&x| x as f32 / 32768.0).collect();
-
         // Resample or pass through
         let processed_samples = if let Some(resampler) = &mut resampler {
-            input_accumulator.extend_from_slice(&samples_f32);
-            let mut output = Vec::new();
-            while input_accumulator.len() >= chunk_size {
-                let input_chunk: Vec<f32> = input_accumulator.drain(..chunk_size).collect();
-                let wave_in = vec![input_chunk];
-                if let Ok(wave_out) = resampler.process(&wave_in, None) {
-                    output.extend_from_slice(&wave_out[0]);
-                }
-            }
-            output
+            resampler.resample(&samples)
         } else {
-            samples_f32
+            samples
         };
 
-        buffer.extend_from_slice(&processed_samples);
         if processed_samples.is_empty() {
             continue;
         }
 
-        let sum_sq: f32 = processed_samples.iter().map(|&x| x * x).sum();
-        let rms = (sum_sq / processed_samples.len() as f32).sqrt();
+        buffer.extend_from_slice(&processed_samples);
 
-        if rms < silence_threshold {
-            silence_samples += processed_samples.len();
-        } else {
-            silence_samples = 0;
+        // Update VAD
+        let mut frame = AudioFrame {
+            track_id: track_id.clone(),
+            samples: Samples::PCM {
+                samples: processed_samples.clone(),
+            },
+            timestamp: current_timestamp,
+            sample_rate: sample_rate as u32,
+            channels: 1,
+        };
+
+        let vad_results = vad.process(&mut frame);
+        for (is_voice, _ts) in vad_results {
+            if is_voice {
+                speaking_started = true;
+                silence_samples = 0;
+            } else if speaking_started {
+                silence_samples += 512; // TinySilero CHUNK_SIZE
+            }
         }
 
-        let should_transcribe = (silence_samples >= min_silence_duration
-            && buffer.len() >= min_segment_len)
-            || (buffer.len() >= max_segment_len);
+        current_timestamp += (processed_samples.len() as u64 * 1000) / sample_rate as u64;
+
+        let should_transcribe = (speaking_started && silence_samples >= min_silence_samples)
+            || (buffer.len() >= max_segment_samples);
 
         if !should_transcribe {
             continue;
         }
-        // Take all (since satisfied silence condition)
-        let segment: Vec<f32> = buffer.drain(..).collect();
 
-        // Reset silence counter because we drained the buffer (including silence)
+        if buffer.len() < min_speech_samples && buffer.len() < max_segment_samples {
+            continue;
+        }
+
+        // Take all
+        let segment_i16: Vec<i16> = buffer.drain(..).collect();
+
+        // Reset VAD state for next segment
+        speaking_started = false;
         silence_samples = 0;
 
         let models = match get_offline_models() {
@@ -204,7 +213,11 @@ async fn process_stream(
                 continue;
             }
         };
-        let feats = match frontend.compute_features(&segment, sample_rate as u32) {
+
+        // Convert i16 to f32 for feature extraction
+        let segment_f32: Vec<f32> = segment_i16.iter().map(|&x| x as f32 / 32768.0).collect();
+
+        let feats = match frontend.compute_features(&segment_f32, sample_rate as u32) {
             Ok(f) => f,
             Err(e) => {
                 warn!(error = %e, "Feature extraction failed");
@@ -217,11 +230,13 @@ async fn process_stream(
         if let Some(encoder) = encoder_guard.as_mut() {
             let feats = feats.insert_axis(ndarray::Axis(0));
             // Run inference
+            let start_time = std::time::Instant::now();
             match encoder.run_and_decode(feats.view(), lang_id, true) {
                 Ok(text) => {
                     let clean_text = text.trim();
                     if !clean_text.is_empty() {
-                        info!(track_id = %track_id, text = %clean_text, "SenseVoice transcription");
+                        info!(track_id = %track_id, text = %clean_text, elapsed_ms = %start_time.elapsed().as_millis(),
+                             "SenseVoice transcription");
                         // Send event
                         let event = SessionEvent::AsrFinal {
                             track_id: track_id.clone(),

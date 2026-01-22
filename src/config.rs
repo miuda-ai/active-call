@@ -9,18 +9,32 @@ use std::collections::HashMap;
 #[derive(Parser, Debug)]
 #[command(version)]
 pub struct Cli {
+    /// Path to configuration file
     #[clap(long)]
     pub conf: Option<String>,
-
+    /// HTTP listening address
     #[clap(long)]
     pub http: Option<String>,
 
+    /// SIP listening port
     #[clap(long)]
     pub sip: Option<String>,
 
     /// SIP invitation handler: URL for webhook (http://...) or playbook file (.md)
     #[clap(long)]
     pub handler: Option<String>,
+
+    /// Call a SIP address immediately and use the handler for the call
+    #[clap(long)]
+    pub call: Option<String>,
+
+    /// External IP address for SIP/RTP
+    #[clap(long)]
+    pub external_ip: Option<String>,
+
+    /// Supported codecs (e.g., pcmu,pcma,g722,g729,opus)
+    #[clap(long, value_delimiter = ',')]
+    pub codecs: Option<Vec<String>>,
 
     /// Download models (sensevoice, supertonic, or all)
     #[cfg(feature = "offline")]

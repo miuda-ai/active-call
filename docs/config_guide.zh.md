@@ -175,6 +175,12 @@ playbook = "sales.md"
 
 # Playbook 处理器（默认 Playbook）
 ./active-call --handler default.md
+
+# 发起 SIP 呼出并执行 Playbook
+./active-call --call sip:1001@127.0.0.1 --handler greeting.md
+
+# 设置外部 IP 和支持的编码
+./active-call --external-ip 1.2.3.4 --codecs pcmu,pcma,opus
 ```
 
 ---
@@ -653,11 +659,19 @@ root = "/var/recordings"
 # 快速设置 Playbook 处理器
 ./active-call --handler default.md
 
+# 发起 SIP 呼出
+./active-call --call sip:1001@127.0.0.1 --handler greeting.md
+
+# 设置外部 IP 和支持的编码
+./active-call --external-ip 1.2.3.4 --codecs pcmu,pcma,opus
+
 # 组合使用
 ./active-call --conf active-call.toml \
   --http 0.0.0.0:8080 \
   --sip 0.0.0.0:13050 \
-  --handler https://api.example.com/webhook
+  --handler https://api.example.com/webhook \
+  --external-ip 1.2.3.4 \
+  --codecs pcmu,pcma,opus
 ```
 
 ---

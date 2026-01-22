@@ -406,23 +406,62 @@ impl RtcTrack {
                 }
             }
 
-            for fmt in &media.formats {
-                if let Ok(pt) = fmt.parse::<u8>() {
-                    let codec = self
-                        .encoder
-                        .payload_type_map
-                        .get(&pt)
-                        .cloned()
-                        .or_else(|| CodecType::try_from(pt).ok());
+            // Negotiate primary audio codec
+            let mut negotiated = None;
 
-                    if let Some(codec) = codec {
-                        if codec != CodecType::TelephoneEvent {
-                            info!(track_id=%self.track_id, "Negotiated primary audio PT {} ({:?})", pt, codec);
-                            self.payload_type = Some(pt);
-                            break;
+            // If we are the offerer (receiving an Answer), we prioritize our own preferred codec order
+            // that is also present in the answer.
+            if sdp_type == rustrtc::sdp::SdpType::Answer && !self.rtc_config.codecs.is_empty() {
+                for preferred_codec in &self.rtc_config.codecs {
+                    if *preferred_codec == CodecType::TelephoneEvent {
+                        continue;
+                    }
+                    for fmt in &media.formats {
+                        if let Ok(pt) = fmt.parse::<u8>() {
+                            let codec = self
+                                .encoder
+                                .payload_type_map
+                                .get(&pt)
+                                .cloned()
+                                .or_else(|| CodecType::try_from(pt).ok());
+                            if let Some(c) = codec {
+                                if c == *preferred_codec {
+                                    negotiated = Some((pt, c));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if negotiated.is_some() {
+                        break;
+                    }
+                }
+            }
+
+            // Fallback: use the first codec in the SDP (matches offerer's preference if we are answerer)
+            if negotiated.is_none() {
+                for fmt in &media.formats {
+                    if let Ok(pt) = fmt.parse::<u8>() {
+                        let codec = self
+                            .encoder
+                            .payload_type_map
+                            .get(&pt)
+                            .cloned()
+                            .or_else(|| CodecType::try_from(pt).ok());
+
+                        if let Some(codec) = codec {
+                            if codec != CodecType::TelephoneEvent {
+                                negotiated = Some((pt, codec));
+                                break;
+                            }
                         }
                     }
                 }
+            }
+
+            if let Some((pt, codec)) = negotiated {
+                info!(track_id=%self.track_id, "Negotiated primary audio PT {} ({:?})", pt, codec);
+                self.payload_type = Some(pt);
             }
         }
         Ok(())

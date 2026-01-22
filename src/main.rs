@@ -17,6 +17,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 use active_call::app::AppStateBuilder;
 use active_call::config::{Cli, Config};
+use uuid::Uuid;
 
 pub async fn index() -> impl IntoResponse {
     match std::fs::read_to_string("static/index.html") {
@@ -106,7 +107,7 @@ async fn main() -> Result<()> {
     }
 
     // Auto-configure handler from CLI parameter
-    if let Some(handler_str) = cli.handler {
+    if let Some(handler_str) = &cli.handler {
         use active_call::config::InviteHandlerConfig;
 
         if handler_str.starts_with("http://") || handler_str.starts_with("https://") {
@@ -134,6 +135,14 @@ async fn main() -> Result<()> {
                 handler_str
             );
         }
+    }
+
+    if let Some(external_ip) = cli.external_ip {
+        config.external_ip = Some(external_ip);
+    }
+
+    if let Some(codecs) = cli.codecs {
+        config.codecs = Some(codecs);
     }
 
     let mut env_filter = EnvFilter::from_default_env();
@@ -192,6 +201,66 @@ async fn main() -> Result<()> {
         .await?;
 
     info!("AppState started");
+
+    // Handle CLI direct call if requested
+    if let Some(callee) = cli.call {
+        let app_state_clone = app_state.clone();
+        let playbook = if let Some(h) = &cli.handler {
+            if h.ends_with(".md") {
+                Some(h.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        tokio::spawn(async move {
+            // Wait a bit for the SIP stack to initialize
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+            let session_id = format!("c.{}", Uuid::new_v4());
+            info!(session_id, "Starting CLI outgoing call to: {}", callee);
+
+            if let Some(playbook) = playbook {
+                app_state_clone
+                    .pending_playbooks
+                    .lock()
+                    .await
+                    .insert(session_id.clone(), playbook);
+            }
+
+            let (command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
+            let (event_sender, _event_receiver) = tokio::sync::mpsc::unbounded_channel();
+            let (_audio_tx, audio_rx) = tokio::sync::mpsc::unbounded_channel();
+
+            use active_call::CallOption;
+            use active_call::call::{ActiveCallType, Command};
+
+            let invite_cmd = Command::Invite {
+                option: CallOption {
+                    callee: Some(callee),
+                    ..Default::default()
+                },
+            };
+
+            let _ = command_sender.send(invite_cmd);
+
+            active_call::handler::handler::call_handler_core(
+                ActiveCallType::Sip,
+                session_id,
+                app_state_clone,
+                tokio_util::sync::CancellationToken::new(),
+                audio_rx,
+                None,
+                false,
+                0,
+                command_receiver,
+                event_sender,
+            )
+            .await;
+        });
+    }
 
     let http_addr = config.http_addr.clone();
     let listener = tokio::net::TcpListener::bind(&http_addr).await?;

@@ -66,38 +66,18 @@ impl SupertonicModel {
     ) -> Result<(Vec<Vec<f32>>, Vec<f32>)> {
         let bsz = text_list.len();
 
-        // Process text
         let (text_ids, text_mask_array) = self.text_processor.call(text_list, lang_list)?;
 
         let mut flat_ids = Vec::new();
-        // Since we pad text_ids in processor, lengths might vary?
-        // NOTE: In ref.md, `UnicodeProcessor::call` logic for padding was not fully shown.
-        // It calculated `text_ids_lengths`. And `get_text_mask` uses max length.
-        // But the returned `text_ids` is `Vec<Vec<i64>>`. We need to flatten and pad it to match max_len.
-
         let max_len = text_ids.iter().map(|v| v.len()).max().unwrap_or(0);
         for row in &text_ids {
             flat_ids.extend_from_slice(row);
-            // Pad with 0? Reference didn't show padding logic explicitly for text_ids.
-            // Assuming 0 is pad or logic handles it.
-            // In processor we should probably pad but let's do it here if needed.
-            // Actually `Array::from_shape_vec` will fail if not uniform.
             for _ in 0..(max_len - row.len()) {
                 flat_ids.push(0); // Assuming 0 is PAD
             }
         }
 
-        // However, referencing ref.md:
-        // `let text_ids_array = { let text_ids_shape = (bsz, text_ids[0].len()); ...`
-        // It implies `text_ids` already has uniform length from processor.
-
-        // Let's adjust processor to pad. But I cannot edit processor.rs easily now (I just created it).
-        // I'll assume processor pads or I handle it here.
-        // Let's just padding here to be safe.
-
         let text_ids_array = Array::from_shape_vec((bsz, max_len), flat_ids.clone())?;
-
-        tracing::info!("text_ids: {:?}", flat_ids);
 
         let text_ids_value = to_ort_value_i64(text_ids_array)?;
         let text_mask_value = to_ort_value_f32(text_mask_array.clone())?;
@@ -112,14 +92,11 @@ impl SupertonicModel {
 
         let (_, duration_data) = dp_outputs["duration"].try_extract_tensor::<f32>()?;
         let mut duration: Vec<f32> = duration_data.to_vec();
-        tracing::info!("predicted duration (before speed): {:?}", duration);
 
-        // Apply speed factor to duration
         for dur in duration.iter_mut() {
             *dur /= speed;
         }
 
-        // Encode text
         let style_ttl_value = to_ort_value_f32(style.ttl.clone())?;
         let text_enc_outputs = self.text_enc_ort.run(ort::inputs! {
             "text_ids" => &text_ids_value,
@@ -129,7 +106,6 @@ impl SupertonicModel {
 
         let (text_emb_shape, text_emb_data) =
             text_enc_outputs["text_emb"].try_extract_tensor::<f32>()?;
-        tracing::info!("text_encoder output text_emb shape: {:?}", text_emb_shape);
 
         let text_emb = Array3::from_shape_vec(
             (
@@ -149,10 +125,7 @@ impl SupertonicModel {
             self.cfgs.ttl.latent_dim,
         );
 
-        // Prepare constant arrays
         let total_step_array = Array::from_elem(bsz, total_step as f32);
-
-        // Denoising loop
         for step in 0..total_step {
             let current_step_array = Array::from_elem(bsz, step as f32);
 
@@ -161,9 +134,6 @@ impl SupertonicModel {
             let text_emb_value = to_ort_value_f32(text_emb.clone())?;
             let latent_mask_value = to_ort_value_f32(latent_mask.clone())?;
             let text_mask_value2 = to_ort_value_f32(text_mask_array.clone())?;
-            // Note: Reuse text_mask because ort::inputs consumes?? No, we can clone values or use refs if possible.
-            // ORT rust bindings: inputs! takes values.
-
             let total_step_val = to_ort_value_f32(total_step_array.clone())?;
             let current_step_val = to_ort_value_f32(current_step_array.clone())?;
 
@@ -181,19 +151,9 @@ impl SupertonicModel {
                 vector_est_outputs["denoised_latent"].try_extract_tensor::<f32>()?;
             let next_xt = Array3::from_shape_vec(xt.dim(), denoised_data.to_vec())?;
 
-            let x_min = next_xt.iter().fold(f32::INFINITY, |a, &b| a.min(b));
-            let x_max = next_xt.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-            tracing::info!("step {} latent min/max: {} / {}", step, x_min, x_max);
-
-            // Update xt directly (model output is the next step latent)
             xt = next_xt;
         }
 
-        let x_min = xt.iter().fold(f32::INFINITY, |a, &b| a.min(b));
-        let x_max = xt.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-        tracing::info!("Final latent min/max: {} / {}", x_min, x_max);
-
-        // Apply latent mask one last time
         for b in 0..bsz {
             for d in 0..xt.dim().1 {
                 for t in 0..xt.dim().2 {
@@ -202,37 +162,18 @@ impl SupertonicModel {
             }
         }
 
-        // Vocoder (Latent to Waveform)
         let xt_value = to_ort_value_f32(xt.clone())?;
         let vocoder_outputs = self.vocoder_ort.run(ort::inputs! {
             "latent" => &xt_value
         })?;
 
         let (_, audio_data) = vocoder_outputs["wav_tts"].try_extract_tensor::<f32>()?;
-
-        // Log audio stats
-        let audio_vec = audio_data.to_vec();
-        let a_min = audio_vec.iter().fold(f32::INFINITY, |a, &b| a.min(b));
-        let a_max = audio_vec.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-        let a_mean = audio_vec.iter().sum::<f32>() / audio_vec.len() as f32;
-        tracing::info!(
-            "Generated Audio Stats (wav_tts): Min={} Max={} Mean={}",
-            a_min,
-            a_max,
-            a_mean
-        );
-
-        let _chunk_size = self.cfgs.ae.base_chunk_size as usize;
         let t_audio = audio_data.len() / bsz;
-
         let mut audios = Vec::with_capacity(bsz);
 
         for b in 0..bsz {
             let audio_len = (duration[b] * self.sample_rate as f32) as usize;
             let start = b * t_audio;
-            // Ensure we don't read past the buffer for this batch item
-            // audio_len is estimated from duration, but vocoder output size is fixed by latent size * chunk_size
-            // t_audio should be >= audio_len usually, unless duration > latent * chunk_compress * chunk_size
             let end = (start + audio_len).min(start + t_audio);
 
             if start < audio_data.len() && start < end {
@@ -250,7 +191,6 @@ pub fn load_cfgs<P: AsRef<Path>>(config_path: P) -> Result<Config> {
     let content = fs::read_to_string(&config_path)
         .with_context(|| format!("Failed to read config file: {:?}", config_path.as_ref()))?;
 
-    // Check for BOM
     let content = if content.starts_with("\u{feff}") {
         &content[3..]
     } else {
@@ -390,7 +330,6 @@ fn build_session_with_ort_cache(model_path: &Path, intra_threads: usize) -> Resu
                     error = %err,
                     "failed to build session with ORT cache, retrying without cache"
                 );
-                // let _ = fs::remove_file(&ort_path); // already failed to create it perhaps?
             }
         }
     }

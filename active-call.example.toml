@@ -7,10 +7,14 @@
 #   --handler <value>      : Quick handler setup
 #                            - URL (http://...) for webhook handler
 #                            - .md file for playbook default handler
+#   --call <SIP_URI>       : Initiate an outgoing SIP call immediately
+#   --external-ip <IP>     : Set external IP address
+#   --codecs <CODECS>      : Supported codecs (e.g., pcmu,pcma,opus)
 #
 # Examples:
 #   ./active-call --handler https://api.example.com/webhook
-#   ./active-call --handler default.md --sip 0.0.0.0:13050
+#   ./active-call --handler default.md --sip 0.0.0.0:13050 --external-ip 1.2.3.4 --codecs pcmu,pcma
+#   ./active-call --call sip:1001@127.0.0.1 --handler greeting.md
 
 addr = "0.0.0.0"
 http_addr = "0.0.0.0:8080"
