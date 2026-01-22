@@ -12,10 +12,9 @@ categories = ["network-programming", "multimedia"]
 
 [features]
 opus = ["dep:opusic-sys"]
-default = ["opus", "offline"]
+default = ["opus", "offline", "ort/download-binaries"]
 offline = ["dep:symphonia", "dep:rubato"]
 not_vad = []
-aws-lc-bindgen = ["aws-lc-rs/bindgen"]
 
 [dependencies]
 opusic-sys = { version = "0.5.8", optional = true }
@@ -92,12 +91,12 @@ hf-hub = { version = "0.4.3", default-features = false, features = [
     "tokio",
     "ureq",
 ] }
-# ONNX Runtime via ort crate - using dynamic linking
-ort = { version = "2.0.0-rc.10", features = [
+
+ort = { version = "2.0.0-rc.11", features = [
+    "std",
     "ndarray",
-    "load-dynamic",
 ], default-features = false }
-ort-sys = { version = "2.0.0-rc.10", features = ["tls-rustls"] }
+ort-sys = { version = "2.0.0-rc.11", features = ["tls-rustls"] }
 knf-rs-sys = "0.3.2"
 
 # Audio processing for offline

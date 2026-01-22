@@ -5,6 +5,7 @@
 ## 📖 Documentation
 
 For comprehensive guides and tutorials, visit:
+
 - **[Documentation Hub](./docs/README.md)** - Complete documentation index
 - **[Configuration Guide](./docs/config_guide.en.md)** - Detailed configuration for all call scenarios
 - **[配置指南（中文）](./docs/config_guide.zh.md)** - 完整的中文配置指南
@@ -14,29 +15,37 @@ For comprehensive guides and tutorials, visit:
 ## Key Capabilities
 
 ### 1. Multi-Protocol Audio Gateway
+
 `active-call` supports a wide range of communication protocols, ensuring compatibility with both legacy and modern systems:
+
 - **SIP (Telephony)**: Supports standard SIP signaling. Can act as a **SIP Client/Extension** to register with PBX systems like **[RustPBX](https://github.com/restsend/rustpbx)**, **FreeSWITCH** or **Asterisk**, or handle direct SIP incoming/outgoing calls.
 - **WebRTC**: Direct browser-to-agent communication with low-latency SRTP.
 - **Voice over WebSocket**: A highly flexible API for custom integrations. Push raw PCM/encoded audio over WebSocket and receive real-time events.
 
 ### 2. Dual-Engine Dialogue Support
+
 Choose the pipeline that fits your latency and cost requirements:
+
 - **Traditional Serial Pipeline**: Integrated **VAD → ASR → LLM → TTS** flow. Supports various providers (OpenAI, Aliyun, Azure, Tencent) with optimized buffering and endpoints.
 - **Realtime Streaming Pipeline**: Native support for **OpenAI/Azure Realtime API**. True full-duplex conversational AI with ultra-low latency, server-side VAD, and emotional nuance.
 
 ### 3. Playbook: The Best Practice for Dialogue
+
 The **Playbook** system is our recommended way to build complex, stateful voice agents:
+
 - **Markdown-Driven**: Define personas, instructions, and flows in readable Markdown files.
 - **Stateful Scenes**: Manage conversation stages with easy transitions (`Scene` switching).
 - **Tool Integration**: Built-in support for DTMF, SIP Refer (Transfer), and custom Function Calling.
 - **Advanced Interaction**: Smart interruptions, filler word filtering, background ambiance, and automated post-call summaries via Webhooks.
 
 ### 4. High-Performance Media Core
+
 - **Low-Latency VAD**: Includes **TinySilero** (optimized Rust implementation), significantly faster than standard ONNX models.
 - **Flexible Processing Chain**: Easily add noise reduction, echo cancellation, or custom audio processors.
 - **Codec Support**: PCM16, G.711 (PCMU/PCMA), G.722, and Opus.
 
 ### 5. Offline AI Capabilities (NEW)
+
 **Privacy-First & Cost-Effective**: Run ASR and TTS locally without cloud APIs
 
 - **Offline ASR**: [SenseVoice](https://github.com/FunAudioLLM/SenseVoice) multi-language speech recognition (Chinese, English, Japanese, Korean, Cantonese)
@@ -59,11 +68,13 @@ mkdir -p $(pwd)/data/models
 docker run --rm \
   -v $(pwd)/data/models:/models \
   ghcr.io/restsend/active-call:latest \
-  --download-models all --models-dir /models
+  --download-models all --models-dir /models \
+   --exit-after-download
 ```
 
 > **Note for users in Mainland China**:
 > If you experience slow downloads from HuggingFace, you can use the mirror site by setting the `HF_ENDPOINT` environment variable:
+>
 > ```bash
 > docker run --rm \
 >   -e HF_ENDPOINT=https://hf-mirror.com \
@@ -106,6 +117,7 @@ vad:
 ```
 
 **Benefits:**
+
 - 🔒 **Privacy**: All audio processing happens locally
 - 💰 **Cost**: No per-minute API charges
 - 🚀 **Performance**: Single model instance shared across calls
@@ -115,17 +127,22 @@ vad:
 ## Protocol Flexibility
 
 ### Voice over WebSocket
+
 For developers who need full control, `active-call` provides a raw audio-over-websocket interface. This is ideal for custom web apps or integration with existing AI pipelines where you want to handle the audio stream manually.
 
 ### SIP PBX Integration
+
 `active-call` can be integrated into existing corporate telephony:
+
 - **As an Extension**: Register `active-call` to your [RustPBX](https://github.com/restsend/rustpbx), FreeSWITCH or Asterisk PBX like any other VoIP phone. AI agents can then receive calls from internal extensions or external trunks.
 - **As a Trunk**: Handle incoming SIP traffic directly from carriers.
 
 ### SIP Invitation Handlers
+
 `active-call` provides flexible handling of incoming SIP invitations through configurable handlers:
 
 #### Quick CLI Configuration
+
 For rapid setup without editing config files, use the `--handler` CLI parameter:
 
 ```bash
@@ -137,11 +154,14 @@ For rapid setup without editing config files, use the `--handler` CLI parameter:
 ```
 
 The handler type is automatically detected:
+
 - URLs starting with `http://` or `https://` become **Webhook handlers**
 - Files ending with `.md` become **Playbook handlers** (set as default)
 
 #### Webhook Handler
+
 Forward incoming SIP invitations to an HTTP endpoint for custom call routing logic:
+
 ```toml
 [handler]
 type = "webhook"
@@ -150,7 +170,9 @@ method = "POST"
 ```
 
 #### Playbook Handler
+
 Automatically route calls to specific playbooks based on caller/callee patterns using regex matching:
+
 ```toml
 [handler]
 type = "playbook"
@@ -171,6 +193,7 @@ playbook = "sales.md"           # Use sales playbook
 ```
 
 **How it works:**
+
 - Rules are evaluated in order from top to bottom
 - Each rule can specify `caller` and/or `callee` regex patterns
 - Both patterns must match for the rule to apply (omitted patterns match any value)
@@ -179,6 +202,7 @@ playbook = "sales.md"           # Use sales playbook
 - Playbook files should be placed in the `config/playbook/` directory
 
 **Use cases:**
+
 - Route calls from different regions to language-specific agents
 - Direct calls to different departments based on the dialed number
 - Provide specialized handling for VIP customers based on caller ID
@@ -212,12 +236,14 @@ You are a friendly AI assistant. Greet the caller warmly and ask how you can hel
 #### 2. Configure the Handler
 
 Option A: Using CLI (Quick Start):
+
 ```bash
 # Start with playbook handler
 ./active-call --handler config/playbook/greeting.md --sip 0.0.0.0:5060
 ```
 
 Option B: Using Configuration File (`config.toml`):
+
 ```toml
 [handler]
 type = "playbook"
@@ -236,6 +262,7 @@ playbook = "support.md"
 #### 3. Make a SIP Call
 
 Using any SIP client (like linphone, zoiper, or sipbot):
+
 ```bash
 # Using pjsua (PJSIP command line tool)
 pjsua --use-ice --null-audio sip:agent@your-server-ip:5060
@@ -257,6 +284,7 @@ sipbot -target sip:agent@your-server-ip:5060 -duration 30
 #### 5. Monitoring
 
 Check logs to see the call flow:
+
 ```bash
 RUST_LOG=info ./active-call --handler greeting.md
 
@@ -269,6 +297,7 @@ RUST_LOG=info ./active-call --handler greeting.md
 #### Error Handling
 
 If the playbook file doesn't exist:
+
 - The handler validates the file before accepting the SIP call
 - Sends `503 Service Unavailable` response to the caller
 - Logs: `Playbook file not found, rejecting SIP call`
@@ -276,6 +305,7 @@ If the playbook file doesn't exist:
 This prevents accepting calls that can't be properly handled.
 
 ## Playbook Demo
+
 ![Playbook demo](./docs/playbook.png)
 
 ## VAD Performance
@@ -436,6 +466,7 @@ docker run -d \
 ```
 
 Supported CLI options:
+
 - `--conf <path>`: Path to config file
 - `--http <addr:port>`: HTTP server address
 - `--sip <addr:port>`: SIP server address
