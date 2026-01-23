@@ -11,9 +11,11 @@ keywords = ["sip", "voip", "telephony", "voice-agent", "webrtc"]
 categories = ["network-programming", "multimedia"]
 
 [features]
+default = ["opus", "offline", "ort"]
 opus = ["dep:opusic-sys"]
-default = ["opus", "offline", "ort/download-binaries"]
 offline = ["dep:symphonia"]
+ort = ["ort/download-binaries"]
+cross = ["opus", "offline", "aws-lc-rs/bindgen", "ort/load-dynamic"]
 not_vad = []
 
 [dependencies]
@@ -92,10 +94,12 @@ hf-hub = { version = "0.4.3", default-features = false, features = [
     "ureq",
 ] }
 
-ort = { version = "2.0.0-rc.10", features = ["ndarray"], optional = true }
-ort-sys = { version = "2.0.0-rc.10", optional = true }
-
+ort = { version = "=2.0.0-rc.10", default-features = false, features = [
+    "std",
+    "ndarray",
+] }
 knf-rs-sys = "0.3.2"
+openssl = { version = "0.10", features = ["vendored"] }
 
 # Audio processing for offline
 symphonia = { version = "0.5", optional = true, features = ["all"] }
