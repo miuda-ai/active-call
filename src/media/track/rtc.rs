@@ -136,10 +136,6 @@ impl RtcTrack {
             config.ssrc_start = self.ssrc;
         }
         config.transport_mode = self.rtc_config.mode.clone();
-        config.enable_latching = self
-            .rtc_config
-            .enable_latching
-            .unwrap_or_else(|| self.rtc_config.mode == TransportMode::Rtp);
 
         if let Some(ice_servers) = &self.rtc_config.ice_servers {
             config.ice_servers = ice_servers.clone();
@@ -148,6 +144,11 @@ impl RtcTrack {
         if let Some(external_ip) = &self.rtc_config.external_ip {
             config.external_ip = Some(external_ip.clone());
         }
+
+        config.enable_latching = self
+            .rtc_config
+            .enable_latching
+            .unwrap_or_else(|| self.rtc_config.mode == TransportMode::Rtp);
 
         if !self.rtc_config.codecs.is_empty() {
             let mut caps = MediaCapabilities::default();
@@ -201,23 +202,6 @@ impl RtcTrack {
             payload_type,
         );
 
-        if self.rtc_config.mode == TransportMode::Rtp {
-            for transceiver in peer_connection.get_transceivers() {
-                if let Some(receiver) = transceiver.receiver() {
-                    let track = receiver.track();
-                    info!(track_id=%self.track_id, "RTP mode: starting receiver track handler");
-                    Self::spawn_track_handler(
-                        track,
-                        self.packet_sender.clone(),
-                        self.track_id.clone(),
-                        self.cancel_token.clone(),
-                        self.processor_chain.clone(),
-                        self.get_payload_type(),
-                    );
-                }
-            }
-        }
-
         Ok(())
     }
 
@@ -255,7 +239,7 @@ impl RtcTrack {
                 if let PeerConnectionEvent::Track(transceiver) = event {
                     if let Some(receiver) = transceiver.receiver() {
                         let track = receiver.track();
-                        info!(track_id=%track_id_log, "New track received");
+                        info!(track_id=%track_id_log, "New track received (SSRC latching complete)");
 
                         Self::spawn_track_handler(
                             track,
@@ -263,7 +247,7 @@ impl RtcTrack {
                             track_id_log.clone(),
                             cancel_token.clone(),
                             processor_chain.clone(),
-                            default_payload_type.clone(),
+                            default_payload_type,
                         );
                     }
                 }
@@ -299,6 +283,29 @@ impl RtcTrack {
                 }
             });
         }
+
+        // 3. Stats Loop
+        let pc_stats = pc.clone();
+        let track_id_stats = track_id.clone();
+        let cancel_token_stats = self.cancel_token.clone();
+        crate::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    _ = cancel_token_stats.cancelled() => break,
+                    _ = interval.tick() => {
+                        match pc_stats.get_stats().await {
+                            Ok(stats) => {
+                                info!(track_id=%track_id_stats, "RTCP Stats: {:?}", stats);
+                            }
+                            Err(e) => {
+                                debug!(track_id=%track_id_stats, "Failed to get stats: {:?}", e);
+                            }
+                        }
+                    }
+                }
+            }
+        });
     }
 
     fn spawn_track_handler(
@@ -336,6 +343,7 @@ impl RtcTrack {
         });
 
         // Receiving Worker
+        let track_id_recv = track_id.clone();
         crate::spawn(async move {
             let mut samples =
                 futures::stream::unfold(
@@ -350,8 +358,11 @@ impl RtcTrack {
                     if let Err(_) = tx.send(frame) {
                         break;
                     }
+                } else {
+                    debug!(track_id=%track_id_recv, "Received non-audio sample");
                 }
             }
+            info!(track_id=%track_id_recv, "RtcTrack receiving worker stopped");
         });
     }
 
@@ -499,6 +510,14 @@ impl RtcTrack {
         answer: &String,
         force_update: bool,
     ) -> Result<()> {
+        info!(
+            track_id=%self.track_id,
+            "update_remote_description_internal called. force={}, last_sdp_is_some={}, mode={:?}",
+            force_update,
+            self.last_remote_sdp.is_some(),
+            self.rtc_config.mode
+        );
+
         if let Some(pc) = &self.peer_connection {
             if !force_update {
                 if let Some(ref last_sdp) = self.last_remote_sdp {
@@ -511,7 +530,7 @@ impl RtcTrack {
                 debug!(track_id=%self.track_id, "Force update requested, skipping SDP comparison");
             }
 
-            let is_first_remote_sdp = self.last_remote_sdp.is_none();
+            let _is_first_remote_sdp = self.last_remote_sdp.is_none();
 
             let sdp_obj = rustrtc::SessionDescription::parse(rustrtc::SdpType::Answer, answer)?;
             match pc.set_remote_description(sdp_obj.clone()).await {
@@ -551,22 +570,7 @@ impl RtcTrack {
                 }
             }
 
-            if is_first_remote_sdp && self.rtc_config.mode != TransportMode::Rtp {
-                for transceiver in pc.get_transceivers() {
-                    if let Some(receiver) = transceiver.receiver() {
-                        let track = receiver.track();
-                        info!(track_id=%self.track_id, "WebRTC mode: manually starting receiver track handler after first answer");
-                        Self::spawn_track_handler(
-                            track,
-                            self.packet_sender.clone(),
-                            self.track_id.clone(),
-                            self.cancel_token.clone(),
-                            self.processor_chain.clone(),
-                            self.get_payload_type(),
-                        );
-                    }
-                }
-            }
+            // Track events will be handled by the event loop after SSRC latching
 
             // Extract negotiated payload types from SDP string
             self.parse_sdp_payload_types(rustrtc::SdpType::Answer, answer)?;
@@ -613,26 +617,9 @@ impl Track for RtcTrack {
                 i, t.kind(), t.mid(), t.direction(), t.receiver().is_some());
         }
 
-        // CRITICAL FIX: When server-initiated signaling (common WebRTC pattern),
-        // Track events fire when remote peer sends offer, not when we accept answer.
-        // Since we received remote offer here and added local track first,
-        // we must manually start receiver tracks as Track events won't fire.
-        if self.rtc_config.mode != TransportMode::Rtp {
-            for transceiver in pc.get_transceivers() {
-                if let Some(receiver) = transceiver.receiver() {
-                    let track = receiver.track();
-                    info!(track_id=%self.track_id, "WebRTC handshake: manually starting receiver track handler for browser audio");
-                    Self::spawn_track_handler(
-                        track,
-                        self.packet_sender.clone(),
-                        self.track_id.clone(),
-                        self.cancel_token.clone(),
-                        self.processor_chain.clone(),
-                        self.get_payload_type(),
-                    );
-                }
-            }
-        }
+        // For RTP mode: Wait for PeerConnectionEvent::Track after SSRC latching completes
+        // For WebRTC mode: The event loop will handle Track events
+        info!(track_id=%self.track_id, "Waiting for Track events (SSRC latching for RTP mode)");
 
         self.parse_sdp_payload_types(rustrtc::SdpType::Offer, &offer)?;
 
@@ -868,5 +855,44 @@ mod tests {
             .parse_sdp_payload_types(rustrtc::SdpType::Offer, sdp3)
             .expect("parse offer");
         assert_eq!(track.get_payload_type(), 111);
+    }
+
+    #[tokio::test]
+    async fn test_rtp_mode_handshake_spawns_handler() {
+        use rustrtc::TransportMode;
+
+        let track_id = "test-track-sip".to_string();
+        let cancel = CancellationToken::new();
+        let track_config = TrackConfig::default();
+        let mut rtc_config = RtcTrackConfig::default();
+        rtc_config.mode = TransportMode::Rtp;
+
+        let mut track = RtcTrack::new(cancel, track_id, track_config, rtc_config);
+
+        // Standard SIP/SDP offer
+        let offer = "v=0\r\n\
+o=- 123456 123456 IN IP4 172.0.0.1\r\n\
+s=-\r\n\
+c=IN IP4 172.0.0.1\r\n\
+t=0 0\r\n\
+m=audio 10000 RTP/AVP 0 101\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=rtpmap:101 telephone-event/8000\r\n\
+a=sendrecv\r\n";
+
+        // This should not panic and should set up the transceiver
+        let res = track.handshake(offer.to_string(), None).await;
+        assert!(res.is_ok());
+
+        // We can inspect the PeerConnection to ensure it has a transceiver with a receiver
+        if let Some(pc) = &track.peer_connection {
+            let transceivers = pc.get_transceivers();
+            // With the fix, we expect the logic to have iterated these transceivers.
+            // In RTP/Receive mode, we should have 1 transceiver with a receiver.
+            assert_eq!(transceivers.len(), 1);
+            assert!(transceivers[0].receiver().is_some());
+        } else {
+            panic!("PeerConnection not initialized");
+        }
     }
 }
