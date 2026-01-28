@@ -80,6 +80,7 @@ impl TrackCodec {
     pub fn is_audio(payload_type: u8) -> bool {
         match payload_type {
             0 | 8 | 9 | 18 | 111 => true,
+            101 => false, // Telephone Event (DTMF) should not be decoded as audio
             pt if pt >= 96 && pt <= 127 => true,
             _ => false,
         }
