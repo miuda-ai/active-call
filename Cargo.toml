@@ -1,6 +1,6 @@
 [package]
 name = "active-call"
-version = "0.3.33"
+version = "0.3.34"
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 description = "A SIP/WebRTC voice agent"
@@ -48,7 +48,7 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 tracing-appender = "0.2.4"
 toml = "0.9.8"
 rsip = "0.4.0"
-rsipstack = "0.4.3"
+rsipstack = "0.4.4"
 #rsipstack = { path = "../rsipstack" }
 uuid = { version = "1.20.0", features = ["v4"] }
 reqwest = { version = "0.13.1", features = [
