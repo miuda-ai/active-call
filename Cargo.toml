@@ -100,9 +100,10 @@ hf-hub = { version = "0.4.3", default-features = false, features = [
     "ureq",
 ], optional = true }
 
-ort = { version = "=2.0.0-rc.10", default-features = false, features = [
+ort = { version = "=2.0.0-rc.11", default-features = false, features = [
     "std",
     "ndarray",
+    "tls-rustls",
 ], optional = true }
 knf-rs-sys = { version = "0.3.2", optional = true }
 
