@@ -144,6 +144,10 @@ impl RtcTrack {
         if let Some(external_ip) = &self.rtc_config.external_ip {
             config.external_ip = Some(external_ip.clone());
         }
+        if let Some((rtp_start_port, rtp_end_port)) = self.rtc_config.rtp_port_range {
+            config.rtp_start_port = Some(rtp_start_port);
+            config.rtp_end_port = Some(rtp_end_port);
+        }
 
         config.enable_latching = self
             .rtc_config
@@ -646,7 +650,7 @@ impl Track for RtcTrack {
 
         debug!(track_id=%self.track_id, "Before set_remote_description: transceivers count = {}", pc.get_transceivers().len());
         for (i, t) in pc.get_transceivers().iter().enumerate() {
-            debug!(track_id=%self.track_id, "  Transceiver #{}: kind={:?}, mid={:?}, direction={:?}", 
+            debug!(track_id=%self.track_id, "  Transceiver #{}: kind={:?}, mid={:?}, direction={:?}",
                 i, t.kind(), t.mid(), t.direction());
         }
 
@@ -655,7 +659,7 @@ impl Track for RtcTrack {
 
         debug!(track_id=%self.track_id, "After set_remote_description: transceivers count = {}", pc.get_transceivers().len());
         for (i, t) in pc.get_transceivers().iter().enumerate() {
-            debug!(track_id=%self.track_id, "  Transceiver #{}: kind={:?}, mid={:?}, direction={:?}, has_receiver={}", 
+            debug!(track_id=%self.track_id, "  Transceiver #{}: kind={:?}, mid={:?}, direction={:?}, has_receiver={}",
                 i, t.kind(), t.mid(), t.direction(), t.receiver().is_some());
         }
 
