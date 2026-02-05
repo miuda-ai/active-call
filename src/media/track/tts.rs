@@ -466,7 +466,7 @@ impl TtsTask {
     // set cache key for each cmd, return true if cached and retrieve succeed
     async fn handle_cache(&mut self, cmd: &SynthesisCommand, cmd_seq: usize) -> bool {
         let start_time_ms = crate::media::get_timestamp();
-        let cache_key = cmd.cache_key.as_ref().cloned().unwrap_or_else(|| {
+        let cache_key = cmd.cache_key.clone().unwrap_or_else(|| {
             cache::generate_cache_key(
                 &format!("tts:{}{}", self.client.provider(), cmd.text),
                 self.sample_rate,
