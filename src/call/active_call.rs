@@ -1969,6 +1969,7 @@ impl ActiveCall {
             hangup_headers,
         );
 
+        self.media_stream.suppress_forwarding(&track_id);
         crate::spawn(async move {
             client_dialog_handler.process_dialog(states).await;
         });
@@ -2012,6 +2013,7 @@ impl ActiveCall {
             .update_remote_description(&track_id, &answer)
             .await
             .ok();
+        self.media_stream.resume_forwarding(&track_id);
 
         Ok(answer)
     }

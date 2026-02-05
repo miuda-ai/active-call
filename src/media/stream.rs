@@ -9,11 +9,12 @@ use crate::media::{
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio::{
     select,
-    sync::{Mutex, mpsc},
+    sync::{Mutex, RwLock, mpsc},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -23,8 +24,8 @@ pub struct MediaStream {
     id: String,
     pub cancel_token: CancellationToken,
     recorder_option: Mutex<Option<RecorderOption>>,
-    tracks: Mutex<HashMap<TrackId, (Box<dyn Track>, DtmfDetector)>>,
-    suppressed_sources: Mutex<HashSet<TrackId>>,
+    tracks: RwLock<HashMap<TrackId, (Arc<Mutex<Box<dyn Track>>>, DtmfDetector)>>,
+    suppressed_sources: std::sync::Mutex<HashSet<TrackId>>,
     event_sender: EventSender,
     pub packet_sender: TrackPacketSender,
     packet_receiver: Mutex<Option<TrackPacketReceiver>>,
@@ -71,7 +72,7 @@ impl MediaStreamBuilder {
         let cancel_token = self
             .cancel_token
             .unwrap_or_else(|| CancellationToken::new());
-        let tracks = Mutex::new(HashMap::new());
+        let tracks = RwLock::new(HashMap::new());
         let (track_packet_sender, track_packet_receiver) = mpsc::unbounded_channel();
         let (recorder_sender, recorder_receiver) = mpsc::unbounded_channel();
         MediaStream {
@@ -79,7 +80,7 @@ impl MediaStreamBuilder {
             cancel_token,
             recorder_option: Mutex::new(self.recorder_config),
             tracks,
-            suppressed_sources: Mutex::new(HashSet::new()),
+            suppressed_sources: std::sync::Mutex::new(HashSet::new()),
             event_sender: self.event_sender,
             packet_sender: track_packet_sender,
             packet_receiver: Mutex::new(Some(track_packet_receiver)),
@@ -136,12 +137,13 @@ impl MediaStream {
     }
 
     pub async fn remove_track(&self, id: &TrackId, graceful: bool) {
-        if let Some((track, _)) = self.tracks.lock().await.remove(id) {
-            self.suppressed_sources.lock().await.remove(id);
+        let track = { self.tracks.write().await.remove(id) };
+        if let Some((track, _)) = track {
+            self.suppressed_sources.lock().unwrap().remove(id);
             let res = if !graceful {
-                track.stop().await
+                track.lock().await.stop().await
             } else {
-                track.stop_graceful().await
+                track.lock().await.stop_graceful().await
             };
             match res {
                 Ok(_) => {}
@@ -156,8 +158,9 @@ impl MediaStream {
         track_id: &TrackId,
         answer: &String,
     ) -> Result<()> {
-        if let Some((track, _)) = self.tracks.lock().await.get_mut(track_id) {
-            track.update_remote_description(answer).await?;
+        let track = { self.tracks.read().await.get(track_id).map(|t| t.0.clone()) };
+        if let Some(track) = track {
+            track.lock().await.update_remote_description(answer).await?;
         }
         Ok(())
     }
@@ -167,8 +170,13 @@ impl MediaStream {
         track_id: &TrackId,
         answer: &String,
     ) -> Result<()> {
-        if let Some((track, _)) = self.tracks.lock().await.get_mut(track_id) {
-            track.update_remote_description_force(answer).await?;
+        let track = { self.tracks.read().await.get(track_id).map(|t| t.0.clone()) };
+        if let Some(track) = track {
+            track
+                .lock()
+                .await
+                .update_remote_description_force(answer)
+                .await?;
         }
         Ok(())
     }
@@ -179,8 +187,9 @@ impl MediaStream {
         offer: String,
         timeout: Option<Duration>,
     ) -> Result<String> {
-        if let Some((track, _)) = self.tracks.lock().await.get_mut(track_id) {
-            return track.handshake(offer, timeout).await;
+        let track = { self.tracks.read().await.get(track_id).map(|t| t.0.clone()) };
+        if let Some(track) = track {
+            return track.lock().await.handshake(offer, timeout).await;
         }
         anyhow::bail!("track not found: {}", track_id)
     }
@@ -199,10 +208,10 @@ impl MediaStream {
             Ok(_) => {
                 info!(session_id = self.id, track_id = track.id(), "track started");
                 let track_id = track.id().clone();
-                self.tracks
-                    .lock()
-                    .await
-                    .insert(track_id.clone(), (track, DtmfDetector::new()));
+                self.tracks.write().await.insert(
+                    track_id.clone(),
+                    (Arc::new(Mutex::new(track)), DtmfDetector::new()),
+                );
                 self.event_sender
                     .send(SessionEvent::TrackStart {
                         track_id,
@@ -225,37 +234,39 @@ impl MediaStream {
 
     pub async fn mute_track(&self, id: Option<TrackId>) {
         if let Some(id) = id {
-            if let Some((track, _)) = self.tracks.lock().await.get_mut(&id) {
-                MuteProcessor::mute_track(track.as_mut());
+            let track = { self.tracks.read().await.get(&id).map(|t| t.0.clone()) };
+            if let Some(track) = track {
+                MuteProcessor::mute_track(track.lock().await.as_mut());
             }
         } else {
-            for (track, _) in self.tracks.lock().await.values_mut() {
-                MuteProcessor::mute_track(track.as_mut());
+            for (track, _) in self.tracks.read().await.values() {
+                MuteProcessor::mute_track(track.lock().await.as_mut());
             }
         }
     }
 
     pub async fn unmute_track(&self, id: Option<TrackId>) {
         if let Some(id) = id {
-            if let Some((track, _)) = self.tracks.lock().await.get_mut(&id) {
-                MuteProcessor::unmute_track(track.as_mut());
+            let track = { self.tracks.read().await.get(&id).map(|t| t.0.clone()) };
+            if let Some(track) = track {
+                MuteProcessor::unmute_track(track.lock().await.as_mut());
             }
         } else {
-            for (track, _) in self.tracks.lock().await.values_mut() {
-                MuteProcessor::unmute_track(track.as_mut());
+            for (track, _) in self.tracks.read().await.values() {
+                MuteProcessor::unmute_track(track.lock().await.as_mut());
             }
         }
     }
 
-    pub async fn suppress_forwarding(&self, track_id: &TrackId) {
+    pub fn suppress_forwarding(&self, track_id: &TrackId) {
         self.suppressed_sources
             .lock()
-            .await
+            .unwrap()
             .insert(track_id.clone());
     }
 
-    pub async fn resume_forwarding(&self, track_id: &TrackId) {
-        self.suppressed_sources.lock().await.remove(track_id);
+    pub fn resume_forwarding(&self, track_id: &TrackId) {
+        self.suppressed_sources.lock().unwrap().remove(track_id);
     }
 }
 
@@ -333,12 +344,12 @@ impl MediaStream {
             let suppressed = {
                 self.suppressed_sources
                     .lock()
-                    .await
+                    .unwrap()
                     .contains(&packet.track_id)
             };
             // Process the packet with each track
-            for (track, dtmf_detector) in self.tracks.lock().await.values_mut() {
-                if track.id() == &packet.track_id {
+            for (track_id, (track, dtmf_detector)) in self.tracks.read().await.iter() {
+                if track_id == &packet.track_id {
                     match &packet.samples {
                         Samples::RTP {
                             payload_type,
@@ -346,7 +357,7 @@ impl MediaStream {
                             ..
                         } => {
                             if let Some(digit) = dtmf_detector.detect_rtp(*payload_type, payload) {
-                                debug!(track_id = track.id(), digit, "DTMF detected");
+                                debug!(track_id = track_id, digit, "DTMF detected");
                                 event_sender
                                     .send(SessionEvent::Dtmf {
                                         track_id: packet.track_id.to_string(),
@@ -363,12 +374,21 @@ impl MediaStream {
                 if suppressed {
                     continue;
                 }
-                if packet.track_id == QUEUE_HOLD_TRACK_ID && track.id() == CALLEE_TRACK_ID {
+                if packet.track_id == QUEUE_HOLD_TRACK_ID && track_id == CALLEE_TRACK_ID {
                     continue;
                 }
-                if let Err(e) = track.send_packet(&packet).await {
+
+                let mut guard = track.lock().await;
+                let track_suppressed =
+                    { self.suppressed_sources.lock().unwrap().contains(track_id) };
+                if track_suppressed {
+                    // recheck suppression to not hold lock across await - might cause deadlocks
+                    drop(guard);
+                    continue;
+                }
+                if let Err(e) = guard.send_packet(&packet).await {
                     warn!(
-                        id = track.id(),
+                        id = track_id,
                         "media_stream: Failed to send packet to track: {}", e
                     );
                 }
