@@ -90,6 +90,10 @@ fn default_config_rtp_latching() -> Option<bool> {
     Some(true)
 }
 
+fn default_graceful_shutdown() -> Option<bool> {
+    Some(true)
+}
+
 fn default_config_useragent() -> Option<String> {
     Some(format!(
         "active-call({} miuda.ai)",
@@ -182,6 +186,7 @@ pub struct Config {
     #[serde(default = "default_config_useragent")]
     pub useragent: Option<String>,
     pub register_users: Option<Vec<RegisterOption>>,
+    #[serde(default = "default_graceful_shutdown")]
     pub graceful_shutdown: Option<bool>,
     pub handler: Option<InviteHandlerConfig>,
     pub accept_timeout: Option<String>,

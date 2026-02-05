@@ -4,6 +4,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use clap::Parser;
 use dotenvy::dotenv;
+use futures::{FutureExt, future};
 use reqwest::StatusCode;
 use std::sync::Arc;
 use tokio::signal;
@@ -273,21 +274,47 @@ async fn main() -> Result<()> {
         .nest_service("/static", ServeDir::new("static"))
         .with_state(app_state.clone());
 
-    tokio::select! {
-        result = axum::serve(listener, app) => {
-            if let Err(e) = result {
-                warn!("axum serve error: {:?}", e);
+    let app_state_clone = app_state.clone();
+    let graceful_shutdown = config.graceful_shutdown.unwrap_or_default();
+
+    let axum_serving = axum::serve(listener, app).into_future();
+    let app_state_serving = app_state_clone.serve();
+    let mut canceled = false;
+    let cancel_timeout = future::pending().boxed();
+
+    tokio::pin!(axum_serving);
+    tokio::pin!(app_state_serving);
+    tokio::pin!(cancel_timeout);
+
+    loop {
+        tokio::select! {
+            result = &mut axum_serving => {
+                if let Err(e) = result {
+                    warn!("axum serve error: {:?}", e);
+                }
+                break;
             }
-        }
-        res = app_state.serve() => {
-            if let Err(e) = res {
-                warn!("AppState server error: {}", e);
+            res = &mut app_state_serving => {
+                if let Err(e) = res {
+                    warn!("AppState server error: {}", e);
+                }
+                break;
             }
-        }
-        _ = signal::ctrl_c() => {
-            info!("Shutdown signal received");
+            _ = signal::ctrl_c(), if !canceled => {
+                info!("Shutdown signal received");
+                if graceful_shutdown {
+                    app_state.stop();
+                    *cancel_timeout = tokio::time::sleep(tokio::time::Duration::from_secs(5)).boxed();
+                    canceled = true;
+                } else {
+                    break;
+                }
+            }
+            _ = &mut cancel_timeout => {
+                warn!("Shutdown timeout");
+                break;
+            }
         }
     }
-    info!("Shutting down...");
     Ok(())
 }
