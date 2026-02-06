@@ -136,7 +136,8 @@ impl MediaStream {
     }
 
     pub async fn remove_track(&self, id: &TrackId, graceful: bool) {
-        if let Some((track, _)) = self.tracks.lock().await.remove(id) {
+        let track_entry = { self.tracks.lock().await.remove(id) };
+        if let Some((track, _)) = track_entry {
             self.suppressed_sources.lock().await.remove(id);
             let res = if !graceful {
                 track.stop().await
@@ -156,8 +157,14 @@ impl MediaStream {
         track_id: &TrackId,
         answer: &String,
     ) -> Result<()> {
-        if let Some((track, _)) = self.tracks.lock().await.get_mut(track_id) {
-            track.update_remote_description(answer).await?;
+        let track_entry = { self.tracks.lock().await.remove(track_id) };
+        if let Some((mut track, dtmf)) = track_entry {
+            let res = track.update_remote_description(answer).await;
+            self.tracks
+                .lock()
+                .await
+                .insert(track_id.clone(), (track, dtmf));
+            res?;
         }
         Ok(())
     }
@@ -167,8 +174,14 @@ impl MediaStream {
         track_id: &TrackId,
         answer: &String,
     ) -> Result<()> {
-        if let Some((track, _)) = self.tracks.lock().await.get_mut(track_id) {
-            track.update_remote_description_force(answer).await?;
+        let track_entry = { self.tracks.lock().await.remove(track_id) };
+        if let Some((mut track, dtmf)) = track_entry {
+            let res = track.update_remote_description_force(answer).await;
+            self.tracks
+                .lock()
+                .await
+                .insert(track_id.clone(), (track, dtmf));
+            res?;
         }
         Ok(())
     }
@@ -179,10 +192,17 @@ impl MediaStream {
         offer: String,
         timeout: Option<Duration>,
     ) -> Result<String> {
-        if let Some((track, _)) = self.tracks.lock().await.get_mut(track_id) {
-            return track.handshake(offer, timeout).await;
+        let track_entry = { self.tracks.lock().await.remove(track_id) };
+        if let Some((mut track, dtmf)) = track_entry {
+            let res = track.handshake(offer, timeout).await;
+            self.tracks
+                .lock()
+                .await
+                .insert(track_id.clone(), (track, dtmf));
+            res
+        } else {
+            anyhow::bail!("track not found: {}", track_id)
         }
-        anyhow::bail!("track not found: {}", track_id)
     }
 
     pub async fn update_track(&self, mut track: Box<dyn Track>, play_id: Option<String>) {

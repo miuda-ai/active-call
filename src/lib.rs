@@ -172,6 +172,7 @@ pub struct ReferOption {
     /// hangup after the call is ended
     pub auto_hangup: Option<bool>,
     pub sip: Option<SipOption>,
+    pub call_id: Option<String>,
 }
 
 #[skip_serializing_none]

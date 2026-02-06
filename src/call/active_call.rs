@@ -1173,6 +1173,11 @@ impl ActiveCall {
                 }
             }
         }
+        let ref_call_id = refer_option
+            .as_ref()
+            .and_then(|o| o.call_id.clone())
+            .unwrap_or_else(|| format!("ref-{}-{}", rand::random::<u32>(), self.session_id));
+
         let session_id = self.session_id.clone();
         let track_id = self.server_side_track_id.clone();
 
@@ -1195,7 +1200,7 @@ impl ActiveCall {
         };
 
         let mut invite_option = call_option.build_invite_option()?;
-        invite_option.call_id = Some(self.session_id.clone());
+        invite_option.call_id = Some(ref_call_id);
 
         let headers = invite_option.headers.get_or_insert_with(|| Vec::new());
 
