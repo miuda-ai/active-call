@@ -26,6 +26,7 @@ mod tests {
             Ok(vec![Command::Hangup {
                 reason: Some("start".to_string()),
                 initiator: Some("tester".to_string()),
+                headers: None,
             }])
         }
 
@@ -34,6 +35,7 @@ mod tests {
                 Ok(vec![Command::Hangup {
                     reason: Some("event".to_string()),
                     initiator: Some("tester".to_string()),
+                    headers: None,
                 }])
             } else {
                 Ok(vec![])

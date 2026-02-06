@@ -18,6 +18,11 @@ static RE_HANGUP: Lazy<Regex> = Lazy::new(|| Regex::new(r"<hangup\s*/>").unwrap(
 static RE_REFER: Lazy<Regex> = Lazy::new(|| Regex::new(r#"<refer\s+to="([^"]+)"\s*/>"#).unwrap());
 static RE_PLAY: Lazy<Regex> = Lazy::new(|| Regex::new(r#"<play\s+file="([^"]+)"\s*/>"#).unwrap());
 static RE_GOTO: Lazy<Regex> = Lazy::new(|| Regex::new(r#"<goto\s+scene="([^"]+)"\s*/>"#).unwrap());
+static RE_SET_VAR: Lazy<Regex> = Lazy::new(|| Regex::new(r#"<set_var\s+key="([^"]+)"\s+value=["'](.+?)["']\s*/>"#).unwrap());
+static RE_HTTP: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"<http\s+url="([^"]+)"(?:\s+method="([^"]+)")?(?:\s+body="([^"]+)")?\s*/>"#)
+        .unwrap()
+});
 static RE_SENTENCE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?m)[.!?。！？\n]\s*").unwrap());
 static FILLERS: Lazy<std::collections::HashSet<String>> = Lazy::new(|| {
     let mut s = std::collections::HashSet::new();
@@ -56,6 +61,8 @@ enum CommandKind {
     Sentence,
     Play,
     Goto,
+    SetVar,
+    Http,
 }
 
 pub use provider::*;
@@ -84,6 +91,7 @@ pub struct LlmHandler {
     scenes: HashMap<String, super::Scene>,
     current_scene_id: Option<String>,
     client: Client,
+    sip_config: Option<crate::SipOption>,
 }
 
 impl LlmHandler {
@@ -94,6 +102,7 @@ impl LlmHandler {
         scenes: HashMap<String, super::Scene>,
         dtmf: Option<HashMap<String, super::DtmfAction>>,
         initial_scene_id: Option<String>,
+        sip_config: Option<crate::SipOption>,
     ) -> Self {
         Self::with_provider(
             config,
@@ -104,6 +113,7 @@ impl LlmHandler {
             scenes,
             dtmf,
             initial_scene_id,
+            sip_config,
         )
     }
 
@@ -116,6 +126,7 @@ impl LlmHandler {
         scenes: HashMap<String, super::Scene>,
         dtmf: Option<HashMap<String, super::DtmfAction>>,
         initial_scene_id: Option<String>,
+        sip_config: Option<crate::SipOption>,
     ) -> Self {
         let mut history = Vec::new();
         let system_prompt = Self::build_system_prompt(&config, None);
@@ -145,6 +156,7 @@ impl LlmHandler {
             scenes,
             current_scene_id: initial_scene_id,
             client: Client::new(),
+            sip_config,
         }
     }
 
@@ -248,9 +260,11 @@ impl LlmHandler {
             }
             super::DtmfAction::Hangup => {
                 info!("DTMF action: hangup");
+                let headers = self.render_sip_headers().await;
                 Ok(vec![Command::Hangup {
                     reason: Some("DTMF Hangup".to_string()),
                     initiator: Some("ai".to_string()),
+                    headers,
                 }])
             }
         }
@@ -438,7 +452,7 @@ impl LlmHandler {
 
                     if checked_json_mode && !is_json_mode {
                         let extracted =
-                            self.extract_streaming_commands(&mut buffer, &play_id, false);
+                            self.extract_streaming_commands(&mut buffer, &play_id, false).await;
                         for cmd in extracted {
                             if let Some(call) = &self.call {
                                 let _ = call.enqueue_command(cmd).await;
@@ -468,7 +482,7 @@ impl LlmHandler {
         if is_json_mode {
             self.interpret_response(full_content).await
         } else {
-            let extracted = self.extract_streaming_commands(&mut buffer, &play_id, true);
+            let extracted = self.extract_streaming_commands(&mut buffer, &play_id, true).await;
             for cmd in extracted {
                 if let Some(call) = &self.call {
                     let _ = call.enqueue_command(cmd).await;
@@ -489,7 +503,7 @@ impl LlmHandler {
         }
     }
 
-    fn extract_streaming_commands(
+    async fn extract_streaming_commands(
         &mut self,
         buffer: &mut String,
         play_id: &str,
@@ -502,10 +516,12 @@ impl LlmHandler {
             let refer_pos = RE_REFER.captures(buffer);
             let play_pos = RE_PLAY.captures(buffer);
             let goto_pos = RE_GOTO.captures(buffer);
+            let set_var_pos = RE_SET_VAR.captures(buffer);
+            let http_pos = RE_HTTP.captures(buffer);
             let sentence_pos = RE_SENTENCE.find(buffer);
 
             // Find the first occurrence
-            let mut positions: Vec<(usize, CommandKind)> = Vec::new();
+            let mut positions: Vec<(usize, CommandKind)> = Vec::new(); // ...existing code...
             if let Some(m) = hangup_pos {
                 positions.push((m.start(), CommandKind::Hangup));
             }
@@ -518,6 +534,12 @@ impl LlmHandler {
             if let Some(caps) = &goto_pos {
                 positions.push((caps.get(0).unwrap().start(), CommandKind::Goto));
             }
+            if let Some(caps) = &set_var_pos {
+                positions.push((caps.get(0).unwrap().start(), CommandKind::SetVar));
+            }
+            if let Some(caps) = &http_pos {
+                positions.push((caps.get(0).unwrap().start(), CommandKind::Http));
+            }
             if let Some(m) = sentence_pos {
                 positions.push((m.start(), CommandKind::Sentence));
             }
@@ -527,6 +549,85 @@ impl LlmHandler {
             if let Some((pos, kind)) = positions.first() {
                 let pos = *pos;
                 match kind {
+                    CommandKind::SetVar => {
+                        let caps = RE_SET_VAR.captures(buffer).unwrap();
+                        let mat = caps.get(0).unwrap();
+                        let key = caps.get(1).unwrap().as_str().to_string();
+                        let value = caps.get(2).unwrap().as_str().to_string();
+
+                        let prefix = buffer[..pos].to_string();
+                        if !prefix.trim().is_empty() {
+                            commands.push(self.create_tts_command_with_id(
+                                prefix,
+                                play_id.to_string(),
+                                None,
+                            ));
+                        }
+
+                        if let Some(call) = &self.call {
+                            let mut state = call.call_state.write().await;
+                            let mut extras = state.extras.take().unwrap_or_default();
+                            extras.insert(key, serde_json::Value::String(value));
+                            state.extras = Some(extras);
+                        }
+
+                        buffer.drain(..mat.end());
+                    }
+                    CommandKind::Http => {
+                         let caps = RE_HTTP.captures(buffer).unwrap();
+                         let mat = caps.get(0).unwrap();
+                         let url = caps.get(1).unwrap().as_str().to_string();
+                         let method = caps.get(2).map(|m| m.as_str().to_string()).unwrap_or("GET".to_string());
+                         let body = caps.get(3).map(|m| m.as_str().to_string());
+
+                         // Flush TTS
+                         let prefix = buffer[..pos].to_string();
+                         if !prefix.trim().is_empty() {
+                             commands.push(self.create_tts_command_with_id(
+                                 prefix,
+                                 play_id.to_string(),
+                                 None,
+                             ));
+                         }
+
+                         // Execute HTTP request synchronously and capture response
+                         let client = self.client.clone();
+                         let mut req = match method.to_uppercase().as_str() {
+                             "POST" => client.post(&url),
+                             "PUT" => client.put(&url),
+                             _ => client.get(&url),
+                         };
+
+                         if let Some(b) = body {
+                             req = req.body(b);
+                         }
+
+                         // Send request and wait for response
+                         match req.send().await {
+                             Ok(res) => {
+                                 let status = res.status();
+                                 let text = res.text().await.unwrap_or_default();
+                                 info!(url, method, status=?status, "HTTP command executed from stream");
+                                 
+                                 // Add response to history for LLM context
+                                 self.history.push(ChatMessage {
+                                     role: "system".to_string(),
+                                     content: format!("HTTP {} {} returned ({}): {}", method, url, status, text),
+                                 });
+                             }
+                             Err(e) => {
+                                 warn!(url, method, "Failed to execute HTTP command from stream: {}", e);
+                                 
+                                 // Add error to history
+                                 self.history.push(ChatMessage {
+                                     role: "system".to_string(),
+                                     content: format!("HTTP {} {} failed: {}", method, url, e),
+                                 });
+                             }
+                         }
+
+                         buffer.drain(..mat.end());
+                    }
                     CommandKind::Hangup => {
                         let prefix = buffer[..pos].to_string();
                         if !prefix.trim().is_empty() {
@@ -552,6 +653,14 @@ impl LlmHandler {
                             self.is_hanging_up = true;
                             commands.push(cmd);
                         }
+
+                        let headers = self.render_sip_headers().await;
+                        commands.push(Command::Hangup {
+                            reason: Some("AI Hangup".to_string()),
+                            initiator: Some("ai".to_string()),
+                            headers,
+                        });
+
                         buffer.drain(..RE_HANGUP.find(buffer).unwrap().end());
                         return commands;
                     }
@@ -722,9 +831,13 @@ impl LlmHandler {
                         }
                     }),
                 );
+                
+                let headers = self.render_sip_headers().await;
+
                 tool_commands.push(Command::Hangup {
                     reason: reason.clone(),
                     initiator: initiator.clone(),
+                    headers,
                 });
                 Ok(false)
             }
@@ -793,6 +906,30 @@ impl LlmHandler {
                 Ok(true)
             }
         }
+    }
+
+    async fn render_sip_headers(&self) -> Option<HashMap<String, String>> {
+        let hangup_template = self.sip_config.as_ref()?.hangup_headers.as_ref()?;
+        let call = self.call.as_ref()?;
+        let state = call.call_state.read().await;
+        
+        let mut context = HashMap::new();
+        if let Some(extras) = &state.extras {
+            for (k, v) in extras {
+                context.insert(k.clone(), v.clone());
+            }
+        }
+        
+        let env = minijinja::Environment::new();
+        let mut rendered_headers = HashMap::new();
+        for (k, v) in hangup_template {
+             if let Ok(rendered) = env.render_str(v, &context) {
+                 rendered_headers.insert(k.clone(), rendered);
+             } else {
+                 rendered_headers.insert(k.clone(), v.clone());
+             }
+        }
+        Some(rendered_headers)
     }
 
     async fn handle_rag_tool(&mut self, query: &str, source: &Option<String>) -> Result<()> {
@@ -1081,9 +1218,11 @@ impl LlmHandler {
 
         if self.consecutive_follow_ups >= config.max_count {
             info!("Max follow-up count reached, hanging up");
+            let headers = self.render_sip_headers().await;
             return Ok(vec![Command::Hangup {
                 reason: Some("Max follow-up reached".to_string()),
                 initiator: Some("system".to_string()),
+                headers,
             }]);
         }
 
@@ -1106,10 +1245,14 @@ impl LlmHandler {
         let args: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
 
         match name {
-            "hangup_call" => Ok(vec![Command::Hangup {
-                reason: args["reason"].as_str().map(|s| s.to_string()),
-                initiator: Some("ai".to_string()),
-            }]),
+            "hangup_call" => {
+                let headers = self.render_sip_headers().await;
+                Ok(vec![Command::Hangup {
+                    reason: args["reason"].as_str().map(|s| s.to_string()),
+                    initiator: Some("ai".to_string()),
+                    headers,
+                }])
+            }
             "transfer_call" | "refer_call" => {
                 if let Some(callee) = args["callee"]
                     .as_str()

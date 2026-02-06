@@ -56,6 +56,7 @@ impl PlaybookRunner {
                 playbook.scenes.clone(),
                 dtmf_config,
                 playbook.initial_scene_id.clone(),
+                playbook.config.sip.clone(),
             );
             // Set event sender for debugging
             llm_handler.set_event_sender(call.event_sender.clone());

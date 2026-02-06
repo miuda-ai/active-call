@@ -40,6 +40,7 @@ pub struct SipOption {
     pub contact: Option<String>,
     pub headers: Option<HashMap<String, String>>,
     pub hangup_headers: Option<HashMap<String, String>>,
+    pub extract_headers: Option<Vec<String>>,
 }
 
 #[skip_serializing_none]

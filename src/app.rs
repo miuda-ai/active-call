@@ -1,4 +1,3 @@
-use crate::media::{cache::set_cache_dir, engine::StreamEngine};
 use crate::{
     call::{ActiveCallRef, sip::Invitation},
     callrecord::{
@@ -15,9 +14,10 @@ use crate::{
         registration::{RegistrationHandle, UserCredential},
     },
 };
+
+use crate::media::{cache::set_cache_dir, engine::StreamEngine};
 use anyhow::Result;
 use chrono::{DateTime, Local};
-use futures::{FutureExt, future};
 use humantime::parse_duration;
 use rsip::prelude::HeadersExt;
 use rsipstack::transaction::{
@@ -39,7 +39,6 @@ use tracing::{info, warn};
 pub struct AppStateInner {
     pub config: Arc<Config>,
     pub token: CancellationToken,
-    pub endpoint_token: CancellationToken,
     pub stream_engine: Arc<StreamEngine>,
     pub callrecord_sender: Option<CallRecordSender>,
     pub endpoint: Endpoint,
@@ -50,6 +49,7 @@ pub struct AppStateInner {
     pub invitation: Invitation,
     pub routing_state: Arc<crate::call::RoutingState>,
     pub pending_playbooks: Arc<Mutex<HashMap<String, String>>>,
+    pub pending_params: Arc<Mutex<HashMap<String, HashMap<String, serde_json::Value>>>>,
 
     pub active_calls: Arc<std::sync::Mutex<HashMap<String, ActiveCallRef>>>,
     pub total_calls: AtomicU64,
@@ -140,52 +140,37 @@ impl AppStateInner {
             }
         }
 
-        let serving = endpoint_inner.serve();
-        let processing =
-            app_state_clone.process_incoming_request(dialog_layer.clone(), incoming_txs);
-        let mut cancelled = false;
-        let stop_registration = future::pending().boxed();
-        tokio::pin!(serving);
-        tokio::pin!(processing);
-        tokio::pin!(stop_registration);
-
-        loop {
-            tokio::select! {
-                _ = token.cancelled(), if !cancelled=> {
-                    cancelled = true;
-                    let timeout = self
-                        .config
-                        .graceful_shutdown
-                        .map(|_| Duration::from_secs(5));
-                    *stop_registration = self.stop_registration(timeout).boxed();
-                }
-                result = &mut serving => {
-                    if let Err(e) = result {
-                        info!("endpoint serve error: {:?}", e);
-                    }
-                    break;
-                }
-                result = &mut processing => {
-                    if let Err(e) = result {
-                        info!("process incoming request error: {:?}", e);
-                    }
-                    break;
-                },
-                result = &mut stop_registration => {
-                    match result {
-                        Ok(_) => {
-                            info!("registration stopped, waiting for clear");
-                        }
-                        Err(e) => {
-                            warn!("failed to stop registration: {:?}", e);
-                        }
-                    }
-                    break;
-                },
+        tokio::select! {
+            _ = token.cancelled() => {
+                info!("cancelled");
             }
+            result = endpoint_inner.serve() => {
+                if let Err(e) = result {
+                    info!("endpoint serve error: {:?}", e);
+                }
+            }
+            result = app_state_clone.process_incoming_request(dialog_layer.clone(), incoming_txs) => {
+                if let Err(e) = result {
+                    info!("process incoming request error: {:?}", e);
+                }
+            },
         }
 
-        self.endpoint_token.cancel();
+        // Wait for registration to stop, if not stopped within 50 seconds,
+        // force stop it.
+        let timeout = self
+            .config
+            .graceful_shutdown
+            .map(|_| Duration::from_secs(50));
+
+        match self.stop_registration(timeout).await {
+            Ok(_) => {
+                info!("registration stopped, waiting for clear");
+            }
+            Err(e) => {
+                warn!("failed to stop registration: {:?}", e);
+            }
+        }
         info!("stopping");
         Ok(())
     }
@@ -689,16 +674,13 @@ impl AppStateBuilder {
         } else {
             crate::net_tool::get_first_non_loopback_interface()?
         };
-
-        let endpoint_cancel_token = CancellationToken::new();
-        let transport_layer =
-            rsipstack::transport::TransportLayer::new(endpoint_cancel_token.clone());
+        let transport_layer = rsipstack::transport::TransportLayer::new(token.clone());
         let local_addr: SocketAddr = format!("{}:{}", local_ip, config.udp_port).parse()?;
 
         let udp_conn = rsipstack::transport::udp::UdpConnection::create_connection(
             local_addr,
             None,
-            Some(endpoint_cancel_token.child_token()),
+            Some(token.child_token()),
         )
         .await
         .map_err(|e| anyhow::anyhow!("Create useragent UDP connection: {} {}", local_addr, e))?;
@@ -713,7 +695,7 @@ impl AppStateBuilder {
         }
 
         let mut endpoint_builder = endpoint_builder
-            .with_cancel_token(endpoint_cancel_token.clone())
+            .with_cancel_token(token.child_token())
             .with_transport_layer(transport_layer)
             .with_option(endpoint_option);
 
@@ -780,11 +762,11 @@ impl AppStateBuilder {
             invitation: Invitation::new(dialog_layer),
             routing_state: Arc::new(crate::call::RoutingState::new()),
             pending_playbooks: Arc::new(Mutex::new(HashMap::new())),
+            pending_params: Arc::new(Mutex::new(HashMap::new())),
             active_calls: Arc::new(std::sync::Mutex::new(HashMap::new())),
             total_calls: AtomicU64::new(0),
             total_failed_calls: AtomicU64::new(0),
             uptime: Local::now(),
-            endpoint_token: endpoint_cancel_token,
         });
 
         Ok(app_state)

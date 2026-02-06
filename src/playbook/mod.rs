@@ -9,6 +9,15 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::Path};
 use tokio::fs;
 
+/// Expand environment variables in the format ${VAR_NAME}
+fn expand_env_vars(input: &str) -> String {
+    let re = regex::Regex::new(r"\$\{([^}]+)\}").unwrap();
+    re.replace_all(input, |caps: &regex::Captures| {
+        let var_name = &caps[1];
+        std::env::var(var_name).unwrap_or_else(|_| format!("${{{}}}", var_name))
+    }).to_string()
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum InterruptionStrategy {
@@ -174,7 +183,10 @@ impl Playbook {
         let yaml_str = parts[1];
         let prompt_section = parts[2].trim();
 
-        let mut config: PlaybookConfig = serde_yaml::from_str(yaml_str)?;
+        // Expand environment variables in YAML configuration
+        // This allows ALL fields to use ${VAR_NAME} syntax
+        let expanded_yaml = expand_env_vars(yaml_str);
+        let mut config: PlaybookConfig = serde_yaml::from_str(&expanded_yaml)?;
 
         let mut scenes = HashMap::new();
         let mut first_scene_id: Option<String> = None;
@@ -286,6 +298,7 @@ impl Playbook {
         }
 
         if let Some(llm) = config.llm.as_mut() {
+            // Fallback to direct env var if not set
             if llm.api_key.is_none() {
                 if let Ok(key) = std::env::var("OPENAI_API_KEY") {
                     llm.api_key = Some(key);
@@ -459,6 +472,56 @@ Hello
     }
 
     #[test]
+    fn test_env_var_expansion() {
+        // Set test env vars
+        unsafe {
+            std::env::set_var("TEST_API_KEY", "sk-test-12345");
+            std::env::set_var("TEST_BASE_URL", "https://api.test.com");
+        }
+        
+        let content = r#"---
+llm:
+  provider: openai
+  apiKey: "${TEST_API_KEY}"
+  baseUrl: "${TEST_BASE_URL}"
+  model: gpt-4
+---
+# Scene: main
+Test
+"#;
+        let playbook = Playbook::parse(content, None).unwrap();
+        let llm = playbook.config.llm.unwrap();
+        
+        assert_eq!(llm.api_key.unwrap(), "sk-test-12345");
+        assert_eq!(llm.base_url.unwrap(), "https://api.test.com");
+        assert_eq!(llm.model.unwrap(), "gpt-4");
+        
+        // Clean up
+        unsafe {
+            std::env::remove_var("TEST_API_KEY");
+            std::env::remove_var("TEST_BASE_URL");
+        }
+    }
+
+    #[test]
+    fn test_env_var_expansion_missing() {
+        // Test with undefined var
+        let content = r#"---
+llm:
+  provider: openai
+  apiKey: "${UNDEFINED_VAR}"
+---
+# Scene: main
+Test
+"#;
+        let playbook = Playbook::parse(content, None).unwrap();
+        let llm = playbook.config.llm.unwrap();
+        
+        // Should keep the placeholder if env var not found
+        assert_eq!(llm.api_key.unwrap(), "${UNDEFINED_VAR}");
+    }
+
+    #[test]
     fn test_custom_summary_parsing() {
         let content = r#"---
 posthook:
@@ -475,6 +538,63 @@ Hello
         match posthook.summary.unwrap() {
             SummaryType::Custom(s) => assert_eq!(s, "Please summarize customly"),
             _ => panic!("Expected Custom summary type"),
+        }
+    }
+
+    #[test]
+    fn test_env_vars_in_all_fields() {
+        // Test that ${VAR} works in all configuration fields
+        unsafe {
+            std::env::set_var("TEST_MODEL_ALL", "gpt-4o");
+            std::env::set_var("TEST_API_KEY_ALL", "sk-test-12345");
+            std::env::set_var("TEST_BASE_URL_ALL", "https://api.example.com");
+            std::env::set_var("TEST_SPEAKER_ALL", "F1");
+            std::env::set_var("TEST_LANGUAGE_ALL", "zh");
+            std::env::set_var("TEST_SPEED_ALL", "1.2");
+        }
+
+        let content = r#"---
+asr:
+  provider: "sensevoice"
+  language: "${TEST_LANGUAGE_ALL}"
+tts:
+  provider: "supertonic"
+  speaker: "${TEST_SPEAKER_ALL}"
+  speed: ${TEST_SPEED_ALL}
+llm:
+  provider: "openai"
+  model: "${TEST_MODEL_ALL}"
+  apiKey: "${TEST_API_KEY_ALL}"
+  baseUrl: "${TEST_BASE_URL_ALL}"
+---
+# Scene: main
+Test content
+"#;
+
+        let playbook = Playbook::parse(content, None).unwrap();
+        
+        // Verify ASR fields
+        let asr = playbook.config.asr.unwrap();
+        assert_eq!(asr.language.unwrap(), "zh");
+        
+        // Verify TTS fields
+        let tts = playbook.config.tts.unwrap();
+        assert_eq!(tts.speaker.unwrap(), "F1");
+        assert_eq!(tts.speed, Some(1.2));
+        
+        // Verify LLM fields
+        let llm = playbook.config.llm.unwrap();
+        assert_eq!(llm.model.unwrap(), "gpt-4o");
+        assert_eq!(llm.api_key.unwrap(), "sk-test-12345");
+        assert_eq!(llm.base_url.unwrap(), "https://api.example.com");
+
+        unsafe {
+            std::env::remove_var("TEST_MODEL_ALL");
+            std::env::remove_var("TEST_API_KEY_ALL");
+            std::env::remove_var("TEST_BASE_URL_ALL");
+            std::env::remove_var("TEST_SPEAKER_ALL");
+            std::env::remove_var("TEST_LANGUAGE_ALL");
+            std::env::remove_var("TEST_SPEED_ALL");
         }
     }
 }

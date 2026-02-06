@@ -80,6 +80,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         ));
 
         {
@@ -154,6 +155,7 @@ mod tests {
             TrackConfig::default(),
             None,
             false,
+            None,
             None,
             None,
         ));
@@ -242,6 +244,7 @@ pub struct ActiveCallState {
     pub refer_callstate: Option<ActiveCallStateRef>,
     pub extras: Option<HashMap<String, serde_json::Value>>,
     pub is_refer: bool,
+    pub sip_hangup_headers_template: Option<HashMap<String, String>>,
 
     // Runtime state (migrated from ActiveCall to reduce multiple locks)
     pub tts_handle: Option<SynthesisHandle>,
@@ -319,6 +322,7 @@ impl ActiveCall {
         dump_events: bool,
         server_side_track_id: Option<TrackId>,
         extras: Option<HashMap<String, serde_json::Value>>,
+        sip_hangup_headers_template: Option<HashMap<String, String>>,
     ) -> Self {
         let event_sender = crate::event::create_event_sender();
         let cmd_sender = tokio::sync::broadcast::Sender::<Command>::new(32);
@@ -332,6 +336,7 @@ impl ActiveCall {
             ssrc: rand::random::<u32>(),
             extras,
             audio_receiver,
+            sip_hangup_headers_template,
             ..Default::default()
         }));
         Self {
@@ -502,7 +507,7 @@ impl ActiveCall {
                                     session_id = self.session_id,
                                     ssrc, "auto hangup when track end track_id:{}", track_id
                                 );
-                                self.do_hangup(Some(hangup_reason), None).await.ok();
+                                self.do_hangup(Some(hangup_reason), None, None).await.ok();
                             }
                         }
 
@@ -531,7 +536,7 @@ impl ActiveCall {
                             session_id = self.session_id,
                             track_id, "inactivity timeout reached, hanging up"
                         );
-                        self.do_hangup(Some(CallRecordHangupReason::InactivityTimeout), None)
+                        self.do_hangup(Some(CallRecordHangupReason::InactivityTimeout), None, None)
                             .await
                             .ok();
                     }
@@ -645,12 +650,16 @@ impl ActiveCall {
                 self.do_play(url, play_id, auto_hangup, wait_input_timeout)
                     .await
             }
-            Command::Hangup { reason, initiator } => {
+            Command::Hangup {
+                reason,
+                initiator,
+                headers,
+            } => {
                 let reason = reason.map(|r| {
                     r.parse::<CallRecordHangupReason>()
                         .unwrap_or(CallRecordHangupReason::BySystem)
                 });
-                self.do_hangup(reason, initiator).await
+                self.do_hangup(reason, initiator, headers).await
             }
             Command::Refer {
                 caller,
@@ -773,7 +782,7 @@ impl ActiveCall {
                     code: None,
                 };
                 self.event_sender.send(error_event).ok();
-                self.do_hangup(Some(CallRecordHangupReason::BySystem), None)
+                self.do_hangup(Some(CallRecordHangupReason::BySystem), None, None)
                     .await
                     .ok();
                 return Err(e);
@@ -809,7 +818,7 @@ impl ActiveCall {
                     code: Some(486),
                 };
                 self.event_sender.send(rejet_event).ok();
-                self.do_hangup(Some(CallRecordHangupReason::BySystem), None)
+                self.do_hangup(Some(CallRecordHangupReason::BySystem), None, None)
                     .await
                     .ok();
                 return Err(anyhow::anyhow!("no pending call to accept"));
@@ -1094,13 +1103,37 @@ impl ActiveCall {
         &self,
         reason: Option<CallRecordHangupReason>,
         initiator: Option<String>,
+        headers: Option<HashMap<String, String>>,
     ) -> Result<()> {
         info!(
             session_id = self.session_id,
             ?reason,
             ?initiator,
+            ?headers,
             "do_hangup"
         );
+
+        // Store headers in extras if provided
+        if let Some(headers) = headers {
+            let h_val = serde_json::to_value(&headers).unwrap_or_default();
+
+            // Update ActiveCallState extras
+            {
+                let mut state = self.call_state.write().await;
+                let mut extras = state.extras.take().unwrap_or_default();
+                extras.insert("_sip_headers".to_string(), h_val.clone());
+                state.extras = Some(extras);
+            }
+
+            // Update AppState pending_params for retrieval by PlaybookInvitationHandler (for SIP BYE)
+            {
+                let mut pending = self.app_state.pending_params.lock().await;
+                let params = pending
+                    .entry(self.session_id.clone())
+                    .or_insert_with(std::collections::HashMap::new);
+                params.insert("_sip_headers".to_string(), h_val);
+            }
+        }
 
         // Set hangup reason based on initiator and reason
         let hangup_reason = match initiator.as_deref() {

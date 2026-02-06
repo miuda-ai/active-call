@@ -85,6 +85,22 @@ impl PlaybookInvitationHandler {
 
         self.default.clone()
     }
+
+    fn extract_custom_headers(
+        headers: &rsip::Headers,
+    ) -> std::collections::HashMap<String, serde_json::Value> {
+        let mut extras = std::collections::HashMap::new();
+        for header in headers.iter() {
+            if let rsip::Header::Other(name, value) = header {
+                // Capture all custom headers, Playbook logic can filter them later using `sip.extract_headers` if needed
+                extras.insert(
+                    name.to_string(),
+                    serde_json::Value::String(value.to_string()),
+                );
+            }
+        }
+        extras
+    }
 }
 
 #[async_trait]
@@ -106,6 +122,14 @@ impl InvitationHandler for PlaybookInvitationHandler {
                     dialog_id,
                     caller, callee, playbook, "matched playbook for invite"
                 );
+
+                // Extract custom headers
+                let extras = Self::extract_custom_headers(&invite_request.headers);
+
+                if !extras.is_empty() {
+                    let mut params = self.app_state.pending_params.lock().await;
+                    params.insert(dialog_id.clone(), extras);
+                }
 
                 // Store the playbook name in pending_playbooks
                 {
@@ -196,6 +220,43 @@ impl InvitationHandler for PlaybookInvitationHandler {
                         _ = cancel_token_clone.cancelled() => {
                             info!(session_id, "SIP call cancelled");
                         }
+                    }
+
+                    // Attempt to retrieve custom headers for BYE
+                    let headers = {
+                        let mut params = app_state.pending_params.lock().await;
+                        // remove returns the map of extras for this session
+                        if let Some(extras) = params.remove(&session_id) {
+                            if let Some(h_val) = extras.get("_sip_headers") {
+                                if let Ok(h_map) = serde_json::from_value::<
+                                    std::collections::HashMap<String, String>,
+                                >(h_val.clone())
+                                {
+                                    Some(h_map)
+                                } else if let serde_json::Value::String(s) = h_val {
+                                    // Handle case where set_var stores it as a string
+                                    serde_json::from_str::<std::collections::HashMap<String, String>>(s).ok()
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    };
+
+                    let sip_headers = headers.map(|h_map| {
+                        h_map
+                            .into_iter()
+                            .map(|(k, v)| rsip::Header::Other(k.into(), v.into()))
+                            .collect::<Vec<_>>()
+                    });
+
+                    // Terminate the SIP dialog
+                    if let Err(e) = dialog.bye_with_headers(sip_headers).await {
+                        warn!(session_id, "Failed to send BYE: {}", e);
                     }
                 });
 
@@ -362,5 +423,27 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.err().unwrap().to_string();
         assert!(err_msg.contains("invalid caller regex"));
+    }
+
+    #[test]
+    fn test_extract_custom_headers() {
+        use rsip::Header;
+
+        let mut headers = rsip::Headers::default();
+        headers.push(Header::ContentLength(10.into())); // Standard header (ignored)
+        headers.push(Header::Other("X-Tenant-ID".into(), "123".into()));
+        headers.push(Header::Other("Custom-Header".into(), "xyz".into()));
+
+        let extras = PlaybookInvitationHandler::extract_custom_headers(&headers);
+
+        assert_eq!(extras.len(), 2);
+        assert_eq!(
+            extras.get("X-Tenant-ID").unwrap(),
+            &serde_json::Value::String("123".to_string())
+        );
+        assert_eq!(
+            extras.get("Custom-Header").unwrap(),
+            &serde_json::Value::String("xyz".to_string())
+        );
     }
 }

@@ -25,6 +25,14 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 
+
+fn filter_headers(
+    extras: &mut std::collections::HashMap<String, serde_json::Value>,
+    allowed_headers: &[String],
+) {
+    extras.retain(|k, _| allowed_headers.iter().any(|h| h.eq_ignore_ascii_case(k)));
+}
+
 pub fn call_router() -> Router<AppState> {
     let r = Router::new()
         .route("/call", get(ws_handler))
@@ -93,6 +101,13 @@ pub async fn call_handler_core(
 ) {
     let _cancel_guard = cancel_token.clone().drop_guard();
     let track_config = TrackConfig::default();
+
+    // Check for pending params (extracted headers)
+    let extras = {
+        let mut pending = app_state.pending_params.lock().await;
+        pending.remove(&session_id)
+    };
+
     let active_call = Arc::new(ActiveCall::new(
         call_type.clone(),
         cancel_token.clone(),
@@ -103,7 +118,8 @@ pub async fn call_handler_core(
         Some(audio_receiver),
         dump_events,
         server_side_track,
-        None, // No extra data for now
+        extras,
+        None, 
     ));
 
     // Check for pending playbook
@@ -124,8 +140,21 @@ pub async fn call_handler_core(
             };
 
             match playbook_result {
-                Ok(playbook) => match PlaybookRunner::new(playbook, active_call.clone()) {
-                    Ok(runner) => {
+                Ok(playbook) => {
+                    // Filter extracted headers if configured (only for SIP calls)
+                    if call_type == ActiveCallType::Sip {
+                        if let Some(sip_config) = &playbook.config.sip {
+                            if let Some(allowed_headers) = &sip_config.extract_headers {
+                                let mut state = active_call.call_state.write().await;
+                                if let Some(extras) = &mut state.extras {
+                                    filter_headers(extras, allowed_headers);
+                                }
+                            }
+                        }
+                    }
+
+                    match PlaybookRunner::new(playbook, active_call.clone()) {
+                        Ok(runner) => {
                         crate::spawn(async move {
                             runner.run().await;
                         });
@@ -147,7 +176,8 @@ pub async fn call_handler_core(
                             "Failed to create runner {}: {}", display_name, e
                         )
                     }
-                },
+                }
+            },
                 Err(e) => {
                     let display_name = if name_or_content.trim().starts_with("---") {
                         "custom content"
@@ -240,6 +270,15 @@ pub async fn call_handler_core(
     match r {
         Ok(_) => info!(session_id, "call ended successfully"),
         Err(e) => warn!(session_id, "call ended with error: {}", e),
+    }
+
+    // Write back final extras to pending_params for post-call processing (e.g. BYE headers)
+    if call_type == ActiveCallType::Sip {
+        let state = active_call.call_state.read().await;
+        if let Some(extras) = &state.extras {
+            let mut pending = app_state.pending_params.lock().await;
+            pending.insert(session_id.clone(), extras.clone());
+        }
     }
 
     active_call.cleanup().await.ok();
@@ -414,5 +453,35 @@ impl IntoWsMessage for crate::event::SessionEvent {
             }
             event => serde_json::to_string(&event).map(|payload| Message::Text(payload.into())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_filter_headers() {
+        let mut extras = HashMap::new();
+        extras.insert("X-Tenant-ID".to_string(), json!("123"));
+        extras.insert("X-User-ID".to_string(), json!("456"));
+        extras.insert("Custom-Header".to_string(), json!("abc"));
+        extras.insert("Irrelevant-Header".to_string(), json!("ignore"));
+
+        // Test case-insensitive matching
+        let allowed = vec!["x-tenant-id".to_string(), "Custom-Header".to_string()];
+
+        filter_headers(&mut extras, &allowed);
+
+        assert!(extras.contains_key("X-Tenant-ID"));
+        assert!(extras.contains_key("Custom-Header"));
+        assert!(!extras.contains_key("X-User-ID"));
+        assert!(!extras.contains_key("Irrelevant-Header"));
+        
+        // ensure values are preserved
+        assert_eq!(extras.get("X-Tenant-ID").unwrap(), &json!("123"));
+        assert_eq!(extras.get("Custom-Header").unwrap(), &json!("abc"));
     }
 }

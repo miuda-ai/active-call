@@ -16,7 +16,7 @@ interruption:
 # Scene: greeting
 <play file="prompts/welcome.wav" />
 <dtmf digit="1" action="goto" scene="product_info" />
-<dtmf digit="2" action="transfer" target="sip:sales@cloudtech.com" />
+<dtmf digit="2" action="transfer" target="sip:sales@miuda.ai" />
 
 You are a friendly AI receptionist for "CloudTech Solutions".
 Your goal is to greet the caller and ask if they are interested in our new AI services.
@@ -24,7 +24,7 @@ Mention that they can press 1 to hear about products, 2 to talk to sales, or 0 a
 
 - If the user says "yes" or expresses interest, tell them you'll give some details and switch to the next stage using: <goto scene="product_info" />
 - If the user says "no" or is not interested, go to the closing scene: <goto scene="closing" />
-- If they ask for a human, refer them: <refer to="sip:human@cloudtech.com" />
+- If they ask for a human, refer them: <refer to="sip:human@miuda.ai" />
 
 # Scene: product_info
 <play file="prompts/product_intro.wav" />

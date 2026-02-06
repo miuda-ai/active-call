@@ -11,7 +11,7 @@ keywords = ["sip", "voip", "telephony", "voice-agent", "webrtc"]
 categories = ["network-programming", "multimedia"]
 
 [features]
-default = ["opus", "offline", "ort"]
+default = ["opus", "offline"]
 opus = ["dep:opusic-sys"]
 offline = [
     "dep:symphonia",
@@ -20,8 +20,7 @@ offline = [
     "dep:hf-hub",
     "dep:ndarray",
 ]
-ort = ["ort/download-binaries"]
-cross = ["opus", "offline", "aws-lc-rs/bindgen", "ort/load-dynamic"]
+cross = ["opus", "offline", "aws-lc-rs/bindgen"]
 not_vad = []
 
 [dependencies]
@@ -104,6 +103,7 @@ ort = { version = "=2.0.0-rc.11", default-features = false, features = [
     "std",
     "ndarray",
     "tls-rustls",
+    "load-dynamic",
 ], optional = true }
 knf-rs-sys = { version = "0.3.2", optional = true }
 
@@ -120,3 +120,4 @@ tokio-test = "0.4.5"
 mockall = "0.14.0"
 portpicker = "0.1.1"
 dotenvy = "0.15.7"
+wiremock = "0.6"

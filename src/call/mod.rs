@@ -74,6 +74,7 @@ pub enum Command {
     Hangup {
         reason: Option<String>,
         initiator: Option<String>,
+        headers: Option<HashMap<String, String>>,
     },
     Refer {
         caller: String,

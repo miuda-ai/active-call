@@ -1315,7 +1315,7 @@ mod tests {
                 _ = &mut timeout => break,
             }
         }
-
+        println!("Received bytes: {}", received_bytes);
         // Ideally we should receive everything (5000 bytes) or at least progress to seq 1
         // If bug exists, we might only get chunk0 (1000 bytes) and then get stuck.
         cancel_token.cancel();

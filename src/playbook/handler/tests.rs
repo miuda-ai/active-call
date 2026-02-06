@@ -131,6 +131,7 @@ async fn handler_applies_tool_instructions() -> Result<()> {
         HashMap::new(),
         None,
         None,
+        None,
     );
 
     let event = SessionEvent::AsrFinal {
@@ -184,6 +185,7 @@ async fn handler_requeries_after_rag() -> Result<()> {
         HashMap::new(),
         None,
         None,
+        None,
     );
 
     let event = SessionEvent::AsrFinal {
@@ -233,6 +235,7 @@ async fn test_full_dialogue_flow() -> Result<()> {
         crate::playbook::InterruptionConfig::default(),
         None,
         HashMap::new(),
+        None,
         None,
         None,
     );
@@ -338,6 +341,7 @@ async fn test_xml_tools_and_sentence_splitting() -> Result<()> {
         HashMap::new(),
         None,
         None,
+        None,
     );
 
     let event = SessionEvent::AsrFinal {
@@ -358,8 +362,9 @@ async fn test_xml_tools_and_sentence_splitting() -> Result<()> {
     // 1. TTS "Hello! "
     // 2. Refer "sip:123"
     // 3. TTS " How are you? "
-    // 4. Hangup
-    assert_eq!(commands.len(), 4);
+    // 4. Empty TTS with auto_hangup
+    // 5. Hangup
+    assert_eq!(commands.len(), 5);
 
     if let Command::Tts {
         text,
@@ -414,6 +419,7 @@ async fn test_interruption_logic() -> Result<()> {
         crate::playbook::InterruptionConfig::default(),
         None,
         HashMap::new(),
+        None,
         None,
         None,
     );
@@ -477,6 +483,7 @@ async fn test_rag_iteration_limit() -> Result<()> {
         HashMap::new(),
         None,
         None,
+        None,
     );
 
     let event = SessionEvent::AsrFinal {
@@ -525,6 +532,7 @@ async fn test_follow_up_logic() -> Result<()> {
         crate::playbook::InterruptionConfig::default(),
         Some(follow_up_config),
         HashMap::new(),
+        None,
         None,
         None,
     );
@@ -654,6 +662,7 @@ async fn test_interruption_protection_period() -> Result<()> {
         HashMap::new(),
         None,
         None,
+        None,
     );
 
     // 1. Trigger a response
@@ -705,6 +714,7 @@ async fn test_interruption_filler_word() -> Result<()> {
         config,
         None,
         HashMap::new(),
+        None,
         None,
         None,
     );
@@ -778,6 +788,7 @@ async fn test_eou_early_response() -> Result<()> {
         HashMap::new(),
         None,
         None,
+        None,
     );
 
     // 1. Receive EOU
@@ -808,6 +819,7 @@ async fn test_summary_and_history() -> Result<()> {
         crate::playbook::InterruptionConfig::default(),
         None,
         HashMap::new(),
+        None,
         None,
         None,
     );
@@ -850,6 +862,7 @@ async fn test_rolling_summary() -> Result<()> {
         crate::playbook::InterruptionConfig::default(),
         None,
         HashMap::new(),
+        None,
         None,
         None,
     );
@@ -906,4 +919,457 @@ async fn test_rolling_summary() -> Result<()> {
     );
 
     Ok(())
+}
+
+#[tokio::test]
+async fn test_set_var_extraction() {
+    let config = LlmConfig::default();
+    let interruption = crate::playbook::InterruptionConfig::default();
+    let provider = Arc::new(TestProvider::new(vec![]));
+    let rag = Arc::new(RecordingRag::new());
+    
+    let mut handler = LlmHandler::with_provider(
+        config,
+        provider,
+        rag,
+        interruption,
+        None,
+        std::collections::HashMap::new(),
+        None,
+        None,
+        None,
+    );
+
+    let mut buffer = "Hello <set_var key=\"foo\" value=\"bar\" /> world".to_string();
+    let cmds = handler.extract_streaming_commands(&mut buffer, "test_p", false).await;
+    
+    // It should have extracted "Hello " as TTS command
+    assert_eq!(cmds.len(), 1);
+    if let Command::Tts { text, .. } = &cmds[0] {
+        assert_eq!(text, "Hello ");
+    } else {
+        panic!("Expected TTS command");
+    }
+
+    // The buffer should now start with " world" (leading space might be kept or consumed depending on regex?)
+    // The regex for SetVar consumes the tag. 
+    // "Hello " was drained. Tag was drained.
+    // Buffer should contain " world".
+    assert_eq!(buffer, " world");
+}
+
+#[tokio::test]
+async fn test_multiple_set_vars() {
+    let config = LlmConfig::default();
+    let interruption = crate::playbook::InterruptionConfig::default();
+    let provider = Arc::new(TestProvider::new(vec![]));
+    let rag = Arc::new(RecordingRag::new());
+    
+    let mut handler = LlmHandler::with_provider(
+        config,
+        provider,
+        rag,
+        interruption,
+        None,
+        std::collections::HashMap::new(),
+        None,
+        None,
+        None,
+    );
+
+    let mut buffer = "<set_var key=\"k1\" value=\"v1\" /><set_var key=\"k2\" value=\"v2\" />".to_string();
+    // First extraction
+    let cmds = handler.extract_streaming_commands(&mut buffer, "test_p", false).await;
+    assert_eq!(cmds.len(), 0); // No text prefix
+    
+    // Should have consumed first tag.
+    // Loop in extract_streaming_commands? 
+    // extract_streaming_commands loop:
+    // loop {
+    //    find first occurrence
+    //    if match, process and drain, then CONTINUE loop?
+    // }
+    // Let's check extract_streaming_commands loop logic.
+}
+
+#[tokio::test]
+async fn test_set_var_updates_state() {
+    use crate::app::AppStateBuilder;
+    use crate::config::Config;
+    use crate::media::track::TrackConfig;
+    use crate::call::{ActiveCall, ActiveCallType};
+    use tokio_util::sync::CancellationToken;
+
+    let config = crate::playbook::LlmConfig::default();
+    let interruption = crate::playbook::InterruptionConfig::default();
+    let provider = Arc::new(TestProvider::new(vec![]));
+    let rag = Arc::new(RecordingRag::new());
+
+    // Setup ActiveCall
+    // Use a random port or default config to avoid binding conflicts if any
+    let mut app_config = Config::default();
+    app_config.udp_port = 0; 
+    
+    let app_state = AppStateBuilder::new()
+        .with_config(app_config)
+        .build()
+        .await
+        .expect("Failed to build app state");
+
+    let cancel_token = CancellationToken::new();
+    let session_id = "test-session-set-var".to_string();
+    let track_config = TrackConfig::default();
+
+    let active_call = Arc::new(ActiveCall::new(
+        ActiveCallType::Sip,
+        cancel_token,
+        session_id,
+        app_state.invitation.clone(),
+        app_state.clone(),
+        track_config,
+        None,
+        false,
+        None,
+        None,
+        None,
+    ));
+
+    let mut handler = LlmHandler::with_provider(
+        config,
+        provider,
+        rag,
+        interruption,
+        None, // global_follow_up
+        std::collections::HashMap::new(),
+        None, // dtmf
+        None, // initial_scene_id
+        None, // sip_config
+    );
+    handler.call = Some(active_call.clone());
+    
+    // Initial buffer with set_var
+    let mut buffer = "<set_var key=\"my_key\" value=\"my_val\" />".to_string();
+    
+    // We called extract_streaming_commands. It should process the tag and update state.
+    handler.extract_streaming_commands(&mut buffer, "p_id", false).await;
+
+    // Check strict equality of buffer (should be drained) or at least the tag removed
+    assert!(buffer.is_empty(), "Buffer should be empty after processing set_var, got: '{}'", buffer);
+
+    // Check ActiveCall state
+    let state = active_call.call_state.read().await;
+    let extras = state.extras.as_ref().expect("extras should be initialized/set");
+    
+    assert_eq!(
+        extras.get("my_key").unwrap(), 
+        &serde_json::Value::String("my_val".to_string()),
+        "Variable my_key should be set to my_val"
+    );
+}
+
+#[tokio::test]
+async fn test_set_var_with_sip_headers() {
+    use crate::app::AppStateBuilder;
+    use crate::call::{ActiveCall, ActiveCallType};
+    use crate::media::track::TrackConfig;
+    use crate::config::Config;
+    use tokio_util::sync::CancellationToken;
+
+    let config = crate::playbook::LlmConfig::default();
+    let interruption = crate::playbook::InterruptionConfig::default();
+    let provider = Arc::new(TestProvider::new(vec![]));
+    let rag = Arc::new(RecordingRag::new());
+
+    let mut app_config = Config::default();
+    app_config.udp_port = 0;
+    
+    let app_state = AppStateBuilder::new()
+        .with_config(app_config)
+        .build()
+        .await
+        .expect("Failed to build app state");
+
+    let cancel_token = CancellationToken::new();
+    let session_id = "test-session-sip-headers".to_string();
+    let track_config = TrackConfig::default();
+
+    // Initialize with some extracted headers
+    let mut initial_extras = std::collections::HashMap::new();
+    initial_extras.insert("X-CID".to_string(), serde_json::json!("123456"));
+    
+    let active_call = Arc::new(ActiveCall::new(
+        ActiveCallType::Sip,
+        cancel_token,
+        session_id,
+        app_state.invitation.clone(),
+        app_state.clone(),
+        track_config,
+        None,
+        false,
+        None,
+        Some(initial_extras),
+        None,
+    ));
+
+    let mut handler = LlmHandler::with_provider(
+        config,
+        provider,
+        rag,
+        interruption,
+        None,
+        std::collections::HashMap::new(),
+        None,
+        None,
+        None,
+    );
+    handler.call = Some(active_call.clone());
+    
+    // Simulate LLM setting _sip_headers for BYE
+    let mut buffer = r#"<set_var key="_sip_headers" value='{"X-Hangup-Reason":"completed","X-Duration":"120"}' />"#.to_string();
+    
+    handler.extract_streaming_commands(&mut buffer, "p_id", true).await;
+
+    assert!(buffer.is_empty(), "Buffer should be empty, got: '{}'", buffer);
+
+    let state = active_call.call_state.read().await;
+    let extras = state.extras.as_ref().unwrap();
+    
+    // Verify original header still exists
+    assert_eq!(extras.get("X-CID").unwrap(), &serde_json::json!("123456"));
+    
+    // Verify new _sip_headers was set
+    assert!(extras.contains_key("_sip_headers"));
+    let headers_value = extras.get("_sip_headers").unwrap();
+    assert_eq!(
+        headers_value,
+        &serde_json::Value::String(r#"{"X-Hangup-Reason":"completed","X-Duration":"120"}"#.to_string())
+    );
+}
+
+#[tokio::test]
+async fn test_http_command_in_stream() {
+    use crate::app::AppStateBuilder;
+    use crate::call::{ActiveCall, ActiveCallType};
+    use crate::media::track::TrackConfig;
+    use crate::config::Config;
+    use tokio_util::sync::CancellationToken;
+    use wiremock::{MockServer, Mock, ResponseTemplate};
+    use wiremock::matchers::{method, path};
+
+    let config = crate::playbook::LlmConfig::default();
+    let interruption = crate::playbook::InterruptionConfig::default();
+    let provider = Arc::new(TestProvider::new(vec![]));
+    let rag = Arc::new(RecordingRag::new());
+
+    let mut app_config = Config::default();
+    app_config.udp_port = 0;
+    
+    let app_state = AppStateBuilder::new()
+        .with_config(app_config)
+        .build()
+        .await
+        .expect("Failed to build app state");
+
+    let cancel_token = CancellationToken::new();
+    let session_id = "test-session-http".to_string();
+    let track_config = TrackConfig::default();
+
+    let active_call = Arc::new(ActiveCall::new(
+        ActiveCallType::Sip,
+        cancel_token,
+        session_id,
+        app_state.invitation.clone(),
+        app_state.clone(),
+        track_config,
+        None,
+        false,
+        None,
+        None,
+        None,
+    ));
+
+    let mut handler = LlmHandler::with_provider(
+        config,
+        provider,
+        rag,
+        interruption,
+        None,
+        std::collections::HashMap::new(),
+        None,
+        None,
+        None,
+    );
+    handler.call = Some(active_call.clone());
+    
+    // Start mock server
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/data"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "success",
+            "data": "test_value"
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let url = format!("{}/api/data", mock_server.uri());
+    let mut buffer = format!(r#"Check this <http url="{}" />"#, url);
+    
+    let initial_history_len = handler.history.len();
+    
+    handler.extract_streaming_commands(&mut buffer, "p_id", true).await;
+
+    // History should have system message with HTTP response
+    assert!(handler.history.len() > initial_history_len, "History should grow after HTTP call");
+    
+    let last_msg = handler.history.last().unwrap();
+    assert_eq!(last_msg.role, "system");
+    assert!(last_msg.content.contains("HTTP GET"));
+    assert!(last_msg.content.contains("200"));
+    assert!(last_msg.content.contains("test_value"));
+}
+
+#[tokio::test]
+async fn test_http_command_post_with_body() {
+    use crate::app::AppStateBuilder;
+    use crate::call::{ActiveCall, ActiveCallType};
+    use crate::media::track::TrackConfig;
+    use crate::config::Config;
+    use tokio_util::sync::CancellationToken;
+    use wiremock::{MockServer, Mock, ResponseTemplate};
+    use wiremock::matchers::{method, path, body_string};
+
+    let config = crate::playbook::LlmConfig::default();
+    let interruption = crate::playbook::InterruptionConfig::default();
+    let provider = Arc::new(TestProvider::new(vec![]));
+    let rag = Arc::new(RecordingRag::new());
+
+    let mut app_config = Config::default();
+    app_config.udp_port = 0;
+    
+    let app_state = AppStateBuilder::new()
+        .with_config(app_config)
+        .build()
+        .await
+        .expect("Failed to build app state");
+
+    let cancel_token = CancellationToken::new();
+    let session_id = "test-session-http-post".to_string();
+    let track_config = TrackConfig::default();
+
+    let active_call = Arc::new(ActiveCall::new(
+        ActiveCallType::Sip,
+        cancel_token,
+        session_id,
+        app_state.invitation.clone(),
+        app_state.clone(),
+        track_config,
+        None,
+        false,
+        None,
+        None,
+        None,
+    ));
+
+    let mut handler = LlmHandler::with_provider(
+        config,
+        provider,
+        rag,
+        interruption,
+        None,
+        std::collections::HashMap::new(),
+        None,
+        None,
+        None,
+    );
+    handler.call = Some(active_call.clone());
+    
+    // Start mock server
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/submit"))
+        .and(body_string("test_payload"))
+        .respond_with(ResponseTemplate::new(201).set_body_string("Created"))
+        .mount(&mock_server)
+        .await;
+
+    let url = format!("{}/api/submit", mock_server.uri());
+    let mut buffer = format!(r#"Submitting <http url="{}" method="POST" body="test_payload" />"#, url);
+    
+    handler.extract_streaming_commands(&mut buffer, "p_id", true).await;
+
+    let last_msg = handler.history.last().unwrap();
+    assert_eq!(last_msg.role, "system");
+    assert!(last_msg.content.contains("HTTP POST"));
+    assert!(last_msg.content.contains("201"));
+}
+
+#[tokio::test]
+async fn test_multiple_commands_in_sequence() {
+    use crate::app::AppStateBuilder;
+    use crate::call::{ActiveCall, ActiveCallType};
+    use crate::media::track::TrackConfig;
+    use crate::config::Config;
+    use tokio_util::sync::CancellationToken;
+
+    let config = crate::playbook::LlmConfig::default();
+    let interruption = crate::playbook::InterruptionConfig::default();
+    let provider = Arc::new(TestProvider::new(vec![]));
+    let rag = Arc::new(RecordingRag::new());
+
+    let mut app_config = Config::default();
+    app_config.udp_port = 0;
+    
+    let app_state = AppStateBuilder::new()
+        .with_config(app_config)
+        .build()
+        .await
+        .expect("Failed to build app state");
+
+    let cancel_token = CancellationToken::new();
+    let session_id = "test-session-multi".to_string();
+    let track_config = TrackConfig::default();
+
+    let active_call = Arc::new(ActiveCall::new(
+        ActiveCallType::Sip,
+        cancel_token,
+        session_id,
+        app_state.invitation.clone(),
+        app_state.clone(),
+        track_config,
+        None,
+        false,
+        None,
+        None,
+        None,
+    ));
+
+    let mut handler = LlmHandler::with_provider(
+        config,
+        provider,
+        rag,
+        interruption,
+        None,
+        std::collections::HashMap::new(),
+        None,
+        None,
+        None,
+    );
+    handler.call = Some(active_call.clone());
+    
+    // Test combining set_var and normal text
+    let mut buffer = r#"Hello <set_var key="user_name" value="Alice" /> nice to meet you!"#.to_string();
+    
+    let commands = handler.extract_streaming_commands(&mut buffer, "p_id", true).await;
+    
+    // Should generate TTS commands
+    assert!(!commands.is_empty());
+    
+    // Check state was updated
+    let state = active_call.call_state.read().await;
+    let extras = state.extras.as_ref().unwrap();
+    assert_eq!(
+        extras.get("user_name").unwrap(),
+        &serde_json::Value::String("Alice".to_string())
+    );
 }

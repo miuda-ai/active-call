@@ -362,6 +362,31 @@ impl DialogStateReceiverGuard {
             }
             _ = self.dialog_event_loop(&mut states) => {}
         };
+
+        // Update hangup headers from ActiveCallState if available
+        {
+            let state = states.call_state.read().await;
+            if let Some(extras) = &state.extras {
+                if let Some(h_val) = extras.get("_sip_headers") {
+                    if let Ok(headers_map) =
+                        serde_json::from_value::<HashMap<String, String>>(h_val.clone())
+                    {
+                        let mut headers = Vec::new();
+                        for (k, v) in headers_map {
+                            headers.push(rsip::Header::Other(k.into(), v.into()));
+                        }
+                        if !headers.is_empty() {
+                            if let Some(existing) = &mut self.hangup_headers {
+                                existing.extend(headers);
+                            } else {
+                                self.hangup_headers = Some(headers);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         self.drop_async().await;
     }
 }

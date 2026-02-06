@@ -332,6 +332,7 @@ async fn test_webrtc_call_workflow() -> Result<()> {
     let hangup_cmd = Command::Hangup {
         reason: None,
         initiator: None,
+        headers: None,
     };
     ws_stream
         .send(Message::Text(serde_json::to_string(&hangup_cmd)?.into()))
