@@ -615,6 +615,17 @@ impl AppStateInner {
                 return Ok(());
             }
         };
+        // Check if the target URI matches one of our own addresses
+        let target_host = &target_uri.host_with_port;
+        for our_addr in  self.endpoint.get_addrs() {
+            if our_addr.addr == *target_host {
+                // Target is this server, respond with OK
+                if let Err(e) = tx.reply(rsip::StatusCode::OK).await {
+                    warn!("error replying to REGISTER: {:?}", e);
+                }
+                return Ok(());
+            }
+        }
 
         let mut headers: Vec<rsip::Header> = tx.original.headers.clone().into();
         // Decrement Max-Forwards header
