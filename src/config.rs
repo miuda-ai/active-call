@@ -296,6 +296,7 @@ impl Default for Config {
             udp_port: default_sip_port(),
             useragent: None,
             register_users: None,
+            sip_register_proxy: None,
             graceful_shutdown: Some(true),
             handler: None,
             accept_timeout: Some("50s".to_string()),
