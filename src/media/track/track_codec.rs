@@ -51,6 +51,7 @@ impl TrackCodec {
         payload_type_map.insert(9, CodecType::G722);
         payload_type_map.insert(18, CodecType::G729);
         payload_type_map.insert(101, CodecType::TelephoneEvent);
+        #[cfg(feature = "opus")]
         payload_type_map.insert(111, CodecType::Opus);
 
         Self {
@@ -101,6 +102,7 @@ impl TrackCodec {
                 8 => CodecType::PCMA,
                 9 => CodecType::G722,
                 18 => CodecType::G729,
+                #[cfg(feature = "opus")]
                 111 => CodecType::Opus,
                 _ => CodecType::PCMU,
             });

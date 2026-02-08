@@ -784,7 +784,7 @@ impl Track for RtcTrack {
                             marker,
                             ..Default::default()
                         };
-                        source.send_audio(frame).await.ok();
+                        source.try_send_audio(frame).ok();
                     }
                 }
                 crate::media::Samples::RTP {
@@ -792,11 +792,8 @@ impl Track for RtcTrack {
                     payload_type,
                     sequence_number,
                 } => {
-                    let clock_rate = match *payload_type {
-                        0 | 8 | 9 | 18 => 8000,
-                        111 => 48000,
-                        _ => packet.sample_rate,
-                    };
+                    let target_codec = CodecType::try_from(*payload_type)?;
+                    let clock_rate = target_codec.clock_rate();
 
                     let now = Instant::now();
                     if let Some(last_time) = self.last_packet_time {
@@ -835,7 +832,7 @@ impl Track for RtcTrack {
                         marker,
                         ..Default::default()
                     };
-                    source.send_audio(frame).await.ok();
+                    source.try_send_audio(frame).ok();
                 }
                 _ => {}
             }
@@ -851,11 +848,13 @@ impl RtcTrack {
         }
 
         self.rtc_config.payload_type.unwrap_or_else(|| {
-            match self.rtc_config.preferred_codec.unwrap_or(CodecType::Opus) {
+            match self.rtc_config.preferred_codec.unwrap_or(CodecType::G722) {
                 CodecType::PCMU => 0,
                 CodecType::PCMA => 8,
+                #[cfg(feature = "opus")]
                 CodecType::Opus => 111,
                 CodecType::G722 => 9,
+                CodecType::G729 => 18,
                 _ => 111,
             }
         })

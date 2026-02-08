@@ -1443,6 +1443,7 @@ impl ActiveCall {
                     "pcma" => codec_types.push(CodecType::PCMA),
                     "g722" => codec_types.push(CodecType::G722),
                     "g729" => codec_types.push(CodecType::G729),
+                    #[cfg(feature = "opus")]
                     "opus" => codec_types.push(CodecType::Opus),
                     "dtmf" | "2833" | "telephone_event" => {
                         codec_types.push(CodecType::TelephoneEvent)
@@ -1819,6 +1820,7 @@ impl ActiveCall {
                     "pcma" => codec_types.push(CodecType::PCMA),
                     "g722" => codec_types.push(CodecType::G722),
                     "g729" => codec_types.push(CodecType::G729),
+                    #[cfg(feature = "opus")]
                     "opus" => codec_types.push(CodecType::Opus),
                     "dtmf" | "2833" | "telephone_event" => {
                         codec_types.push(CodecType::TelephoneEvent)
