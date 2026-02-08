@@ -186,6 +186,7 @@ pub struct Config {
     #[serde(default = "default_config_useragent")]
     pub useragent: Option<String>,
     pub register_users: Option<Vec<RegisterOption>>,
+    pub sip_register_proxy: Option<bool>,
     #[serde(default = "default_graceful_shutdown")]
     pub graceful_shutdown: Option<bool>,
     pub handler: Option<InviteHandlerConfig>,

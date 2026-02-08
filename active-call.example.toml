@@ -3,7 +3,7 @@
 # CLI Options (override config file):
 #   --conf <path>          : Load configuration from file
 #   --http <addr:port>     : HTTP server bind address
-#   --sip <addr:port>      : SIP server bind address  
+#   --sip <addr:port>      : SIP server bind address
 #   --handler <value>      : Quick handler setup
 #                            - URL (http://...) for webhook handler
 #                            - .md file for playbook default handler
@@ -33,6 +33,10 @@ media_cache_path = "./config/mediacache"
 # rtp_start_port = 20000
 # rtp_end_port = 30000
 
+# SIP REGISTER requests against the active-call instance will be forwarded
+# to the upstream server specified in the To header.
+# sip_register_proxy = true
+
 # setup your STUN/TURN servers here, for webrtc web clients
 # [[ice_servers]]
 # urls = ["stun:stun.l.google.com:19302"]
@@ -53,16 +57,16 @@ media_cache_path = "./config/mediacache"
 # [handler]
 # type = "playbook"
 # default = "default.md"  # optional: default playbook when no rules match
-# 
+#
 # [[handler.rules]]
 # caller = "^\\+1\\d{10}$"        # regex pattern for caller number
 # callee = "^sip:support@.*"      # regex pattern for callee number
 # playbook = "support.md"         # playbook file to use
-# 
+#
 # [[handler.rules]]
 # caller = "^\\+86\\d+"           # pattern for Chinese numbers
 # playbook = "chinese.md"         # optional: only match caller
-# 
+#
 # [[handler.rules]]
 # callee = "^sip:sales@.*"        # optional: only match callee
 # playbook = "sales.md"

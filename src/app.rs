@@ -349,7 +349,7 @@ impl AppStateInner {
                     info!(?key, "ignoring out-of-dialog OPTIONS request");
                     continue;
                 }
-                rsip::Method::Register => {
+                rsip::Method::Register if self.config.sip_register_proxy == Some(true) => {
                     if let Err(e) = self.forward_register(tx).await {
                         warn!("error forwarding registration: {:?}", e);
                     }
