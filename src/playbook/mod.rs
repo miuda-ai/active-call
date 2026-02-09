@@ -148,56 +148,50 @@ pub struct Scene {
 
 #[derive(Debug, Clone)]
 pub struct Playbook {
+    pub raw_content: String,
     pub config: PlaybookConfig,
     pub scenes: HashMap<String, Scene>,
     pub initial_scene_id: Option<String>,
 }
 
 impl Playbook {
-    pub async fn load<P: AsRef<Path>>(
-        path: P,
-        variables: Option<&HashMap<String, serde_json::Value>>,
-    ) -> Result<Self> {
+    pub async fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let content = fs::read_to_string(path).await?;
-        Self::parse(&content, variables)
+        Self::parse(&content)
     }
 
-    pub fn parse(
-        content: &str,
-        variables: Option<&HashMap<String, serde_json::Value>>,
-    ) -> Result<Self> {
-        let rendered_content = if let Some(vars) = variables {
-            let env = Environment::new();
-            let mut context = vars.clone();
+    pub fn render(&self, vars: &HashMap<String, serde_json::Value>) -> Result<Self> {
+        let env = Environment::new();
+        let mut context = vars.clone();
 
-            // Get the list of SIP header keys stored by extract_headers processing
-            // If not present, sip dict will be empty (no headers were configured for extraction)
-            let sip_header_keys: Vec<String> = vars
-                .get("_sip_header_keys")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or_default();
+        // Get the list of SIP header keys stored by extract_headers processing
+        // If not present, sip dict will be empty (no headers were configured for extraction)
+        let sip_header_keys: Vec<String> = vars
+            .get("_sip_header_keys")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
 
-            // Separate SIP headers into sip dictionary based on stored keys
-            let mut sip_headers = HashMap::new();
-            for key in &sip_header_keys {
-                if let Some(value) = vars.get(key) {
-                    sip_headers.insert(key.clone(), value.clone());
-                }
+        // Separate SIP headers into sip dictionary based on stored keys
+        let mut sip_headers = HashMap::new();
+        for key in &sip_header_keys {
+            if let Some(value) = vars.get(key) {
+                sip_headers.insert(key.clone(), value.clone());
             }
-            context.insert(
-                "sip".to_string(),
-                serde_json::to_value(&sip_headers).unwrap_or(Value::Null),
-            );
-            env.render_str(content, &context)?
-        } else {
-            content.to_string()
-        };
+        }
+        context.insert(
+            "sip".to_string(),
+            serde_json::to_value(&sip_headers).unwrap_or(Value::Null),
+        );
+        let rendered = env.render_str(&self.raw_content, &context)?;
+        Self::parse(&rendered)
+    }
 
-        if !rendered_content.starts_with("---") {
+    pub fn parse(content: &str) -> Result<Self> {
+        if !content.starts_with("---") {
             return Err(anyhow!("Missing front matter"));
         }
 
-        let parts: Vec<&str> = rendered_content.splitn(3, "---").collect();
+        let parts: Vec<&str> = content.splitn(3, "---").collect();
         if parts.len() < 3 {
             return Err(anyhow!("Invalid front matter format"));
         }
@@ -346,6 +340,7 @@ impl Playbook {
         }
 
         Ok(Self {
+            raw_content: content.to_string(),
             config,
             scenes,
             initial_scene_id: first_scene_id,
@@ -371,8 +366,10 @@ mod tests {
         let content = r#"---
 llm:
   provider: openai
-  model: {{ model_name }}
-  greeting: Hello, {{ user_name }}!
+  model: |-
+    {{ model_name }}
+  greeting: |-
+    Hello, {{ user_name }}!
 ---
 # Scene: main
 You are an assistant for {{ company }}.
@@ -382,8 +379,10 @@ You are an assistant for {{ company }}.
         variables.insert("user_name".to_string(), json!("Alice"));
         variables.insert("company".to_string(), json!("RestSend"));
 
-        let playbook = Playbook::parse(content, Some(&variables)).unwrap();
-
+        let playbook = Playbook::parse(content)
+            .unwrap()
+            .render(&variables)
+            .unwrap();
         assert_eq!(
             playbook.config.llm.as_ref().unwrap().model,
             Some("gpt-4".to_string())
@@ -409,7 +408,7 @@ llm:
 <dtmf digit="0" action="hangup" />
 Welcome to our service.
 "#;
-        let playbook = Playbook::parse(content, None).unwrap();
+        let playbook = Playbook::parse(content).unwrap();
 
         let scene = playbook.scenes.get("main").unwrap();
         assert_eq!(scene.prompt, "Welcome to our service.");
@@ -446,7 +445,7 @@ dtmf:
 <dtmf digit="1" action="goto" scene="local_dest" />
 Welcome.
 "#;
-        let playbook = Playbook::parse(content, None).unwrap();
+        let playbook = Playbook::parse(content).unwrap();
 
         // Check global config
         let global_dtmf = playbook.config.dtmf.as_ref().unwrap();
@@ -479,7 +478,7 @@ llm:
 # Scene: main
 Hello
 "#;
-        let playbook = Playbook::parse(content, None).unwrap();
+        let playbook = Playbook::parse(content).unwrap();
         let posthook = playbook.config.posthook.unwrap();
         assert_eq!(posthook.url, "http://test.com");
         match posthook.summary.unwrap() {
@@ -511,7 +510,7 @@ llm:
 # Scene: main
 Test
 "#;
-        let playbook = Playbook::parse(content, None).unwrap();
+        let playbook = Playbook::parse(content).unwrap();
         let llm = playbook.config.llm.unwrap();
 
         assert_eq!(llm.api_key.unwrap(), "sk-test-12345");
@@ -536,7 +535,7 @@ llm:
 # Scene: main
 Test
 "#;
-        let playbook = Playbook::parse(content, None).unwrap();
+        let playbook = Playbook::parse(content).unwrap();
         let llm = playbook.config.llm.unwrap();
 
         // Should keep the placeholder if env var not found
@@ -555,7 +554,7 @@ llm:
 # Scene: main
 Hello
 "#;
-        let playbook = Playbook::parse(content, None).unwrap();
+        let playbook = Playbook::parse(content).unwrap();
         let posthook = playbook.config.posthook.unwrap();
         match posthook.summary.unwrap() {
             SummaryType::Custom(s) => assert_eq!(s, "Please summarize customly"),
@@ -585,8 +584,10 @@ Session type: {{ sip["X-Session-Type"] }}.
             json!(["X-Customer-Name", "X-Customer-ID", "X-Session-Type"]),
         );
 
-        let playbook = Playbook::parse(content, Some(&variables)).unwrap();
-
+        let playbook = Playbook::parse(content)
+            .unwrap()
+            .render(&variables)
+            .unwrap();
         assert_eq!(
             playbook.config.llm.as_ref().unwrap().greeting,
             Some("Hello Alice!".to_string())
@@ -617,7 +618,10 @@ Regular var: {{ regular_var }}
         // Only X-Custom-Header is extracted
         variables.insert("_sip_header_keys".to_string(), json!(["X-Custom-Header"]));
 
-        let playbook = Playbook::parse(content, Some(&variables)).unwrap();
+        let playbook = Playbook::parse(content)
+            .unwrap()
+            .render(&variables)
+            .unwrap();
         let scene = playbook.scenes.get("main").unwrap();
 
         // Both should work - SIP header via sip dict, regular var via direct access
@@ -644,7 +648,10 @@ SIP via Direct: {{ X_Custom_Header2 }}
         // Only X-Custom-Header is in extract_headers
         variables.insert("_sip_header_keys".to_string(), json!(["X-Custom-Header"]));
 
-        let playbook = Playbook::parse(content, Some(&variables)).unwrap();
+        let playbook = Playbook::parse(content)
+            .unwrap()
+            .render(&variables)
+            .unwrap();
         let scene = playbook.scenes.get("main").unwrap();
 
         assert!(scene.prompt.contains("Direct: direct_value"));
@@ -663,7 +670,7 @@ llm:
 # Scene: main
 No variables here.
 "#;
-        let playbook = Playbook::parse(content, None).unwrap();
+        let playbook = Playbook::parse(content).unwrap();
         let scene = playbook.scenes.get("main").unwrap();
         assert_eq!(scene.prompt, "No variables here.");
     }
@@ -687,7 +694,10 @@ Lower: {{ sip["x-header-lower"] }}
             json!(["X-Header-Upper", "x-header-lower"]),
         );
 
-        let playbook = Playbook::parse(content, Some(&variables)).unwrap();
+        let playbook = Playbook::parse(content)
+            .unwrap()
+            .render(&variables)
+            .unwrap();
         let scene = playbook.scenes.get("main").unwrap();
 
         assert!(scene.prompt.contains("Upper: UPPER"));
@@ -724,7 +734,7 @@ llm:
 Test content
 "#;
 
-        let playbook = Playbook::parse(content, None).unwrap();
+        let playbook = Playbook::parse(content).unwrap();
 
         // Verify ASR fields
         let asr = playbook.config.asr.unwrap();
@@ -765,7 +775,10 @@ Querying API: <http url='https://api.example.com/customers/{{ sip["X-Customer-ID
         variables.insert("X-Customer-ID".to_string(), json!("CUST12345"));
         variables.insert("_sip_header_keys".to_string(), json!(["X-Customer-ID"]));
 
-        let playbook = Playbook::parse(content, Some(&variables)).unwrap();
+        let playbook = Playbook::parse(content)
+            .unwrap()
+            .render(&variables)
+            .unwrap();
         let scene = playbook.scenes.get("main").unwrap();
 
         // The HTTP tag should be preserved in the prompt with the variable expanded
@@ -791,7 +804,10 @@ SIP dict should be empty.
         variables.insert("regular_var".to_string(), json!("regular_value"));
         // No _sip_header_keys, so sip dict should be empty
 
-        let playbook = Playbook::parse(content, Some(&variables)).unwrap();
+        let playbook = Playbook::parse(content)
+            .unwrap()
+            .render(&variables)
+            .unwrap();
         let scene = playbook.scenes.get("main").unwrap();
 
         assert!(scene.prompt.contains("Regular var: regular_value"));
@@ -816,7 +832,8 @@ How can I help you today?
             json!(["X-Customer-Name", "X-Customer-ID"]),
         );
 
-        let playbook = Playbook::parse(content, Some(&variables)).unwrap();
+        let playbook = Playbook::parse(content).unwrap();
+        let playbook = playbook.render(&variables).unwrap();
 
         assert_eq!(
             playbook.config.llm.as_ref().unwrap().greeting,
@@ -840,9 +857,9 @@ This will fail: {{ X-Customer-ID }}
 
         // This should fail because X-Customer-ID is not in the direct context
         // It's only in sip dict
-        let result = Playbook::parse(content, Some(&variables));
-
-        // The parse should fail with a template error
+        let playbook = Playbook::parse(content).unwrap();
+        let result = playbook.render(&variables);
+        // Templates are not checked during parsing anymore
         assert!(result.is_err());
     }
 
@@ -862,7 +879,10 @@ Status set successfully.
         variables.insert("X-Customer-ID".to_string(), json!("CUST456"));
         variables.insert("_sip_header_keys".to_string(), json!(["X-Customer-ID"]));
 
-        let playbook = Playbook::parse(content, Some(&variables)).unwrap();
+        let playbook = Playbook::parse(content)
+            .unwrap()
+            .render(&variables)
+            .unwrap();
         let scene = playbook.scenes.get("main").unwrap();
 
         assert!(scene.prompt.contains("Customer: CUST456"));
@@ -898,7 +918,10 @@ Order count: {{ order_count }}
             json!(["X-Customer-Name", "X-Customer-ID", "X-Priority"]),
         );
 
-        let playbook = Playbook::parse(content, Some(&variables)).unwrap();
+        let playbook = Playbook::parse(content)
+            .unwrap()
+            .render(&variables)
+            .unwrap();
 
         // Check greeting has both types
         assert_eq!(

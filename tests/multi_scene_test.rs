@@ -59,7 +59,7 @@ This is the detail part.
     let path = "test_multi_scene.md";
     std::fs::write(path, content).unwrap();
 
-    let playbook = Playbook::load(path, None).await.unwrap();
+    let playbook = Playbook::load(path).await.unwrap();
     assert_eq!(playbook.scenes.len(), 2);
     assert!(playbook.scenes.contains_key("intro"));
     assert!(playbook.scenes.contains_key("detail"));

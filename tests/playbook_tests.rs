@@ -26,7 +26,7 @@ Hello, I am an AI assistant.
     let path = "test_playbook.md";
     fs::write(path, content).unwrap();
 
-    let playbook = Playbook::load(path, None).await.unwrap();
+    let playbook = Playbook::load(path).await.unwrap();
     assert_eq!(
         playbook
             .config
@@ -94,6 +94,7 @@ async fn test_aliyun_llm_integration() {
         config,
         scenes: Default::default(),
         initial_scene_id: None,
+        raw_content: String::new(),
     };
 
     let mut history = Vec::new();
@@ -162,7 +163,7 @@ Hello
     let path = "test_playbook_recorder.md";
     fs::write(path, content).unwrap();
 
-    let playbook = Playbook::load(path, None).await.unwrap();
+    let playbook = Playbook::load(path).await.unwrap();
     assert_eq!(
         playbook.config.recorder.as_ref().unwrap().recorder_file,
         "records/{id}.wav"

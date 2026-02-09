@@ -125,9 +125,8 @@ pub async fn call_handler_core(
     {
         let mut pending = app_state.pending_playbooks.lock().await;
         if let Some(name_or_content) = pending.remove(&session_id) {
-            let variables = active_call.call_state.read().await.extras.clone();
             let playbook_result = if name_or_content.trim().starts_with("---") {
-                Playbook::parse(&name_or_content, variables.as_ref())
+                Playbook::parse(&name_or_content)
             } else {
                 // If path already contains config/playbook, use it as-is; otherwise prepend it
                 let path = if name_or_content.starts_with("config/playbook/") {
@@ -135,11 +134,11 @@ pub async fn call_handler_core(
                 } else {
                     PathBuf::from("config/playbook").join(&name_or_content)
                 };
-                Playbook::load(path, variables.as_ref()).await
+                Playbook::load(path).await
             };
 
             match playbook_result {
-                Ok(playbook) => {
+                Ok(mut playbook) => {
                     // Filter extracted headers if configured (only for SIP calls)
                     if call_type == ActiveCallType::Sip {
                         if let Some(sip_config) = &playbook.config.sip {
@@ -157,6 +156,9 @@ pub async fn call_handler_core(
                                         "_sip_header_keys".to_string(),
                                         serde_json::to_value(&header_keys).unwrap_or_default(),
                                     );
+                                    if let Ok(result) = playbook.render(extras) {
+                                        playbook = result;
+                                    }
                                 }
                             }
                         }
