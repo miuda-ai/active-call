@@ -182,8 +182,17 @@ impl Playbook {
             "sip".to_string(),
             serde_json::to_value(&sip_headers).unwrap_or(Value::Null),
         );
+
         let rendered = env.render_str(&self.raw_content, &context)?;
-        Self::parse(&rendered)
+        let mut res = Self::parse(&rendered)?;
+        res.config.sip.as_mut().map(|sip| {
+            sip.hangup_headers = self
+                .config
+                .sip
+                .as_ref()
+                .and_then(|sip| sip.hangup_headers.clone());
+        });
+        Ok(res)
     }
 
     pub fn parse(content: &str) -> Result<Self> {
