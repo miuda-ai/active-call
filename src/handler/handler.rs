@@ -278,6 +278,12 @@ pub async fn call_handler_core(
             cancel_token.cancel();
         }
     };
+    // drain events
+    while let Ok(event) = event_receiver.try_recv() {
+        if let Err(_) = event_sender_to_client.send(event) {
+            break;
+        }
+    }
     match r {
         Ok(_) => info!(session_id, "call ended successfully"),
         Err(e) => warn!(session_id, "call ended with error: {}", e),
@@ -385,9 +391,6 @@ pub async fn call_handler(
             },
             _ = send_to_ws_loop => {
                 info!(session_id, "WebSocket send loop ended");
-            },
-            _ = cancel_token.cancelled() => {
-                info!(session_id, "WebSocket cancelled");
             },
         }
 
