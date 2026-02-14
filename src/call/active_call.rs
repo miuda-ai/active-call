@@ -332,9 +332,27 @@ impl ActiveCall {
             .with_id(session_id.clone())
             .with_cancel_token(cancel_token.child_token());
         let media_stream = Arc::new(media_stream_builder.build());
+        let start_time = Utc::now();
+        // Inject built-in session variables into extras
+        let call_type_str = match &call_type {
+            ActiveCallType::Sip => "sip",
+            ActiveCallType::WebSocket => "websocket",
+            ActiveCallType::Webrtc => "webrtc",
+            ActiveCallType::B2bua => "b2bua",
+        };
+        let extras = {
+            let mut e = extras.unwrap_or_default();
+            e.entry(crate::playbook::BUILTIN_SESSION_ID.to_string())
+                .or_insert_with(|| serde_json::Value::String(session_id.clone()));
+            e.entry(crate::playbook::BUILTIN_CALL_TYPE.to_string())
+                .or_insert_with(|| serde_json::Value::String(call_type_str.to_string()));
+            e.entry(crate::playbook::BUILTIN_START_TIME.to_string())
+                .or_insert_with(|| serde_json::Value::String(start_time.to_rfc3339()));
+            Some(e)
+        };
         let call_state = Arc::new(RwLock::new(ActiveCallState {
             session_id: session_id.clone(),
-            start_time: Utc::now(),
+            start_time,
             ssrc: rand::random::<u32>(),
             extras,
             audio_receiver,

@@ -178,9 +178,60 @@ pub struct ChatMessage {
 pub struct Scene {
     pub id: String,
     pub prompt: String,
+    /// The original unrendered prompt template, preserved for dynamic re-rendering
+    /// with updated variables (e.g., after set_var during conversation).
+    pub raw_prompt: Option<String>,
     pub dtmf: Option<HashMap<String, DtmfAction>>,
     pub play: Option<String>,
     pub follow_up: Option<FollowUpConfig>,
+}
+
+/// Built-in session variable key constants.
+/// These are automatically injected into `extras` so they can be referenced
+/// in playbook templates using `{{ session_id }}`, `{{ call_type }}`, etc.
+pub const BUILTIN_SESSION_ID: &str = "session_id";
+pub const BUILTIN_CALL_TYPE: &str = "call_type";
+pub const BUILTIN_CALLER: &str = "caller";
+pub const BUILTIN_CALLEE: &str = "callee";
+pub const BUILTIN_START_TIME: &str = "start_time";
+
+/// Render a scene prompt template dynamically using the current variables.
+/// This allows `set_var` values set during conversation to be used in scene prompts.
+///
+/// If `raw_prompt` is `None` or rendering fails, falls back to the pre-rendered `prompt`.
+pub fn render_scene_prompt(scene: &Scene, vars: &HashMap<String, serde_json::Value>) -> String {
+    let template = match &scene.raw_prompt {
+        Some(t) if t.contains("{{") => t,
+        _ => return scene.prompt.clone(),
+    };
+
+    let env = Environment::new();
+    let mut context = vars.clone();
+
+    // Build sip dictionary from _sip_header_keys (same logic as Playbook::render)
+    let sip_header_keys: Vec<String> = vars
+        .get("_sip_header_keys")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+
+    let mut sip_headers = HashMap::new();
+    for key in &sip_header_keys {
+        if let Some(value) = vars.get(key) {
+            sip_headers.insert(key.clone(), value.clone());
+        }
+    }
+    context.insert(
+        "sip".to_string(),
+        serde_json::to_value(&sip_headers).unwrap_or(Value::Null),
+    );
+
+    // Remove internal keys from context
+    context.retain(|k, _| !k.starts_with('_'));
+
+    match env.render_str(template, &context) {
+        Ok(rendered) => rendered,
+        Err(_) => scene.prompt.clone(),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -222,6 +273,14 @@ impl Playbook {
 
         let rendered = env.render_str(&self.raw_content, &context)?;
         let mut res = Self::parse(&rendered)?;
+        // Preserve the original raw_content (with templates) for dynamic re-rendering
+        res.raw_content = self.raw_content.clone();
+        // Preserve original raw_prompts from the unrendered playbook for dynamic re-rendering
+        for (scene_id, scene) in &self.scenes {
+            if let Some(res_scene) = res.scenes.get_mut(scene_id) {
+                res_scene.raw_prompt = scene.raw_prompt.clone();
+            }
+        }
         res.config.sip.as_mut().map(|sip| {
             sip.hangup_headers = self
                 .config
@@ -308,6 +367,7 @@ impl Playbook {
 
             Scene {
                 id,
+                raw_prompt: Some(final_content.clone()),
                 prompt: final_content,
                 dtmf: if dtmf_map.is_empty() {
                     None
@@ -981,5 +1041,196 @@ Order count: {{ order_count }}
         assert!(scene.prompt.contains("Your status: Active"));
         assert!(scene.prompt.contains("Your priority: VIP"));
         assert!(scene.prompt.contains("Order count: 5"));
+    }
+
+    #[test]
+    fn test_raw_prompt_preserved_after_render() {
+        // Test that raw_prompt is preserved after rendering so it can be re-rendered later
+        let content = r#"---
+llm:
+  provider: openai
+---
+# Scene: greeting
+您好，{{ customer_name }}！您的意图是：{{ intent }}
+# Scene: detail
+客户意图：{{ intent }}
+详细信息在此。
+"#;
+        let mut variables = HashMap::new();
+        variables.insert("customer_name".to_string(), json!("张三"));
+        variables.insert("intent".to_string(), json!("咨询"));
+
+        let playbook = Playbook::parse(content)
+            .unwrap()
+            .render(&variables)
+            .unwrap();
+
+        // Verify rendered prompts
+        let greeting = playbook.scenes.get("greeting").unwrap();
+        assert!(greeting.prompt.contains("您好，张三"));
+        assert!(greeting.prompt.contains("您的意图是：咨询"));
+
+        // Verify raw_prompt still has the template
+        assert!(greeting.raw_prompt.is_some());
+        let raw = greeting.raw_prompt.as_ref().unwrap();
+        assert!(raw.contains("{{ customer_name }}"));
+        assert!(raw.contains("{{ intent }}"));
+
+        // Verify detail scene too
+        let detail = playbook.scenes.get("detail").unwrap();
+        assert!(detail.raw_prompt.is_some());
+        assert!(detail.raw_prompt.as_ref().unwrap().contains("{{ intent }}"));
+    }
+
+    #[test]
+    fn test_render_scene_prompt_with_dynamic_vars() {
+        // Test render_scene_prompt: simulates set_var updating variables mid-conversation
+        let scene = Scene {
+            id: "main".to_string(),
+            raw_prompt: Some("客户意图：{{ intent }}\n客户ID：{{ sip[\"X-Jobid\"] }}".to_string()),
+            prompt: "客户意图：\n客户ID：JOB123".to_string(), // initially rendered
+            ..Default::default()
+        };
+
+        // Simulate variables after set_var has been called
+        let mut vars = HashMap::new();
+        vars.insert("intent".to_string(), json!("买零食"));
+        vars.insert("X-Jobid".to_string(), json!("JOB123"));
+        vars.insert("_sip_header_keys".to_string(), json!(["X-Jobid"]));
+
+        let rendered = render_scene_prompt(&scene, &vars);
+        assert!(rendered.contains("客户意图：买零食"));
+        assert!(rendered.contains("客户ID：JOB123"));
+    }
+
+    #[test]
+    fn test_render_scene_prompt_fallback_without_template() {
+        // When raw_prompt has no template markers, should return prompt as-is
+        let scene = Scene {
+            id: "simple".to_string(),
+            raw_prompt: Some("你好，欢迎光临".to_string()),
+            prompt: "你好，欢迎光临".to_string(),
+            ..Default::default()
+        };
+
+        let vars = HashMap::new();
+        let rendered = render_scene_prompt(&scene, &vars);
+        assert_eq!(rendered, "你好，欢迎光临");
+    }
+
+    #[test]
+    fn test_render_scene_prompt_fallback_no_raw_prompt() {
+        // When raw_prompt is None, should return prompt
+        let scene = Scene {
+            id: "legacy".to_string(),
+            prompt: "Hello world".to_string(),
+            ..Default::default()
+        };
+
+        let vars = HashMap::new();
+        let rendered = render_scene_prompt(&scene, &vars);
+        assert_eq!(rendered, "Hello world");
+    }
+
+    #[test]
+    fn test_render_scene_prompt_with_builtin_vars() {
+        // Test that built-in session variables work in scene prompts
+        let scene = Scene {
+            id: "main".to_string(),
+            raw_prompt: Some(
+                "会话ID：{{ session_id }}\n呼叫类型：{{ call_type }}\n主叫：{{ caller }}\n被叫：{{ callee }}\n开始时间：{{ start_time }}"
+                    .to_string(),
+            ),
+            prompt: String::new(),
+            ..Default::default()
+        };
+
+        let mut vars = HashMap::new();
+        vars.insert(BUILTIN_SESSION_ID.to_string(), json!("sess-12345"));
+        vars.insert(BUILTIN_CALL_TYPE.to_string(), json!("sip"));
+        vars.insert(BUILTIN_CALLER.to_string(), json!("sip:alice@example.com"));
+        vars.insert(BUILTIN_CALLEE.to_string(), json!("sip:bob@example.com"));
+        vars.insert(
+            BUILTIN_START_TIME.to_string(),
+            json!("2026-02-14T10:00:00Z"),
+        );
+
+        let rendered = render_scene_prompt(&scene, &vars);
+        assert!(rendered.contains("会话ID：sess-12345"));
+        assert!(rendered.contains("呼叫类型：sip"));
+        assert!(rendered.contains("主叫：sip:alice@example.com"));
+        assert!(rendered.contains("被叫：sip:bob@example.com"));
+        assert!(rendered.contains("开始时间：2026-02-14T10:00:00Z"));
+    }
+
+    #[test]
+    fn test_render_scene_prompt_mixed_sip_and_set_var() {
+        // Test mixed SIP headers and set_var variables in dynamic rendering
+        let scene = Scene {
+            id: "main".to_string(),
+            raw_prompt: Some(
+                "客户：{{ sip[\"X-Customer-Name\"] }}\n意图：{{ intent }}\n会话：{{ session_id }}"
+                    .to_string(),
+            ),
+            prompt: String::new(),
+            ..Default::default()
+        };
+
+        let mut vars = HashMap::new();
+        // SIP header
+        vars.insert("X-Customer-Name".to_string(), json!("王五"));
+        vars.insert("_sip_header_keys".to_string(), json!(["X-Customer-Name"]));
+        // set_var variable
+        vars.insert("intent".to_string(), json!("退货"));
+        // Built-in variable
+        vars.insert(BUILTIN_SESSION_ID.to_string(), json!("sess-99"));
+
+        let rendered = render_scene_prompt(&scene, &vars);
+        assert!(rendered.contains("客户：王五"));
+        assert!(rendered.contains("意图：退货"));
+        assert!(rendered.contains("会话：sess-99"));
+    }
+
+    #[test]
+    fn test_render_scene_prompt_graceful_on_missing_vars() {
+        // When a referenced variable is missing, MiniJinja renders it as empty string
+        // The render still succeeds but with empty values
+        let scene = Scene {
+            id: "main".to_string(),
+            raw_prompt: Some("意图：{{ intent }}".to_string()),
+            prompt: "意图：（未知）".to_string(), // fallback (not used since rendering succeeds)
+            ..Default::default()
+        };
+
+        let vars = HashMap::new(); // no intent variable
+        let rendered = render_scene_prompt(&scene, &vars);
+        // MiniJinja renders missing vars as empty string
+        assert_eq!(rendered, "意图：");
+    }
+
+    #[test]
+    fn test_raw_prompt_set_on_parse() {
+        // Verify that raw_prompt is set during initial parsing
+        let content = r#"---
+llm:
+  provider: openai
+---
+# Scene: main
+Hello {{ name }}!
+"#;
+        let playbook = Playbook::parse(content).unwrap();
+        let scene = playbook.scenes.get("main").unwrap();
+        assert!(scene.raw_prompt.is_some());
+        assert!(scene.raw_prompt.as_ref().unwrap().contains("{{ name }}"));
+    }
+
+    #[test]
+    fn test_builtin_var_constants() {
+        // Verify the built-in variable constant values
+        assert_eq!(BUILTIN_SESSION_ID, "session_id");
+        assert_eq!(BUILTIN_CALL_TYPE, "call_type");
+        assert_eq!(BUILTIN_CALLER, "caller");
+        assert_eq!(BUILTIN_CALLEE, "callee");
+        assert_eq!(BUILTIN_START_TIME, "start_time");
     }
 }

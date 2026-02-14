@@ -246,6 +246,11 @@ sip:
 # 4. System built-ins
 {{turn_count}}      # Conversation turn count
 {{summary}}         # Conversation summary
+{{session_id}}      # Unique session identifier
+{{call_type}}       # Call type (sip/websocket/webrtc/b2bua)
+{{caller}}          # Caller SIP URI (SIP only)
+{{callee}}          # Callee SIP URI (SIP only)
+{{start_time}}      # Call start time (RFC 3339)
 ```
 
 ## Common Questions
@@ -367,6 +372,8 @@ Current model: ${LLM_MODEL}  # Static, fixed at load time
 | Customer info | `{{X-Customer-Name}}` | Different per call |
 | Conversation state | `{{user_confirmed}}` | Changes at runtime |
 | HTTP response | `{{api_response}}` | Retrieved at runtime |
+| Session info | `{{session_id}}` | Built-in auto-injected |
+| Call type | `{{call_type}}` | Built-in auto-injected |
 
 **Remember**:
 - **`${VAR}`** = Configuration time (static) = Environment variables

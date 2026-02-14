@@ -100,6 +100,7 @@ async fn test_scene_transition_logic() -> Result<()> {
             dtmf: None,
             play: None,
             follow_up: None,
+            ..Default::default()
         },
     );
     scenes.insert(
@@ -110,6 +111,7 @@ async fn test_scene_transition_logic() -> Result<()> {
             dtmf: None,
             play: None,
             follow_up: None,
+            ..Default::default()
         },
     );
 

@@ -203,6 +203,112 @@ sip:
 
 ---
 
+## Built-in Session Variables
+
+The system automatically injects a set of built-in variables into `ActiveCall.extras` when a call is established. These can be used in prompts and templates without manual setup.
+
+### Variable List
+
+| Variable | Description | Example Value |
+|----------|-------------|---------------|
+| `session_id` | Unique call session identifier | `"abc123-def456"` |
+| `call_type` | Call type | `"sip"` / `"websocket"` / `"webrtc"` / `"b2bua"` |
+| `caller` | Caller SIP URI | `"sip:13800138000@domain.com"` |
+| `callee` | Callee SIP URI | `"sip:10086@domain.com"` |
+| `start_time` | Call start time (RFC 3339 format) | `"2025-01-15T10:30:00+08:00"` |
+
+### Usage in Prompts
+
+```markdown
+# Scene: main
+Session ID: {{ session_id }}
+Call type: {{ call_type }}
+Start time: {{ start_time }}
+Caller: {{ caller }}
+Callee: {{ callee }}
+```
+
+### Notes
+
+- Built-in variables use `entry().or_insert_with()` pattern, so they **won't override** externally passed variables with the same name
+- `caller` and `callee` are only available for SIP calls
+- All built-in variables can be used in prompts via dynamic rendering during scene switches
+
+---
+
+## Dynamic Scene Prompt Rendering
+
+### Problem Background
+
+In multi-scene Playbooks, prompt templates are rendered when the Playbook loads (`{{var}}` gets replaced). This means variables set via `<set_var>` during conversation **cannot** be referenced in other scene prompts.
+
+**Example**:
+```markdown
+# Scene: collect_info
+Please collect the user's intent.
+
+# Scene: confirm
+The user's intent is: {{ intent }}   ← intent doesn't exist at load time, renders to empty
+```
+
+### Solution
+
+Starting from v0.3.38, the system supports **dynamic scene prompt rendering**:
+
+1. When parsing the Playbook, the original template is preserved in `Scene.raw_prompt`
+2. Each time a scene switch occurs (`<goto>`), the prompt is re-rendered using current variables from `extras`
+3. On render failure, the system falls back to the existing prompt, ensuring uninterrupted conversation
+
+### Usage Example
+
+```markdown
+---
+sip:
+  extract_headers:
+    - "X-Jobid"
+llm:
+  provider: "openai"
+  model: "gpt-4o"
+---
+
+# Scene: collect
+You are an intent collection assistant.
+Please collect the user's purchase intent. After collection, output <set_var key="intent" value="user intent" /> then output <goto scene="confirm" />
+
+# Scene: confirm
+You are a confirmation assistant.
+Job ID: {{ sip["X-Jobid"] }}
+Session ID: {{ session_id }}
+User intent: {{ intent }}
+
+Please confirm the above information with the user.
+```
+
+**Execution Flow**:
+1. Call starts, enters `collect` scene
+2. LLM collects info and executes `<set_var key="intent" value="buy snacks" />`
+3. LLM outputs `<goto scene="confirm" />`
+4. System switches scene, reads `confirm` scene's `raw_prompt`, re-renders with current extras (including `intent="buy snacks"`, `session_id`, etc.)
+5. `confirm` scene's prompt becomes: "User intent: buy snacks", "Session ID: abc123"
+
+### Supported Variable Types
+
+All variable types are available during dynamic rendering:
+
+| Type | Example | Description |
+|------|---------|-------------|
+| `<set_var>` variables | `{{ intent }}` | Variables set during conversation |
+| SIP Headers | `{{ sip["X-Jobid"] }}` | Accessed via sip dictionary |
+| Built-in variables | `{{ session_id }}` | Auto-injected by system |
+
+### Error Handling
+
+- Referencing non-existent variables renders as empty string (MiniJinja default behavior)
+- Template syntax errors fall back to the existing prompt without interrupting the call
+- Render failures are logged with details for troubleshooting
+
+---
+
 ## Variable Management (`<set_var>`)
 
 ### Purpose
@@ -655,6 +761,7 @@ WEBHOOK_URL=https://webhook.example.com/call-summary
 
 ## Version History
 
+- **v0.3.38**: Built-in session variables (session_id, call_type, caller, callee, start_time); Dynamic scene prompt rendering (set_var variables applied to prompts on scene switch)
 - **v0.3.37**: Universal `${VAR_NAME}` support for all config fields
 - **v0.3.36**: Added `<http>` response injection
 - **v0.3.35**: SIP BYE headers customization

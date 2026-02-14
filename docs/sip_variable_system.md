@@ -25,6 +25,18 @@ Active-Call 的变量系统现在明确区分 **SIP Headers** 和 **普通变量
 - **访问方式**：`{{ var_name }}`
 - **用途**：业务逻辑相关的数据
 
+#### 内置会话变量（v0.3.38+）
+- **识别规则**：系统自动注入，无需配置
+- **来源**：通话建立时自动生成
+- **访问方式**：`{{ session_id }}`、`{{ call_type }}` 等
+- **变量列表**：
+  - `session_id` — 通话会话唯一标识
+  - `call_type` — 通话类型（`sip`/`websocket`/`webrtc`/`b2bua`）
+  - `caller` — 主叫方 SIP URI（仅 SIP 通话）
+  - `callee` — 被叫方 SIP URI（仅 SIP 通话）
+  - `start_time` — 通话开始时间（RFC 3339）
+- **特性**：不会覆盖外部传入的同名变量
+
 ### 2. 模板访问
 
 在 Playbook 的 YAML 配置和 Prompt 中，可以使用以下语法：
@@ -93,6 +105,33 @@ sip:
 <set_var key="agent_name" value="Alice" />
 <set_var key="call_duration" value="180" />
 ```
+
+## 动态场景 Prompt 渲染（v0.3.38+）
+
+从 v0.3.38 开始，通过 `<set_var>` 设置的变量可以在场景切换时动态渲染到目标场景的 Prompt 中。
+
+### 工作原理
+
+1. 解析 Playbook 时，原始模板保存在 `Scene.raw_prompt` 中
+2. 每次 `<goto>` 切换场景时，使用当前 `extras` 重新渲染
+3. 内置变量、SIP Headers、set_var 变量均可用
+4. 渲染失败时自动回退到已有 Prompt
+
+### 示例
+
+```markdown
+# Scene: collect
+请收集用户意向。收集后输出 <set_var key="intent" value="..." /> 然后 <goto scene="confirm" />
+
+# Scene: confirm
+会话ID：{{ session_id }}
+用户意向：{{ intent }}
+请确认以上信息。
+```
+
+切换到 `confirm` 场景时，`{{ intent }}` 和 `{{ session_id }}` 会被动态替换为实际值。
+
+详细说明参见 [Playbook Advanced Features](./playbook_advanced_features.md#动态场景-prompt-渲染)
 
 ## 实现细节
 

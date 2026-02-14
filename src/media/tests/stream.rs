@@ -378,6 +378,7 @@ async fn test_remove_processor() -> Result<()> {
 
     // Define a test processor
     struct TestProcessor {
+        #[allow(unused)]
         name: String,
     }
 
@@ -421,7 +422,7 @@ async fn test_append_processor() -> Result<()> {
 
     // Define a test processor
     struct AppendTestProcessor {
-        value: u32,
+        _value: u32,
     }
 
     impl Processor for AppendTestProcessor {
@@ -440,7 +441,7 @@ async fn test_append_processor() -> Result<()> {
     stream.update_track(Box::new(track), None).await;
 
     // Append a processor
-    let processor = Box::new(AppendTestProcessor { value: 42 });
+    let processor = Box::new(AppendTestProcessor { _value: 42 });
     let result = stream.append_processor(&track_id, processor).await;
     assert!(result.is_ok());
 

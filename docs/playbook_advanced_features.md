@@ -207,6 +207,112 @@ llm:
 
 ---
 
+## 内置会话变量
+
+系统会在通话建立时自动注入一组内置变量到 `ActiveCall.extras` 中，无需手动设置即可在 Prompt 和模板中使用。
+
+### 内置变量列表
+
+| 变量名 | 说明 | 示例值 |
+|--------|------|--------|
+| `session_id` | 通话会话唯一标识 | `"abc123-def456"` |
+| `call_type` | 通话类型 | `"sip"` / `"websocket"` / `"webrtc"` / `"b2bua"` |
+| `caller` | 主叫方 SIP URI | `"sip:13800138000@domain.com"` |
+| `callee` | 被叫方 SIP URI | `"sip:10086@domain.com"` |
+| `start_time` | 通话开始时间（RFC 3339 格式） | `"2025-01-15T10:30:00+08:00"` |
+
+### 在 Prompt 中使用
+
+```markdown
+# Scene: main
+当前会话ID：{{ session_id }}
+通话类型：{{ call_type }}
+开始时间：{{ start_time }}
+主叫号码：{{ caller }}
+被叫号码：{{ callee }}
+```
+
+### 注意事项
+
+- 内置变量使用 `entry().or_insert_with()` 模式注入，**不会覆盖**外部传入的同名变量
+- `caller` 和 `callee` 仅在 SIP 通话中可用
+- 所有内置变量都可以在场景切换时通过动态渲染在 Prompt 中使用
+
+---
+
+## 动态场景 Prompt 渲染
+
+### 问题背景
+
+在多场景 Playbook 中，Prompt 模板在 Playbook 加载时就会被渲染（`{{var}}` 被替换）。这意味着通过 `<set_var>` 在对话过程中设置的变量**无法**在其他场景的 Prompt 中被引用。
+
+**例如**：
+```markdown
+# Scene: collect_info
+请收集用户的意向信息。
+
+# Scene: confirm
+用户的意向是：{{ intent }}   ← 加载时 intent 尚不存在，渲染为空
+```
+
+### 解决方案
+
+从 v0.3.38 开始，系统支持**动态场景 Prompt 渲染**：
+
+1. 解析 Playbook 时，原始模板保存在 `Scene.raw_prompt` 中
+2. 每次切换场景（`<goto>`）时，使用当前 `extras` 中的变量重新渲染 Prompt
+3. 渲染失败时自动回退到已有的 Prompt，确保不影响正常对话
+
+### 使用示例
+
+```markdown
+---
+sip:
+  extract_headers:
+    - "X-Jobid"
+llm:
+  provider: "openai"
+  model: "gpt-4o"
+---
+
+# Scene: collect
+你是一个意向收集助手。
+请收集用户的购买意向。收集完毕后输出 <set_var key="intent" value="用户意向" /> 然后输出 <goto scene="confirm" />
+
+# Scene: confirm
+你是一个确认助手。
+工单编号：{{ sip["X-Jobid"] }}
+会话ID：{{ session_id }}
+用户意向：{{ intent }}
+
+请向用户确认以上信息是否正确。
+```
+
+**执行流程**：
+1. 通话开始，进入 `collect` 场景
+2. LLM 收集信息后执行 `<set_var key="intent" value="买零食" />`
+3. LLM 输出 `<goto scene="confirm" />`
+4. 系统切换场景时，读取 `confirm` 场景的 `raw_prompt`，使用当前 extras（含 `intent="买零食"`、`session_id` 等）重新渲染
+5. `confirm` 场景的 Prompt 变为："用户意向：买零食"，"会话ID：abc123"
+
+### 支持的变量类型
+
+动态渲染时可以使用以下所有变量：
+
+| 类型 | 示例 | 说明 |
+|------|------|------|
+| `<set_var>` 变量 | `{{ intent }}` | 对话中设置的变量 |
+| SIP Headers | `{{ sip["X-Jobid"] }}` | 通过 sip 字典访问 |
+| 内置变量 | `{{ session_id }}` | 系统自动注入 |
+
+### 容错机制
+
+- 引用不存在的变量时，渲染为空字符串（MiniJinja 默认行为）
+- 模板语法错误时，自动回退到原有 Prompt，不会中断通话
+- 日志记录渲染失败的详细信息，便于排查
+
+---
+
 ## 变量管理 (`<set_var>`)
 
 `<set_var>` 标签允许 LLM 在对话过程中动态设置或修改变量。
@@ -556,3 +662,14 @@ sip:
 - [Playbook 基础](./playbook_guide.md)
 - [SIP 集成](./sip_integration.md)
 - [API Reference](./api_reference.md)
+
+---
+
+## 版本历史
+
+- **v0.3.38**: 内置会话变量（session_id, call_type, caller, callee, start_time）；动态场景 Prompt 渲染（set_var 变量可在场景切换时应用到 Prompt）
+- **v0.3.37**: 通用 `${VAR_NAME}` 环境变量支持
+- **v0.3.36**: `<http>` 响应注入
+- **v0.3.35**: SIP BYE Headers 定制
+- **v0.3.34**: `<set_var>` 单/双引号支持
+- **v0.3.30**: SIP Headers 提取

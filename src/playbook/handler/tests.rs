@@ -1808,9 +1808,6 @@ async fn test_streaming_chunks_with_incomplete_set_var() {
 
     // Simulate the tag being split in the middle (incomplete buffer state)
     let incomplete_buffer1 = r#"好的，我帮您转接人工 <set_var key="hangupreason" value="Transfer"#;
-    let incomplete_buffer2 =
-        r#"好的，我帮您转接人工 <set_var key="hangupreason" value="Transfer"/> <hang"#;
-
     // Test that incomplete tags are NOT matched
     assert!(
         super::RE_SET_VAR.captures(incomplete_buffer1).is_none(),
@@ -1957,4 +1954,235 @@ async fn test_hangup_before_set_var_still_works() {
     // The headers should now contain the set values
     assert_eq!(headers.get("X-Hangupreason").unwrap(), "Transfer");
     assert_eq!(headers.get("X-Skillgroupid").unwrap(), "7084rx000003");
+}
+#[tokio::test]
+async fn test_dynamic_scene_prompt_rendering() {
+    use crate::app::AppStateBuilder;
+    use crate::call::{ActiveCall, ActiveCallType};
+    use crate::config::Config;
+    use crate::media::track::TrackConfig;
+    use crate::playbook::Scene;
+
+    let mut config = Config::default();
+    config.udp_port = 0;
+    let app_state = AppStateBuilder::new()
+        .with_config(config)
+        .build()
+        .await
+        .expect("Failed to build app state");
+
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    let session_id = "test-dynamic-prompt".to_string();
+    let track_config = TrackConfig::default();
+
+    // Initialize extras with SIP headers and built-in variables
+    let mut initial_extras = std::collections::HashMap::new();
+    initial_extras.insert("X-Jobid".to_string(), serde_json::json!("JOB-456"));
+    initial_extras.insert(
+        "_sip_header_keys".to_string(),
+        serde_json::json!(["X-Jobid"]),
+    );
+
+    let active_call = Arc::new(ActiveCall::new(
+        ActiveCallType::Sip,
+        cancel_token,
+        session_id.clone(),
+        app_state.invitation.clone(),
+        app_state.clone(),
+        track_config,
+        None,
+        false,
+        None,
+        Some(initial_extras),
+        None,
+    ));
+
+    // Create scenes with raw_prompt templates
+    let mut scenes = std::collections::HashMap::new();
+    scenes.insert(
+        "greeting".to_string(),
+        Scene {
+            id: "greeting".to_string(),
+            raw_prompt: Some(
+                "您好，客户意图：{{ intent }}\nJob ID：{{ sip[\"X-Jobid\"] }}".to_string(),
+            ),
+            prompt: "您好，客户意图：\nJob ID：JOB-456".to_string(),
+            ..Default::default()
+        },
+    );
+    scenes.insert(
+        "detail".to_string(),
+        Scene {
+            id: "detail".to_string(),
+            raw_prompt: Some("处理意图：{{ intent }}\n会话：{{ session_id }}".to_string()),
+            prompt: "处理意图：\n会话：".to_string(),
+            ..Default::default()
+        },
+    );
+
+    let llm_config = LlmConfig {
+        provider: "mock".to_string(),
+        prompt: Some("初始prompt".to_string()),
+        ..Default::default()
+    };
+
+    let provider = Arc::new(TestProvider::new(vec!["好的".to_string()]));
+    let mut handler = LlmHandler::with_provider(
+        llm_config,
+        provider,
+        Arc::new(NoopRagRetriever),
+        crate::playbook::InterruptionConfig::default(),
+        None,
+        scenes,
+        None,
+        None,
+        Some("greeting".to_string()),
+        None,
+    );
+    handler.call = Some(active_call.clone());
+
+    // Simulate set_var: LLM sets intent during conversation
+    {
+        let mut state = active_call.call_state.write().await;
+        let mut extras = state.extras.take().unwrap_or_default();
+        extras.insert(
+            "intent".to_string(),
+            serde_json::Value::String("买零食".to_string()),
+        );
+        state.extras = Some(extras);
+    }
+
+    // Now switch to greeting scene, it should dynamically render with the latest variables
+    let commands = handler.switch_to_scene("greeting", false).await.unwrap();
+    // The commands should be empty since greeting scene has no play url
+    assert!(commands.is_empty());
+
+    // Check that the system prompt was dynamically rendered with intent
+    let system_msg = &handler.history[0];
+    assert_eq!(system_msg.role, "system");
+    assert!(
+        system_msg.content.contains("客户意图：买零食"),
+        "System prompt should contain dynamically rendered intent, got: {}",
+        system_msg.content
+    );
+    assert!(
+        system_msg.content.contains("Job ID：JOB-456"),
+        "System prompt should contain SIP header value, got: {}",
+        system_msg.content
+    );
+
+    // Switch to detail scene, should also render dynamically
+    let _ = handler.switch_to_scene("detail", false).await.unwrap();
+    let system_msg = &handler.history[0];
+    assert!(
+        system_msg.content.contains("处理意图：买零食"),
+        "Detail scene should have rendered intent, got: {}",
+        system_msg.content
+    );
+    // Built-in session_id should be available
+    assert!(
+        system_msg
+            .content
+            .contains(&format!("会话：{}", session_id)),
+        "Detail scene should have session_id, got: {}",
+        system_msg.content
+    );
+}
+
+#[tokio::test]
+async fn test_dynamic_prompt_with_builtin_vars() {
+    use crate::app::AppStateBuilder;
+    use crate::call::{ActiveCall, ActiveCallType};
+    use crate::config::Config;
+    use crate::media::track::TrackConfig;
+    use crate::playbook::{BUILTIN_CALL_TYPE, BUILTIN_SESSION_ID, BUILTIN_START_TIME, Scene};
+
+    let mut config = Config::default();
+    config.udp_port = 0;
+    let app_state = AppStateBuilder::new()
+        .with_config(config)
+        .build()
+        .await
+        .expect("Failed to build app state");
+
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    let session_id = "session-builtin-test".to_string();
+    let track_config = TrackConfig::default();
+
+    let active_call = Arc::new(ActiveCall::new(
+        ActiveCallType::Sip,
+        cancel_token,
+        session_id.clone(),
+        app_state.invitation.clone(),
+        app_state.clone(),
+        track_config,
+        None,
+        false,
+        None,
+        None,
+        None,
+    ));
+
+    // Verify built-in variables were injected
+    {
+        let state = active_call.call_state.read().await;
+        let extras = state.extras.as_ref().expect("extras should exist");
+        assert_eq!(
+            extras.get(BUILTIN_SESSION_ID).and_then(|v| v.as_str()),
+            Some("session-builtin-test"),
+        );
+        assert_eq!(
+            extras.get(BUILTIN_CALL_TYPE).and_then(|v| v.as_str()),
+            Some("sip"),
+        );
+        assert!(extras.get(BUILTIN_START_TIME).is_some());
+    }
+
+    // Create a scene that uses built-in variables
+    let mut scenes = std::collections::HashMap::new();
+    scenes.insert(
+        "main".to_string(),
+        Scene {
+            id: "main".to_string(),
+            raw_prompt: Some("会话：{{ session_id }}\n类型：{{ call_type }}".to_string()),
+            prompt: "会话：\n类型：".to_string(),
+            ..Default::default()
+        },
+    );
+
+    let llm_config = LlmConfig {
+        provider: "mock".to_string(),
+        prompt: Some("test".to_string()),
+        ..Default::default()
+    };
+
+    let provider = Arc::new(TestProvider::new(vec![]));
+    let mut handler = LlmHandler::with_provider(
+        llm_config,
+        provider,
+        Arc::new(NoopRagRetriever),
+        crate::playbook::InterruptionConfig::default(),
+        None,
+        scenes,
+        None,
+        None,
+        Some("main".to_string()),
+        None,
+    );
+    handler.call = Some(active_call.clone());
+
+    let _ = handler.switch_to_scene("main", false).await.unwrap();
+    let system_msg = &handler.history[0];
+    assert!(
+        system_msg
+            .content
+            .contains(&format!("会话：{}", session_id)),
+        "Should contain built-in session_id, got: {}",
+        system_msg.content
+    );
+    assert!(
+        system_msg.content.contains("类型：sip"),
+        "Should contain built-in call_type, got: {}",
+        system_msg.content
+    );
 }

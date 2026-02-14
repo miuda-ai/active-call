@@ -151,6 +151,7 @@ async fn test_media_stream_processor_operations() -> Result<()> {
 
     // Define a test processor type
     struct AsrTestProcessor {
+        #[allow(unused)]
         id: String,
     }
 

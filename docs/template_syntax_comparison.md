@@ -246,6 +246,11 @@ sip:
 # 4. 系统内置
 {{turn_count}}      # 对话轮次
 {{summary}}         # 对话摘要
+{{session_id}}      # 会话唯一标识
+{{call_type}}       # 通话类型 (sip/websocket/webrtc/b2bua)
+{{caller}}          # 主叫方 (仅 SIP)
+{{callee}}          # 被叫方 (仅 SIP)
+{{start_time}}      # 通话开始时间 (RFC 3339)
 ```
 
 ## 常见问题
@@ -367,6 +372,8 @@ Current model: ${LLM_MODEL}  # 这是静态的，加载时就固定了
 | 客户信息 | `{{X-Customer-Name}}` | 每次通话不同 |
 | 对话状态 | `{{user_confirmed}}` | 运行时动态变化 |
 | HTTP 响应 | `{{api_response}}` | 运行时获取 |
+| 会话信息 | `{{session_id}}` | 内置自动注入 |
+| 通话类型 | `{{call_type}}` | 内置自动注入 |
 
 **记住**：
 - **`${VAR}`** = 配置时（静态）= 环境变量

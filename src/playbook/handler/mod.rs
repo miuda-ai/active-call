@@ -650,6 +650,23 @@ impl LlmHandler {
         }
     }
 
+    /// Get current extras (variables) from call_state for dynamic template rendering.
+    async fn get_current_extras(&self) -> HashMap<String, serde_json::Value> {
+        if let Some(call) = &self.call {
+            let state = call.call_state.read().await;
+            state.extras.clone().unwrap_or_default()
+        } else {
+            HashMap::new()
+        }
+    }
+
+    /// Render a scene's prompt template using the latest variables from call_state.
+    /// This enables `set_var` values to be reflected in system prompts dynamically.
+    async fn render_scene_prompt(&self, scene: &super::Scene) -> String {
+        let extras = self.get_current_extras().await;
+        super::render_scene_prompt(scene, &extras)
+    }
+
     async fn switch_to_scene(
         &mut self,
         scene_id: &str,
@@ -658,9 +675,11 @@ impl LlmHandler {
         if let Some(scene) = self.scenes.get(scene_id).cloned() {
             info!("Switching to scene: {}", scene_id);
             self.current_scene_id = Some(scene_id.to_string());
+            // Dynamically render the scene prompt with the latest variables
+            let rendered_prompt = self.render_scene_prompt(&scene).await;
             let system_prompt = Self::build_system_prompt(
                 &self.config,
-                Some(&scene.prompt),
+                Some(&rendered_prompt),
                 self.dtmf_collectors.as_ref(),
             );
             if let Some(first_msg) = self.history.get_mut(0) {
@@ -1098,12 +1117,14 @@ impl LlmHandler {
                         }
 
                         info!("Switching to scene (from stream): {}", scene_id);
-                        if let Some(scene) = self.scenes.get(&scene_id) {
+                        if let Some(scene) = self.scenes.get(&scene_id).cloned() {
                             self.current_scene_id = Some(scene_id);
+                            // Dynamically render scene prompt with the latest variables
+                            let rendered_prompt = self.render_scene_prompt(&scene).await;
                             // Update system prompt in history
                             let system_prompt = Self::build_system_prompt(
                                 &self.config,
-                                Some(&scene.prompt),
+                                Some(&rendered_prompt),
                                 self.dtmf_collectors.as_ref(),
                             );
                             if let Some(first_msg) = self.history.get_mut(0) {

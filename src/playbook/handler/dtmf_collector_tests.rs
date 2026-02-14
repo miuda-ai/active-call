@@ -2,7 +2,6 @@ use super::*;
 use crate::call::Command;
 use crate::event::SessionEvent;
 use anyhow::Result;
-use async_trait::async_trait;
 use futures::Stream;
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -333,7 +332,7 @@ async fn test_collector_max_retries_exceeded() -> Result<()> {
         }
 
         // Press finish key
-        let commands = handler.handle_collector_digit("#").await?;
+        let _commands = handler.handle_collector_digit("#").await?;
 
         if retry < 2 {
             // Should still be collecting (retrying)

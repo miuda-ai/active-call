@@ -124,7 +124,17 @@ impl InvitationHandler for PlaybookInvitationHandler {
                 );
 
                 // Extract custom headers
-                let extras = Self::extract_custom_headers(&invite_request.headers);
+                let mut extras = Self::extract_custom_headers(&invite_request.headers);
+
+                // Inject built-in caller/callee variables
+                extras.insert(
+                    crate::playbook::BUILTIN_CALLER.to_string(),
+                    serde_json::Value::String(caller.clone()),
+                );
+                extras.insert(
+                    crate::playbook::BUILTIN_CALLEE.to_string(),
+                    serde_json::Value::String(callee.clone()),
+                );
 
                 if !extras.is_empty() {
                     let mut params = self.app_state.pending_params.lock().await;
