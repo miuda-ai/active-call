@@ -267,100 +267,26 @@ async fn main() -> Result<()> {
 
     // Create TCP listener with SO_REUSEPORT for graceful restarts
     let addr: std::net::SocketAddr = http_addr.parse()?;
-
     // Create socket manually to set SO_REUSEPORT before bind
-    #[cfg(unix)]
     let std_listener = {
-        use std::os::unix::io::FromRawFd;
+        use socket2::{Domain, Protocol, Socket, Type};
 
         let domain = if addr.is_ipv4() {
-            libc::AF_INET
+            Domain::IPV4
         } else {
-            libc::AF_INET6
+            Domain::IPV6
         };
-        let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM, 0) };
-        if fd < 0 {
-            return Err(anyhow::anyhow!("Failed to create socket"));
-        }
-
-        let optval: libc::c_int = 1;
-        unsafe {
-            // SO_REUSEADDR
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_REUSEADDR,
-                &optval as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-
-            // SO_REUSEPORT (Linux/BSD/macOS)
-            #[cfg(any(
-                target_os = "linux",
-                target_os = "android",
-                target_os = "freebsd",
-                target_os = "openbsd",
-                target_os = "netbsd",
-                target_os = "dragonfly",
-                target_os = "macos",
-                target_os = "ios"
-            ))]
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_REUSEPORT,
-                &optval as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-
-            // Bind
-            let (sockaddr_ptr, sockaddr_len) = match addr {
-                std::net::SocketAddr::V4(addr_v4) => {
-                    let mut addr_in: libc::sockaddr_in = std::mem::zeroed();
-                    addr_in.sin_family = libc::AF_INET as libc::sa_family_t;
-                    addr_in.sin_port = addr_v4.port().to_be();
-                    addr_in.sin_addr.s_addr = u32::from(*addr_v4.ip()).to_be();
-                    (
-                        &addr_in as *const _ as *const libc::sockaddr,
-                        std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-                    )
-                }
-                std::net::SocketAddr::V6(addr_v6) => {
-                    let mut addr_in6: libc::sockaddr_in6 = std::mem::zeroed();
-                    addr_in6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
-                    addr_in6.sin6_port = addr_v6.port().to_be();
-                    addr_in6.sin6_addr.s6_addr = addr_v6.ip().octets();
-                    (
-                        &addr_in6 as *const _ as *const libc::sockaddr,
-                        std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
-                    )
-                }
-            };
-
-            if libc::bind(fd, sockaddr_ptr, sockaddr_len) < 0 {
-                libc::close(fd);
-                return Err(anyhow::anyhow!("Failed to bind socket"));
-            }
-
-            // Listen
-            if libc::listen(fd, 1024) < 0 {
-                libc::close(fd);
-                return Err(anyhow::anyhow!("Failed to listen on socket"));
-            }
-
-            // Set non-blocking
-            let flags = libc::fcntl(fd, libc::F_GETFL, 0);
-            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-
-            std::net::TcpListener::from_raw_fd(fd)
-        }
-    };
-
-    #[cfg(not(unix))]
-    let std_listener = {
-        let listener = std::net::TcpListener::bind(addr)?;
-        listener.set_nonblocking(true)?;
-        listener
+        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+        socket.set_reuse_address(true)?;
+        #[cfg(all(
+            unix,
+            not(any(target_os = "solaris", target_os = "illumos"))
+        ))]
+        socket.set_reuse_port(true)?;
+        socket.bind(&addr.into())?;
+        socket.listen(1024)?;
+        socket.set_nonblocking(true)?;
+        std::net::TcpListener::from(socket)
     };
 
     let listener = tokio::net::TcpListener::from_std(std_listener)?;
