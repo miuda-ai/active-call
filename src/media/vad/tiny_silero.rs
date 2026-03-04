@@ -40,7 +40,7 @@ fn fast_sigmoid(x: f32) -> f32 {
         return 1.0;
     }
     let idx = (x + 8.0) * (1023.0 / 16.0);
-    let i = idx as usize;
+    let i = (idx as usize).min(1022);
     let frac = idx - i as f32;
     let table = &*SIGMOID_TABLE;
     table[i] * (1.0 - frac) + table[i + 1] * frac
@@ -55,7 +55,7 @@ fn fast_tanh(x: f32) -> f32 {
         return 1.0;
     }
     let idx = (x + 5.0) * (1023.0 / 10.0);
-    let i = idx as usize;
+    let i = (idx as usize).min(1022);
     let frac = idx - i as f32;
     let table = &*TANH_TABLE;
     table[i] * (1.0 - frac) + table[i + 1] * frac
@@ -601,5 +601,64 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    /// Regression test: fast_tanh panicked with "index out of bounds: the len is 1024
+    /// but the index is 1024" for x values one ULP below the upper guard (5.0).
+    ///
+    /// Root cause: `1023.0_f32 / 10.0_f32` rounds UP to 102.30000305..., so for
+    /// x = 4.9999995 (one ULP below 5.0), the interpolation index `i` becomes exactly
+    /// 1023, making `table[i + 1] = table[1024]` an out-of-bounds access.
+    ///
+    /// Fix: clamp i to at most 1022 via `.min(1022)`.
+    #[test]
+    fn test_fast_tanh_boundary_no_panic() {
+        // One ULP below 5.0 — passes the guard `x >= 5.0` check (returns false),
+        // but the old code still computed i = 1023.
+        let x: f32 = f32::from_bits(5.0_f32.to_bits() - 1);
+        assert!(x < 5.0, "must be strictly below the guard");
+
+        // Verify this is exactly the triggering input that caused the panic in old code:
+        //   idx = (x + 5.0) * (1023.0_f32 / 10.0_f32)
+        // 1023.0_f32 / 10.0_f32 rounds UP to 102.30000305..., so i becomes 1023 -> OOB.
+        let idx = (x + 5.0_f32) * (1023.0_f32 / 10.0_f32);
+        assert_eq!(
+            idx as usize, 1023,
+            "old code: i == 1023, so table[i+1] = table[1024] would panic"
+        );
+
+        // With the fix (.min(1022)), fast_tanh must NOT panic and must be near 1.0.
+        let result = fast_tanh(x);
+        assert!(
+            result > 0.999 && result <= 1.0,
+            "expected a value very close to 1.0, got {}",
+            result
+        );
+    }
+
+    /// Regression test: fast_sigmoid panicked with the same out-of-bounds error.
+    ///
+    /// For x = 7.9999995 (one ULP below 8.0), f32 addition `x + 8.0` rounds up to
+    /// exactly 16.0, and `16.0 * 63.9375 = 1023.0` exactly, again giving i = 1023.
+    #[test]
+    fn test_fast_sigmoid_boundary_no_panic() {
+        let x: f32 = f32::from_bits(8.0_f32.to_bits() - 1);
+        assert!(x < 8.0, "must be strictly below the guard");
+
+        // f32 addition 7.9999995 + 8.0 rounds to 16.0; 16.0 * 63.9375 == 1023.0,
+        // so the old code produced i = 1023 -> OOB.
+        let idx = (x + 8.0_f32) * (1023.0_f32 / 16.0_f32);
+        assert_eq!(
+            idx as usize, 1023,
+            "old code: i == 1023, so table[i+1] = table[1024] would panic"
+        );
+
+        // With the fix, fast_sigmoid must NOT panic and must be near 1.0.
+        let result = fast_sigmoid(x);
+        assert!(
+            result > 0.999 && result <= 1.0,
+            "expected a value very close to 1.0, got {}",
+            result
+        );
     }
 }

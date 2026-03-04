@@ -1,6 +1,6 @@
 [package]
 name = "active-call"
-version = "0.3.43"
+version = "0.3.44"
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 description = "A SIP/WebRTC voice agent"
