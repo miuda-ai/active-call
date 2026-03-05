@@ -168,15 +168,13 @@ impl TrackCodec {
     pub fn encode(&mut self, payload_type: u8, frame: AudioFrame) -> (u8, Vec<u8>) {
         match frame.samples {
             Samples::PCM { samples: mut pcm } => {
-                let target_samplerate = match payload_type {
-                    0 => 8000,
-                    8 => 8000,
-                    9 => 16000,
-                    18 => 8000,
-                    111 => 48000, // Opus sample rate
-                    _ => 8000,
-                };
+                let codec = self
+                    .payload_type_map
+                    .get(&payload_type)
+                    .cloned()
+                    .or_else(|| CodecType::try_from(payload_type).ok());
 
+                let target_samplerate = codec.map(|c| c.samplerate()).unwrap_or(8000);
                 if frame.sample_rate != target_samplerate {
                     if self.resampler.is_none()
                         || self.resampler_in_rate != frame.sample_rate
@@ -192,19 +190,19 @@ impl TrackCodec {
                     pcm = self.resampler.as_mut().unwrap().resample(&pcm);
                 }
 
-                let payload = match payload_type {
-                    0 => self.pcmu_encoder.encode(&pcm),
-                    8 => self.pcma_encoder.encode(&pcm),
-                    9 => self
+                let payload = match codec {
+                    Some(CodecType::PCMU) => self.pcmu_encoder.encode(&pcm),
+                    Some(CodecType::PCMA) => self.pcma_encoder.encode(&pcm),
+                    Some(CodecType::G722) => self
                         .g722_encoder
                         .get_or_insert_with(|| Box::new(G722Encoder::new()))
                         .encode(&pcm),
-                    18 => self
+                    Some(CodecType::G729) => self
                         .g729_encoder
                         .get_or_insert_with(|| Box::new(G729Encoder::new()))
                         .encode(&pcm),
                     #[cfg(feature = "opus")]
-                    111 => self
+                    Some(CodecType::Opus) => self
                         .opus_encoder
                         .get_or_insert_with(OpusEncoder::new_default)
                         .encode(&pcm),
@@ -219,5 +217,33 @@ impl TrackCodec {
             } => (payload_type, payload),
             _ => (payload_type, vec![]),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(feature = "opus")]
+    #[test]
+    fn test_encode_dynamic_opus_payload_type_uses_opus_encoder() {
+        let mut codec = TrackCodec::new();
+        codec.set_payload_type(96, CodecType::Opus);
+
+        let frame = AudioFrame {
+            samples: Samples::PCM {
+                // 20ms @ 16k mono
+                samples: vec![0; 320],
+            },
+            sample_rate: 16000,
+            channels: 1,
+            ..Default::default()
+        };
+
+        let (pt, payload) = codec.encode(96, frame);
+        assert_eq!(pt, 96);
+        assert!(!payload.is_empty());
+        // If this were raw PCM bytes, it would be 640 bytes.
+        assert!(payload.len() < 640);
     }
 }

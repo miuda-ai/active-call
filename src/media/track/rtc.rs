@@ -745,7 +745,13 @@ impl Track for RtcTrack {
                 crate::media::Samples::PCM { samples } => {
                     let payload_type = self.get_payload_type();
                     let (_, encoded) = self.encoder.encode(payload_type, packet.clone());
-                    let target_codec = CodecType::try_from(payload_type)?;
+                    let target_codec = self
+                        .encoder
+                        .payload_type_map
+                        .get(&payload_type)
+                        .cloned()
+                        .or_else(|| CodecType::try_from(payload_type).ok())
+                        .ok_or_else(|| anyhow::anyhow!("Invalid codec type: {}", payload_type))?;
                     if !encoded.is_empty() {
                         let clock_rate = target_codec.clock_rate();
 
@@ -794,7 +800,13 @@ impl Track for RtcTrack {
                     payload_type,
                     sequence_number,
                 } => {
-                    let target_codec = CodecType::try_from(*payload_type)?;
+                    let target_codec = self
+                        .encoder
+                        .payload_type_map
+                        .get(payload_type)
+                        .cloned()
+                        .or_else(|| CodecType::try_from(*payload_type).ok())
+                        .ok_or_else(|| anyhow::anyhow!("Invalid codec type: {}", payload_type))?;
                     let clock_rate = target_codec.clock_rate();
 
                     let now = Instant::now();
