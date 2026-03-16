@@ -31,7 +31,9 @@ use crate::{
     callrecord::{CallRecord, CallRecordEvent, CallRecordEventType, CallRecordHangupReason},
     useragent::{
         invitation::PendingDialog,
-        public_address::{build_public_contact_uri, contact_needs_public_resolution},
+        public_address::{
+            build_public_contact_uri, contact_needs_public_resolution, find_local_addr_for_uri,
+        },
     },
 };
 use anyhow::Result;
@@ -2041,7 +2043,8 @@ impl ActiveCall {
         let needs_contact = contact_needs_public_resolution(&invite_option.contact);
 
         if needs_contact {
-            if let Some(addr) = self.invitation.dialog_layer.endpoint.get_addrs().first() {
+            let addrs = self.invitation.dialog_layer.endpoint.get_addrs();
+            if let Some(addr) = find_local_addr_for_uri(&addrs, &invite_option.callee) {
                 let contact_username = invite_option
                     .contact
                     .auth
@@ -2055,12 +2058,17 @@ impl ActiveCall {
                             .map(|auth| auth.user.as_str())
                     });
                 invite_option.contact = build_public_contact_uri(
-                    &self.app_state.learned_public_addresses,
+                    &self.app_state.learned_public_address,
                     self.app_state.auto_learn_public_address_enabled(),
-                    addr,
+                    &addr,
                     contact_username,
                     Some(&invite_option.contact),
                 );
+            } else {
+                return Err(rsipstack::Error::Error(format!(
+                    "missing local SIP address for callee transport: {}",
+                    invite_option.callee
+                )));
             }
         }
 
