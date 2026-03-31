@@ -761,6 +761,7 @@ impl ActiveCall {
                 fade_out_ms: _,
             } => self.do_interrupt(passage.unwrap_or_default()).await,
             Command::History { speaker, text } => self.do_history(speaker, text).await,
+            Command::Custom { sender, data } => self.do_custom(sender, data),
         }
     }
 
@@ -1163,6 +1164,17 @@ impl ActiveCall {
                 timestamp: crate::media::get_timestamp(),
                 speaker,
                 text,
+            })
+            .map(|_| ())
+            .map_err(Into::into)
+    }
+
+    fn do_custom(&self, sender: Option<String>, data: serde_json::Value) -> Result<()> {
+        self.event_sender
+            .send(SessionEvent::Custom {
+                timestamp: crate::media::get_timestamp(),
+                sender,
+                data,
             })
             .map(|_| ())
             .map_err(Into::into)

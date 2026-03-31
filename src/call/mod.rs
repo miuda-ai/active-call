@@ -92,6 +92,10 @@ pub enum Command {
         speaker: String,
         text: String,
     },
+    Custom {
+        sender: Option<String>,
+        data: serde_json::Value,
+    },
 }
 
 /// Routing state for managing stateful load balancing

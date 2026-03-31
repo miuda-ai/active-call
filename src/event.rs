@@ -203,6 +203,11 @@ pub enum SessionEvent {
         timestamp: u64,
         payload: Option<String>,
     },
+    Custom {
+        timestamp: u64,
+        sender: Option<String>,
+        data: serde_json::Value,
+    },
 }
 
 impl Display for SessionEvent {
