@@ -12,7 +12,7 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State, WebSocketUpgrade, ws::Message},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use bytes::Bytes;
 use chrono::Utc;
@@ -39,7 +39,8 @@ pub fn call_router() -> Router<AppState> {
         .route("/call/webrtc", get(webrtc_handler))
         .route("/call/sip", get(sip_handler))
         .route("/list", get(list_active_calls))
-        .route("/kill/{id}", get(kill_active_call));
+        .route("/kill/{id}", get(kill_active_call))
+        .route("/command/{id}", post(send_command));
     r
 }
 
@@ -459,8 +460,31 @@ pub(crate) async fn kill_active_call(
         call.cancel_token.cancel();
         Json(serde_json::json!({ "status": "killed", "id": id })).into_response()
     } else {
-        Json(serde_json::json!({ "status": "not_found", "id": id })).into_response()
+        (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "status": "not_found", "id": id })),
+        )
+            .into_response()
     }
+}
+
+pub(crate) async fn send_command(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    Json(command): Json<Command>,
+) -> Response {
+    let active_calls = state.active_calls.lock().unwrap();
+    if let Some(call) = active_calls.get(&id) {
+        if let Ok(_) = call.cmd_sender.send(command) {
+            return Json(serde_json::json!({ "status": "sent", "id": id })).into_response();
+        }
+    }
+
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        Json(serde_json::json!({ "status": "not_found", "id": id })),
+    )
+        .into_response()
 }
 
 trait IntoWsMessage {
