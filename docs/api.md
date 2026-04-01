@@ -1497,7 +1497,7 @@ curl -X POST http://localhost:8080/command/s.session123 \
 curl http://localhost:8080/iceservers
 ```
 
-### 7. Playbook API
+### 8. Playbook API
 
 #### List Playbooks
 
