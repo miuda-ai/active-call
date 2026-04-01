@@ -1465,7 +1465,50 @@ curl http://localhost:8080/kill/s.session123
 curl http://localhost:8080/iceservers
 ```
 
-### 7. Playbook API
+### 7. Stream Events
+
+**Endpoint:** `GET /events/{id}`
+
+**Description:** Opens a Server-Sent Events (SSE) stream for a specific active call, delivering real-time session events and commands as they occur.
+
+**Path Parameters:**
+
+| Parameter | Type   | Description          |
+|-----------|--------|----------------------|
+| `id`      | string | Active call/track ID |
+
+**Response:** `text/event-stream;charset=utf-8`
+
+The stream emits two SSE event types:
+
+| SSE Event   | Data                                                    |
+|-------------|---------------------------------------------------------|
+| `event`     | JSON-serialized `SessionEvent` (same as WebSocket events) |
+| `command`   | JSON-serialized command sent to the session              |
+
+The stream closes when the call ends (channel closed). Lagged messages are silently skipped.
+
+**Errors:**
+
+| Status | Description                        |
+|--------|------------------------------------|
+| 404    | No active call found for given `id` |
+
+**Usage:**
+```bash
+curl -N http://localhost:8080/events/{id}
+```
+
+**Example output:**
+```
+event: event
+data: {"event":"answer","trackId":"track-abc","timestamp":1700000000}
+
+event: command
+data: {"command":"tts","text":"Hello, how can I help you?"}
+```
+
+### 8. Playbook API
 
 #### List Playbooks
 
