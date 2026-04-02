@@ -11,6 +11,7 @@ use crate::{event::SessionEvent, media::track::TrackConfig};
 use axum::{
     Json, Router,
     extract::{Path, Query, State, WebSocketUpgrade, ws::Message},
+    response::sse::{Event, KeepAlive, Sse},
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -39,7 +40,8 @@ pub fn call_router() -> Router<AppState> {
         .route("/call/webrtc", get(webrtc_handler))
         .route("/call/sip", get(sip_handler))
         .route("/list", get(list_active_calls))
-        .route("/kill/{id}", get(kill_active_call));
+        .route("/kill/{id}", get(kill_active_call))
+        .route("/events/{id}", get(stream_events));
     r
 }
 
@@ -461,6 +463,47 @@ pub(crate) async fn kill_active_call(
     } else {
         Json(serde_json::json!({ "status": "not_found", "id": id })).into_response()
     }
+}
+
+pub(crate) async fn stream_events(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    let mut rx_events;
+    let mut rx_commands;
+    {
+        let active_calls = state.active_calls.lock().unwrap();
+        if let Some(call) = active_calls.get(&id) {
+            rx_events = call.event_sender.subscribe();
+            rx_commands = call.cmd_sender.subscribe();
+        } else {
+            return (axum::http::StatusCode::NOT_FOUND, "track not active").into_response();
+        }
+    }
+
+    let stream = async_stream::stream! {
+        loop {
+            let result = tokio::select! {
+                r = rx_events.recv() => r.map(|e| serde_json::to_string(&e).map(|json| Event::default().event("event").data(json))),
+                r = rx_commands.recv() => r.map(|c| serde_json::to_string(&c).map(|json| Event::default().event("command").data(json))),
+            };
+            match result {
+                Ok(Ok(sse_event)) => yield Ok::<Event, serde_json::Error>(sse_event),
+                Ok(Err(e)) => yield Err(e.into()),
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            }
+        }
+    };
+
+    let mut response = Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response();
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        "text/event-stream;charset=utf-8".parse().unwrap(),
+    );
+    response
 }
 
 trait IntoWsMessage {
