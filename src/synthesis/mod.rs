@@ -106,12 +106,6 @@ pub struct SynthesisOption {
     pub extra: Option<HashMap<String, String>>,
     pub max_concurrent_tasks: Option<usize>,
     pub session_id: Option<String>,
-    /// Leading silence duration in milliseconds before the first TTS audio chunk.
-    /// Useful for SIP/RTP scenarios where the audio channel may not be fully
-    /// established when the first chunk arrives, causing the initial syllable
-    /// to be clipped. Set to 200-300 for SIP calls. Default: 0 (disabled).
-    #[serde(alias = "leadingSilenceMs")]
-    pub leading_silence_ms: Option<u32>,
 }
 
 impl SynthesisOption {
@@ -135,7 +129,6 @@ impl SynthesisOption {
                 extra: other.extra.or(self.extra.clone()),
                 max_concurrent_tasks: other.max_concurrent_tasks.or(self.max_concurrent_tasks),
                 session_id: other.session_id.or(self.session_id.clone()),
-                leading_silence_ms: other.leading_silence_ms.or(self.leading_silence_ms),
             }
         } else {
             self.clone()

@@ -667,18 +667,6 @@ impl TtsTask {
                     }
                     entry.first_chunk = false;
                     entry.ttfb = crate::media::get_timestamp() - entry.recv_time;
-
-                    // Insert leading silence before the first audio chunk to prevent
-                    // initial syllable clipping on SIP/RTP channels where the audio
-                    // path may not be fully established when playback starts.
-                    if self.leading_silence_ms > 0 {
-                        let silence_bytes = (self.sample_rate as usize * 2 * self.leading_silence_ms as usize) / 1000;
-                        let silence = Bytes::from(vec![0u8; silence_bytes]);
-                        self.get_emit_entry_mut(assume_seq).map(|entry| {
-                            entry.chunks.push_back(silence);
-                        });
-                        debug!("inserted {}ms leading silence ({} bytes)", self.leading_silence_ms, silence_bytes);
-                    }
                 }
 
                 entry.total_bytes += chunk.len();
@@ -874,8 +862,6 @@ pub struct TtsTrack {
     graceful: Arc<AtomicBool>,
     min_buffer_duration: Duration,
     max_buffer_wait: Duration,
-    /// Leading silence in ms before first TTS audio (for SIP/RTP channel readiness)
-    leading_silence_ms: u32,
 }
 
 impl SynthesisHandle {
@@ -923,7 +909,6 @@ impl TtsTrack {
             ssrc: 0,
             min_buffer_duration: Duration::from_millis(200), // Default 200ms
             max_buffer_wait: Duration::from_millis(500),     // Default 500ms
-            leading_silence_ms: 0,
         }
     }
     pub fn with_ssrc(mut self, ssrc: u32) -> Self {
@@ -953,11 +938,6 @@ impl TtsTrack {
 
     pub fn with_cache_enabled(mut self, use_cache: bool) -> Self {
         self.use_cache = use_cache;
-        self
-    }
-
-    pub fn with_leading_silence(mut self, ms: u32) -> Self {
-        self.leading_silence_ms = ms;
         self
     }
 

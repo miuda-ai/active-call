@@ -432,21 +432,7 @@ impl RtcTrack {
             let src_codec = match CodecType::try_from(payload_type) {
                 Ok(c) => c,
                 Err(_) => {
-                    // Forward unknown payload types (e.g. telephone-event/DTMF) as-is
-                    // so the downstream DTMF detector in MediaStream can process them.
-                    let af = AudioFrame {
-                        track_id: track_id.clone(),
-                        samples: crate::media::Samples::RTP {
-                            payload_type,
-                            payload: frame.data.to_vec(),
-                            sequence_number: frame.sequence_number.unwrap_or(0),
-                        },
-                        timestamp: crate::media::get_timestamp(),
-                        sample_rate: 8000,
-                        channels: 1,
-                        ..Default::default()
-                    };
-                    sender.send(af).ok();
+                    debug!(track_id=%track_id, "Unknown payload type {}, skipping frame", payload_type);
                     return;
                 }
             };
