@@ -1045,7 +1045,7 @@ impl ActiveCall {
             speaker,
             play_id: play_id.clone(),
             streaming,
-            end_of_stream,
+            end_of_stream: if !streaming { true } else { end_of_stream },
             option: tts_option,
             base64,
             cache_key,
