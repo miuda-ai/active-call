@@ -150,6 +150,8 @@ impl TtsTask {
         let mut cmd_finished = false;
         let mut tts_finished = false;
         let mut cancel_received = false;
+        // Track when cmd_finished was set, used as escape timeout for stuck streams
+        let mut cmd_finished_time: Option<Instant> = None;
         let sample_rate = self.sample_rate;
         let packet_duration_ms = self.ptime.as_millis();
         // capacity of samples buffer
@@ -188,6 +190,7 @@ impl TtsTask {
 
                     // else, stop receiving command
                     cmd_finished = true;
+                    cmd_finished_time = Some(Instant::now());
                     self.client.stop().await?;
                 }
                 _ = ptimer.tick() => {
@@ -342,6 +345,24 @@ impl TtsTask {
                         }
                     }
 
+                    // Escape hatch for stuck stream: if streaming, cmd is finished,
+                    // emit_q is empty, but the stream hasn't closed (tts_finished=false),
+                    // force tts_finished after a timeout to prevent the task from hanging.
+                    if self.streaming && cmd_finished && !tts_finished && self.emit_q.is_empty() && i == 0 {
+                        if let Some(t) = cmd_finished_time {
+                            if t.elapsed() > Duration::from_secs(5) {
+                                debug!(
+                                    session_id = %self.session_id,
+                                    track_id = %self.track_id,
+                                    play_id = ?self.play_id,
+                                    elapsed_ms = t.elapsed().as_millis(),
+                                    "tts stream stuck after cmd finished, forcing tts_finished"
+                                );
+                                tts_finished = true;
+                            }
+                        }
+                    }
+
                     if i == 0 && self.emit_q.is_empty() && cmd_finished && tts_finished {
                         debug!(
                             session_id = %self.session_id,
@@ -410,6 +431,7 @@ impl TtsTask {
                             "tts command finished"
                         );
                         cmd_finished = true;
+                        cmd_finished_time = Some(Instant::now());
                         self.client.stop().await?;
                     }
                 }

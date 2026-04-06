@@ -1079,10 +1079,8 @@ impl ActiveCall {
                 (ssrc, false)
             };
 
-            state.auto_hangup = match auto_hangup {
-                Some(true) => Some((target_ssrc, CallRecordHangupReason::BySystem)),
-                _ => state.auto_hangup.clone(),
-            };
+            // Defer auto_hangup setting until after potential interrupt.
+            // auto_hangup will be set below after do_interrupt() to avoid being cleared.
             state.wait_input_timeout = wait_input_timeout;
 
             state.current_play_id = play_id.clone();
@@ -1091,6 +1089,26 @@ impl ActiveCall {
 
         if should_interrupt {
             let _ = self.do_interrupt(false).await;
+        }
+
+        // Set auto_hangup AFTER potential interrupt to avoid it being cleared by do_interrupt().
+        // Only preserve auto_hangup when reusing the same handle (same play_id).
+        // When starting a new track or interrupting, clear stale auto_hangup.
+        {
+            let mut state = self.call_state.write().await;
+            state.auto_hangup = match auto_hangup {
+                Some(true) => Some((picked_ssrc, CallRecordHangupReason::BySystem)),
+                _ => {
+                    // Only preserve auto_hangup when reusing the same handle (same play_id).
+                    // When starting a new track (different play_id or no existing handle),
+                    // clear stale auto_hangup to prevent orphaned hangup.
+                    if state.tts_handle.is_some() && !should_interrupt {
+                        state.auto_hangup.clone()
+                    } else {
+                        None
+                    }
+                }
+            };
         }
 
         let existing_handle = self.call_state.read().await.tts_handle.clone();
@@ -1185,6 +1203,7 @@ impl ActiveCall {
             let mut state = self.call_state.write().await;
             state.tts_handle = None;
             state.moh = None;
+            state.auto_hangup = None;
         }
         self.media_stream
             .remove_track(&self.server_side_track_id, graceful)
