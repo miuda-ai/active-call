@@ -631,6 +631,7 @@ pub fn read_wav_file(path: &str) -> Result<(PcmBuf, u32)> {
 mod tests {
     use super::*;
     use crate::media::cache::ensure_cache_dir;
+    use std::io::Write;
     use tokio::sync::{broadcast, mpsc};
 
     #[tokio::test]
@@ -805,19 +806,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rmp3_read_samples() -> Result<()> {
+    async fn test_mp3_decode_sample_file() -> Result<()> {
         let file_path = "fixtures/sample.mp3".to_string();
-        match std::fs::read(&file_path) {
+        match File::open(&file_path) {
             Ok(file) => {
-                let mut decoder = rmp3::Decoder::new(&file);
-                while let Some(frame) = decoder.next() {
-                    match frame {
-                        rmp3::Frame::Audio(_pcm) => {}
-                        rmp3::Frame::Other(h) => {
-                            println!("Found non-audio frame: {:?}", h);
-                        }
-                    }
-                }
+                let samples = crate::media::loader::decode_mp3(file, 16000)?;
+                assert!(
+                    !samples.is_empty(),
+                    "Decoded sample list should not be empty"
+                );
             }
             Err(_) => {
                 println!("Skipping MP3 test: sample file not found at {}", file_path);
@@ -848,13 +845,39 @@ mod tests {
         println!("Total samples: {}", total_samples);
         println!("Duration: {:.2} seconds", duration_seconds);
 
-        const EXPECTED_SAMPLES: usize = 228096;
+        const EXPECTED_SAMPLES: usize = 227520;
         assert!(
             total_samples == EXPECTED_SAMPLES,
             "Sample count {} does not match expected {}",
             total_samples,
             EXPECTED_SAMPLES
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "manual debug helper: dumps raw pcm for ffplay"]
+    async fn dump_mp3_as_16k_pcm_for_ffplay() -> Result<()> {
+        let input_path = "fixtures/sample.mp3";
+        let output_path = "target/tmp/sample_16k_mono_s16le.pcm";
+
+        let file = File::open(input_path)?;
+        let mut reader = Mp3AudioReader::from_file(file, 16000)?;
+
+        let mut pcm_samples = Vec::<i16>::new();
+        while let Some((chunk, _chunk_sample_rate)) = reader.read_chunk(320)? {
+            pcm_samples.extend_from_slice(&chunk);
+        }
+
+        std::fs::create_dir_all("target/tmp")?;
+        let mut out = std::fs::File::create(output_path)?;
+        for sample in pcm_samples {
+            out.write_all(&sample.to_le_bytes())?;
+        }
+        out.flush()?;
+
+        println!("PCM dumped: {}", output_path);
+        println!("ffplay -f s16le -ar 16000 -ac 1 {}", output_path);
         Ok(())
     }
 }

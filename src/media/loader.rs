@@ -4,7 +4,15 @@ use audio_codec::Resampler;
 use hound::WavReader;
 use reqwest::Client;
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, Seek, SeekFrom, Write};
+use symphonia::core::audio::SampleBuffer;
+use symphonia::core::codecs::DecoderOptions;
+use symphonia::core::errors::Error as SymphoniaError;
+use symphonia::core::formats::FormatOptions;
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::probe::Hint;
+use symphonia::default::{get_codecs, get_probe};
 use std::time::Instant;
 use tracing::{info, warn};
 use url::Url;
@@ -142,25 +150,75 @@ pub fn decode_wav(file: File, target_sample_rate: u32) -> Result<Vec<i16>> {
 }
 
 pub fn decode_mp3(file: File, target_sample_rate: u32) -> Result<Vec<i16>> {
-    let mut reader = BufReader::new(file);
-    let mut file_data = Vec::new();
-    reader.read_to_end(&mut file_data)?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    hint.with_extension("mp3");
 
-    let mut decoder = rmp3::Decoder::new(&file_data);
+    let probed = get_probe().format(
+        &hint,
+        mss,
+        &FormatOptions::default(),
+        &MetadataOptions::default(),
+    )?;
+
+    let mut format = probed.format;
+    let (track_id, codec_params) = {
+        let track = format
+            .default_track()
+            .ok_or_else(|| anyhow!("loader: no default audio track found in mp3"))?;
+        (track.id, track.codec_params.clone())
+    };
+
+    let mut decoder = get_codecs().make(&codec_params, &DecoderOptions::default())?;
     let mut all_samples = Vec::new();
-    let mut sample_rate = 0;
+    let mut sample_rate = codec_params.sample_rate.unwrap_or(0);
 
-    while let Some(frame) = decoder.next() {
-        match frame {
-            rmp3::Frame::Audio(audio) => {
+    loop {
+        let packet = match format.next_packet() {
+            Ok(packet) => packet,
+            Err(SymphoniaError::IoError(_)) => break,
+            Err(SymphoniaError::ResetRequired) => continue,
+            Err(e) => return Err(anyhow!("loader: failed reading mp3 packet: {e}")),
+        };
+
+        if packet.track_id() != track_id {
+            continue;
+        }
+
+        match decoder.decode(&packet) {
+            Ok(decoded) => {
                 if sample_rate == 0 {
-                    sample_rate = audio.sample_rate();
+                    sample_rate = decoded.spec().rate;
                     info!("MP3 file detected with sample rate: {} Hz", sample_rate);
                 }
-                all_samples.extend_from_slice(audio.samples());
+                let spec = *decoded.spec();
+                let channels = spec.channels.count();
+
+                let mut sample_buffer = SampleBuffer::<i16>::new(decoded.capacity() as u64, spec);
+                sample_buffer.copy_interleaved_ref(decoded);
+                let interleaved = sample_buffer.samples();
+
+                if channels <= 1 {
+                    all_samples.extend_from_slice(interleaved);
+                } else {
+                    for frame in interleaved.chunks(channels) {
+                        if frame.is_empty() {
+                            continue;
+                        }
+                        let sum: i32 = frame.iter().map(|s| *s as i32).sum();
+                        all_samples.push((sum / frame.len() as i32) as i16);
+                    }
+                }
             }
-            rmp3::Frame::Other(_) => {}
+            Err(SymphoniaError::DecodeError(_)) => continue,
+            Err(SymphoniaError::IoError(_)) => break,
+            Err(SymphoniaError::ResetRequired) => continue,
+            Err(e) => return Err(anyhow!("loader: failed decoding mp3 packet: {e}")),
         }
+    }
+
+    if all_samples.is_empty() {
+        return Err(anyhow!("loader: no decodable audio samples found in mp3"));
     }
 
     if sample_rate != target_sample_rate && sample_rate > 0 {
