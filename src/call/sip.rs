@@ -398,6 +398,30 @@ impl DialogStateReceiverGuard {
                     info!(session_id = states.session_id, %dialog_id, "dialog options received");
                     tx_handle.reply(rsipstack::rsip::StatusCode::OK).await.ok();
                 }
+                DialogState::Refer(dialog_id, req, tx_handle) => {
+                    let refer_to = req.headers.iter().find_map(|h| {
+                        if let rsipstack::rsip::Header::ReferTo(h) = h {
+                            return Some(h.value().to_string());
+                        }
+                        None
+                    }).unwrap_or_default();
+                    let referred_by = req.headers.iter().find_map(|h| {
+                        if let rsipstack::rsip::Header::ReferredBy(h) = h {
+                            return Some(h.value().to_string());
+                        }
+                        None
+                    });
+                    info!(session_id = states.session_id, %dialog_id, %refer_to, "received REFER");
+                    tx_handle.reply(rsipstack::rsip::StatusCode::Other(202, "Accepted".into())).await.ok();
+                    let is_refer = states.call_state.read().await.is_refer;
+                    states.event_sender.send(crate::event::SessionEvent::TransferRequest {
+                        track_id: states.track_id.clone(),
+                        timestamp: crate::media::get_timestamp(),
+                        refer_to,
+                        referred_by,
+                        refer: Some(is_refer),
+                    }).ok();
+                }
                 DialogState::Terminated(dialog_id, reason) => {
                     info!(
                         session_id = states.session_id,

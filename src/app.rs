@@ -426,6 +426,16 @@ impl AppStateInner {
                     info!(?key, "ignoring out-of-dialog OPTIONS request");
                     continue;
                 }
+                rsipstack::rsip::Method::Refer => {
+                    info!(?key, "ignoring out-of-dialog REFER");
+                    match tx.reply(rsipstack::rsip::StatusCode::BadRequest).await {
+                        Ok(_) => (),
+                        Err(e) => {
+                            info!("error replying to out-of-dialog REFER: {:?}", e);
+                        }
+                    }
+                    continue;
+                }
                 _ => {
                     info!(?key, "received request: {:?}", tx.original.method);
                     match tx.reply(rsipstack::rsip::StatusCode::OK).await {
