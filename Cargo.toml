@@ -1,6 +1,6 @@
 [package]
 name = "active-call"
-version = "0.3.55"
+version = "0.3.56"
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 description = "A SIP/WebRTC voice agent"
@@ -22,7 +22,7 @@ libc = "0.2"
 opusic-sys = { version = "0.6.0", optional = true }
 audio-codec = { version = "0.3.30", features = ["opus"] }
 #rustrtc = { path = "../rustrtc" }
-rustrtc = "0.3.43"
+rustrtc = "0.3.47"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 minijinja = { version = "2.19.0", features = ["loader", "json"] }
