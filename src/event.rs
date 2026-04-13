@@ -126,6 +126,13 @@ pub enum SessionEvent {
         timestamp: u64,
         on_hold: bool,
     },
+    TransferRequest {
+        track_id: String,
+        timestamp: u64,
+        refer_to: String,
+        referred_by: Option<String>,
+        refer: Option<bool>,
+    },
     TrackStart {
         track_id: String,
         timestamp: u64,
