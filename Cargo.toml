@@ -1,6 +1,6 @@
 [package]
 name = "active-call"
-version = "0.3.56"
+version = "0.3.57"
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 description = "A SIP/WebRTC voice agent"
@@ -22,23 +22,23 @@ libc = "0.2"
 opusic-sys = { version = "0.6.0", optional = true }
 audio-codec = { version = "0.3.30", features = ["opus"] }
 #rustrtc = { path = "../rustrtc" }
-rustrtc = "0.3.47"
+rustrtc = "0.3.50"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 minijinja = { version = "2.19.0", features = ["loader", "json"] }
 anyhow = "1"
-arc-swap = "1.8.2"
+arc-swap = "1.9.1"
 async-trait = "0.1.88"
 async-stream = "0.3.6"
-axum = { version = "0.8.7", features = ["ws", "tokio", "multipart"] }
+axum = { version = "0.8.9", features = ["ws", "tokio", "multipart"] }
 tower-http = { version = "0.6.2", features = ["fs", "trace"] }
 bytes = "1"
 futures = "0.3.32"
-rustls = "0.23.37"
+rustls = "0.23.38"
 dotenvy = "0.15.7"
 clap = { version = "4.6.0", features = ["derive"] }
 chrono = { version = "0.4.44", features = ["serde"] }
-tokio = { version = "1.51.0", features = ["full", "tracing"] }
+tokio = { version = "1.52.0", features = ["full", "tracing"] }
 tokio-stream = { version = "0.1.18", features = ["net", "sync"] }
 tokio-tungstenite = { version = "0.29.0", features = [
     "rustls-tls-native-roots",
@@ -48,7 +48,7 @@ tracing = "0.1.43"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tracing-appender = "0.2.4"
 toml = "1.1.2"
-rsipstack = "0.5.3"
+rsipstack = "0.5.7"
 #rsipstack = { path = "../rsipstack" }
 uuid = { version = "1.23.0", features = ["v4"] }
 reqwest = { version = "0.13.2", features = [
@@ -64,7 +64,7 @@ object_store = { version = "0.13.2", features = ["aws", "azure", "gcp"] }
 serde_with = "3.18.0"
 rand = "0.10.0"
 humantime = "2.1.0"
-lru = "0.16.3"
+lru = "0.17.0"
 md5 = { package = "md-5", version = "0.11.0" }
 sha2 = "0.11.0"
 serde_yaml = "0.9.33"
