@@ -7,6 +7,7 @@ use audio_codec::{
     samples_to_bytes,
 };
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use audio_codec::g729::{G729Decoder, G729Encoder};
 #[cfg(feature = "opus")]
@@ -32,27 +33,29 @@ pub struct TrackCodec {
     resampler: Option<Resampler>,
     resampler_in_rate: u32,
     resampler_out_rate: u32,
-    pub payload_type_map: HashMap<u8, CodecType>,
+    pub payload_type_map: Arc<RwLock<HashMap<u8, CodecType>>>,
 }
 
 impl Clone for TrackCodec {
     fn clone(&self) -> Self {
         let mut new = Self::new();
-        new.payload_type_map = self.payload_type_map.clone();
+        // Share the same underlying map so reinvite PT updates are visible to all clones.
+        new.payload_type_map = Arc::clone(&self.payload_type_map);
         new
     }
 }
 
 impl TrackCodec {
     pub fn new() -> Self {
-        let mut payload_type_map = HashMap::new();
-        payload_type_map.insert(0, CodecType::PCMU);
-        payload_type_map.insert(8, CodecType::PCMA);
-        payload_type_map.insert(9, CodecType::G722);
-        payload_type_map.insert(18, CodecType::G729);
-        payload_type_map.insert(101, CodecType::TelephoneEvent);
+        let mut map = HashMap::new();
+        map.insert(0, CodecType::PCMU);
+        map.insert(8, CodecType::PCMA);
+        map.insert(9, CodecType::G722);
+        map.insert(18, CodecType::G729);
+        map.insert(101, CodecType::TelephoneEvent);
         #[cfg(feature = "opus")]
-        payload_type_map.insert(111, CodecType::Opus);
+        map.insert(111, CodecType::Opus);
+        let payload_type_map = Arc::new(RwLock::new(map));
 
         Self {
             pcmu_encoder: PcmuEncoder::new(),
@@ -75,7 +78,18 @@ impl TrackCodec {
     }
 
     pub fn set_payload_type(&mut self, pt: u8, codec: CodecType) {
-        self.payload_type_map.insert(pt, codec);
+        self.payload_type_map.write().unwrap().insert(pt, codec);
+    }
+
+    /// Look up the codec for a given RTP payload type, consulting the negotiated map first
+    /// and falling back to the static payload type registry.
+    pub fn get_codec_for_pt(&self, pt: u8) -> Option<CodecType> {
+        self.payload_type_map
+            .read()
+            .unwrap()
+            .get(&pt)
+            .cloned()
+            .or_else(|| CodecType::try_from(pt).ok())
     }
 
     pub fn is_audio(payload_type: u8) -> bool {
@@ -95,6 +109,8 @@ impl TrackCodec {
     ) -> (u32, u16, PcmBuf) {
         let codec = self
             .payload_type_map
+            .read()
+            .unwrap()
             .get(&payload_type)
             .cloned()
             .unwrap_or_else(|| match payload_type {
@@ -170,6 +186,8 @@ impl TrackCodec {
             Samples::PCM { samples: mut pcm } => {
                 let codec = self
                     .payload_type_map
+                    .read()
+                    .unwrap()
                     .get(&payload_type)
                     .cloned()
                     .or_else(|| CodecType::try_from(payload_type).ok());
