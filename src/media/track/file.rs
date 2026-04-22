@@ -309,6 +309,7 @@ pub struct FileTrack {
     path: Option<String>,
     use_cache: bool,
     ssrc: u32,
+    offset_ms: u32,
 }
 
 impl FileTrack {
@@ -323,6 +324,7 @@ impl FileTrack {
             path: None,
             use_cache: true,
             ssrc: 0,
+            offset_ms: 0,
         }
     }
 
@@ -362,6 +364,11 @@ impl FileTrack {
 
     pub fn with_cache_enabled(mut self, use_cache: bool) -> Self {
         self.use_cache = use_cache;
+        self
+    }
+
+    pub fn with_offset_ms(mut self, offset_ms: u32) -> Self {
+        self.offset_ms = offset_ms;
         self
     }
 }
@@ -405,6 +412,7 @@ impl Track for FileTrack {
         let token = self.cancel_token.clone();
         let start_time = crate::media::get_timestamp();
         let ssrc = self.ssrc;
+        let offset_ms = self.offset_ms;
         // Spawn async task to handle file streaming
         let play_id = self.play_id.clone();
         crate::spawn(async move {
@@ -473,6 +481,7 @@ impl Track for FileTrack {
                     &id,
                     sample_rate,
                     packet_duration_ms,
+                    offset_ms,
                     token,
                     packet_sender,
                 )
@@ -537,11 +546,12 @@ async fn stream_audio_file(
     track_id: &str,
     target_sample_rate: u32,
     packet_duration_ms: u32,
+    offset_ms: u32,
     token: CancellationToken,
     packet_sender: TrackPacketSender,
 ) -> Result<()> {
     let start_time = Instant::now();
-    let audio_reader = match extension {
+    let mut audio_reader = match extension {
         "wav" => {
             // Use spawn_blocking for CPU-intensive WAV decoding
             let reader = tokio::task::spawn_blocking(move || {
@@ -566,6 +576,11 @@ async fn stream_audio_file(
         audio_reader.sample_rate(),
         extension
     );
+    if offset_ms > 0 {
+        let offset_samples =
+            (offset_ms as usize * audio_reader.sample_rate() as usize) / 1000;
+        audio_reader.set_position(offset_samples.min(audio_reader.buffer_size()));
+    }
     process_audio_reader(
         processor_chain,
         audio_reader,

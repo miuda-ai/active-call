@@ -732,8 +732,9 @@ impl ActiveCall {
                 play_id,
                 auto_hangup,
                 wait_input_timeout,
+                offset_ms,
             } => {
-                self.do_play(url, play_id, auto_hangup, wait_input_timeout)
+                self.do_play(url, play_id, auto_hangup, wait_input_timeout, offset_ms)
                     .await
             }
             Command::Hangup {
@@ -1016,7 +1017,7 @@ impl ActiveCall {
             );
             if let Some(ringtone_url) = ringtone {
                 drop(state);
-                self.do_play(ringtone_url, None, None, None).await.ok();
+                self.do_play(ringtone_url, None, None, None, None).await.ok();
             } else {
                 info!(session_id = self.session_id, "no ringtone to play");
             }
@@ -1160,6 +1161,7 @@ impl ActiveCall {
         play_id: Option<String>,
         auto_hangup: Option<bool>,
         wait_input_timeout: Option<u32>,
+        offset_ms: Option<u32>,
     ) -> Result<()> {
         let ssrc = rand::random::<u32>();
         info!(
@@ -1169,11 +1171,15 @@ impl ActiveCall {
 
         let play_id = play_id.or(Some(url.clone()));
 
-        let file_track = FileTrack::new(self.server_side_track_id.clone())
+        let mut file_track = FileTrack::new(self.server_side_track_id.clone())
             .with_play_id(play_id.clone())
             .with_ssrc(ssrc)
             .with_path(url)
             .with_cancel_token(self.cancel_token.child_token());
+
+        if let Some(offset) = offset_ms {
+            file_track = file_track.with_offset_ms(offset);
+        }
 
         {
             let mut state = self.call_state.write().await;
