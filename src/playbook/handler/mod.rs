@@ -695,6 +695,7 @@ impl LlmHandler {
                     play_id: None,
                     auto_hangup: None,
                     wait_input_timeout: None,
+                    offset_ms: None,
                 });
             }
 
@@ -1098,6 +1099,7 @@ impl LlmHandler {
                             play_id: None,
                             auto_hangup: None,
                             wait_input_timeout: None,
+                            offset_ms: None,
                         });
                         buffer.drain(..mat.end());
                     }
@@ -1905,6 +1907,7 @@ impl DialogueHandler for LlmHandler {
                         play_id: None,
                         auto_hangup: None,
                         wait_input_timeout: None,
+                        offset_ms: None,
                     });
                 }
             }
