@@ -72,7 +72,7 @@ trait AudioReader: Send {
     fn resample_chunk(&mut self, chunk: &[i16]) -> Vec<i16>;
 }
 
-struct WavAudioReader {
+struct DecodedAudioReader {
     buffer: Vec<i16>,
     sample_rate: u32,
     position: usize,
@@ -80,9 +80,15 @@ struct WavAudioReader {
     resampler: Option<Resampler>,
 }
 
-impl WavAudioReader {
-    fn from_file(file: File, target_sample_rate: u32) -> Result<Self> {
-        let all_samples = crate::media::loader::decode_wav(file, target_sample_rate)?;
+impl DecodedAudioReader {
+    fn from_file(
+        file: File,
+        extension: &str,
+        mime_type: Option<&str>,
+        target_sample_rate: u32,
+    ) -> Result<Self> {
+        let all_samples =
+            crate::media::loader::decode_audio(file, extension, mime_type, target_sample_rate)?;
         Ok(Self {
             buffer: all_samples,
             sample_rate: target_sample_rate,
@@ -91,108 +97,14 @@ impl WavAudioReader {
             resampler: None,
         })
     }
+}
 
+impl AudioReader for DecodedAudioReader {
     fn fill_buffer(&mut self) -> Result<usize> {
-        // All data is already decoded and stored in buffer
-        // Return the remaining samples from current position
         if self.position >= self.buffer.len() {
-            return Ok(0); // End of file
+            return Ok(0);
         }
-
-        let remaining = self.buffer.len() - self.position;
-        Ok(remaining)
-    }
-}
-
-impl AudioReader for WavAudioReader {
-    fn fill_buffer(&mut self) -> Result<usize> {
-        // This method is already implemented in the WavAudioReader struct
-        // We just call it here
-        WavAudioReader::fill_buffer(self)
-    }
-
-    fn buffer_size(&self) -> usize {
-        self.buffer.len()
-    }
-
-    fn position(&self) -> usize {
-        self.position
-    }
-
-    fn set_position(&mut self, pos: usize) {
-        self.position = pos;
-    }
-
-    fn sample_rate(&self) -> u32 {
-        self.sample_rate
-    }
-
-    fn target_sample_rate(&self) -> u32 {
-        self.target_sample_rate
-    }
-
-    fn channels(&self) -> u16 {
-        1
-    }
-
-    fn extract_chunk(&self, start: usize, end: usize) -> Vec<i16> {
-        self.buffer[start..end].to_vec()
-    }
-
-    fn resample_chunk(&mut self, chunk: &[i16]) -> Vec<i16> {
-        if self.sample_rate == self.target_sample_rate {
-            return chunk.to_vec();
-        }
-
-        if let Some(resampler) = &mut self.resampler {
-            resampler.resample(chunk)
-        } else {
-            let mut new_resampler =
-                Resampler::new(self.sample_rate as usize, self.target_sample_rate as usize);
-            let result = new_resampler.resample(chunk);
-            self.resampler = Some(new_resampler);
-            result
-        }
-    }
-}
-
-struct Mp3AudioReader {
-    buffer: Vec<i16>,
-    sample_rate: u32,
-    position: usize,
-    target_sample_rate: u32,
-    resampler: Option<Resampler>,
-}
-
-impl Mp3AudioReader {
-    fn from_file(file: File, target_sample_rate: u32) -> Result<Self> {
-        let all_samples = crate::media::loader::decode_mp3(file, target_sample_rate)?;
-        Ok(Self {
-            buffer: all_samples,
-            sample_rate: target_sample_rate,
-            position: 0,
-            target_sample_rate,
-            resampler: None,
-        })
-    }
-
-    fn fill_buffer(&mut self) -> Result<usize> {
-        // All data is already decoded and stored in buffer
-        // Return the remaining samples from current position
-        if self.position >= self.buffer.len() {
-            return Ok(0); // End of file
-        }
-
-        let remaining = self.buffer.len() - self.position;
-        Ok(remaining)
-    }
-}
-
-impl AudioReader for Mp3AudioReader {
-    fn fill_buffer(&mut self) -> Result<usize> {
-        // This method is already implemented in the Mp3AudioReader struct
-        // We just call it here
-        Mp3AudioReader::fill_buffer(self)
+        Ok(self.buffer.len() - self.position)
     }
 
     fn buffer_size(&self) -> usize {
@@ -231,7 +143,6 @@ impl AudioReader for Mp3AudioReader {
         if let Some(resampler) = &mut self.resampler {
             resampler.resample(chunk)
         } else {
-            // Initialize resampler if needed
             let mut new_resampler =
                 Resampler::new(self.sample_rate as usize, self.target_sample_rate as usize);
             let result = new_resampler.resample(chunk);
@@ -409,33 +320,30 @@ impl Track for FileTrack {
         let play_id = self.play_id.clone();
         crate::spawn(async move {
             let res = async move {
-                // Determine file extension
-                let extension = if path.starts_with("http://") || path.starts_with("https://") {
-                    path.parse::<Url>()?
-                        .path()
-                        .split(".")
-                        .last()
-                        .unwrap_or("")
-                        .to_string()
+                let is_url = path.starts_with("http://") || path.starts_with("https://");
+
+                let extension = if is_url {
+                    path.parse::<Url>()?.path().split('.').last().unwrap_or("").to_string()
                 } else {
                     path.split('.').last().unwrap_or("").to_string()
                 };
 
-                let cache_key = if path.starts_with("http://") || path.starts_with("https://") {
+                let cache_key = if is_url {
                     Some(cache::generate_cache_key(&path, 0, None, None))
                 } else {
                     None
                 };
 
                 // Open file or download from URL
-                let file = if path.starts_with("http://") || path.starts_with("https://") {
+                let open_result = if is_url {
                     crate::media::loader::download_from_url(&path, use_cache).await
                 } else {
-                    File::open(&path).map_err(|e| anyhow::anyhow!("filetrack: {}", e))
+                    File::open(&path)
+                        .map(|f| (f, None))
+                        .map_err(|e| anyhow::anyhow!("filetrack: {}", e))
                 };
-
-                let file = match file {
-                    Ok(file) => file,
+                let (file, content_type) = match open_result {
+                    Ok(result) => result,
                     Err(e) => {
                         warn!("filetrack: Error opening file: {}", e);
                         if let Some(key) = cache_key {
@@ -469,6 +377,7 @@ impl Track for FileTrack {
                 let stream_result = stream_audio_file(
                     processor_chain,
                     extension.as_str(),
+                    content_type.as_deref(),
                     file,
                     &id,
                     sample_rate,
@@ -533,6 +442,7 @@ impl Track for FileTrack {
 async fn stream_audio_file(
     processor_chain: ProcessorChain,
     extension: &str,
+    content_type: Option<&str>,
     file: File,
     track_id: &str,
     target_sample_rate: u32,
@@ -541,25 +451,18 @@ async fn stream_audio_file(
     packet_sender: TrackPacketSender,
 ) -> Result<()> {
     let start_time = Instant::now();
-    let audio_reader = match extension {
-        "wav" => {
-            // Use spawn_blocking for CPU-intensive WAV decoding
-            let reader = tokio::task::spawn_blocking(move || {
-                WavAudioReader::from_file(file, target_sample_rate)
-            })
-            .await??;
-            Box::new(reader) as Box<dyn AudioReader>
-        }
-        "mp3" => {
-            // Use spawn_blocking for CPU-intensive MP3 decoding
-            let reader = tokio::task::spawn_blocking(move || {
-                Mp3AudioReader::from_file(file, target_sample_rate)
-            })
-            .await??;
-            Box::new(reader) as Box<dyn AudioReader>
-        }
-        _ => return Err(anyhow!("Unsupported audio format: {}", extension)),
-    };
+    let extension_owned = extension.to_string();
+    let content_type_owned = content_type.map(|s| s.to_string());
+    let reader = tokio::task::spawn_blocking(move || {
+        DecodedAudioReader::from_file(
+            file,
+            &extension_owned,
+            content_type_owned.as_deref(),
+            target_sample_rate,
+        )
+    })
+    .await??;
+    let audio_reader = Box::new(reader) as Box<dyn AudioReader>;
     info!(
         "filetrack: Load file duration: {:.2} seconds, sample rate: {} Hz, extension: {}",
         start_time.elapsed().as_secs_f64(),
@@ -638,7 +541,7 @@ mod tests {
     async fn test_wav_reader() -> Result<()> {
         let file_path = "fixtures/sample.wav";
         let file = File::open(file_path)?;
-        let mut reader = WavAudioReader::from_file(file, 16000)?;
+        let mut reader = DecodedAudioReader::from_file(file, "wav", None, 16000)?;
         let mut total_samples = 0;
         let mut total_duration_ms = 0.0;
         let mut chunk_count = 0;
@@ -679,8 +582,7 @@ mod tests {
         }
         println!("Verified total samples: {}", verify_samples.len());
 
-        // Test using WavAudioReader
-        let mut reader = WavAudioReader::from_file(file, 16000)?;
+        let mut reader = DecodedAudioReader::from_file(file, "wav", None, 16000)?;
         let mut total_samples = 0;
         let mut total_duration_ms = 0.0;
         let mut chunk_count = 0;
@@ -810,7 +712,7 @@ mod tests {
         let file_path = "fixtures/sample.mp3".to_string();
         match File::open(&file_path) {
             Ok(file) => {
-                let samples = crate::media::loader::decode_mp3(file, 16000)?;
+                let samples = crate::media::loader::decode_audio(file, "mp3", None, 16000)?;
                 assert!(
                     !samples.is_empty(),
                     "Decoded sample list should not be empty"
@@ -831,8 +733,7 @@ mod tests {
         let file_path = "fixtures/sample.mp3".to_string();
         let file = File::open(&file_path)?;
         let sample_rate = 16000;
-        // Test directly creating and using a Mp3AudioReader
-        let mut reader = Mp3AudioReader::from_file(file, sample_rate)?;
+        let mut reader = DecodedAudioReader::from_file(file, "mp3", None, sample_rate)?;
         let mut total_samples = 0;
         let mut total_duration_ms = 0.0;
         while let Some((chunk, _chunk_sample_rate)) = reader.read_chunk(320)? {
@@ -862,7 +763,7 @@ mod tests {
         let output_path = "target/tmp/sample_16k_mono_s16le.pcm";
 
         let file = File::open(input_path)?;
-        let mut reader = Mp3AudioReader::from_file(file, 16000)?;
+        let mut reader = DecodedAudioReader::from_file(file, "mp3", None, 16000)?;
 
         let mut pcm_samples = Vec::<i16>::new();
         while let Some((chunk, _chunk_sample_rate)) = reader.read_chunk(320)? {

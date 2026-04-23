@@ -104,6 +104,7 @@ knf-rs-sys = { version = "0.3.2", optional = true }
 
 # Audio processing
 symphonia = { version = "0.5", features = ["all"] }
+ogg = "0.9"
 unicode-normalization = "0.1"
 rand_distr = "0.6.0"
 num_cpus = "1.16"
