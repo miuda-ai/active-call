@@ -1338,12 +1338,18 @@ impl ActiveCall {
         let session_id = self.session_id.clone();
         let track_id = self.server_side_track_id.clone();
 
-        let recorder = {
+        let (recorder, parent_caller) = {
             let cs = self.call_state.read().await;
-            cs.option
-                .as_ref()
-                .map(|o| o.recorder.clone())
-                .unwrap_or_default()
+            let option = cs.option.as_ref();
+            (
+                option.map(|o| o.recorder.clone()).unwrap_or_default(),
+                option.and_then(|o| o.caller.clone()),
+            )
+        };
+        let caller = if caller.trim().is_empty() {
+            parent_caller.unwrap_or_default()
+        } else {
+            caller
         };
 
         let call_option = CallOption {
