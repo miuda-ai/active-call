@@ -407,7 +407,7 @@ impl ActiveCall {
 
         let process_command_loop = async move {
             while let Ok(command) = cmd_receiver.recv().await {
-                match self.dispatch(command).await {
+                match Box::pin(self.dispatch(command)).await {
                     Ok(_) => (),
                     Err(e) => {
                         warn!(session_id = self.session_id, "{}", e);
