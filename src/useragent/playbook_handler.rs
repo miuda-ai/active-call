@@ -181,8 +181,13 @@ impl InvitationHandler for PlaybookInvitationHandler {
                         tokio::sync::mpsc::unbounded_channel::<crate::event::SessionEvent>();
 
                     // Send Accept command immediately to trigger SDP negotiation
+                    let accept_option = crate::CallOption {
+                        caller: Some(caller.clone()),
+                        callee: Some(callee.clone()),
+                        ..Default::default()
+                    };
                     if let Err(e) = command_sender.send(Command::Accept {
-                        option: Default::default(),
+                        option: accept_option,
                     }) {
                         warn!(session_id, "Failed to send accept command: {}", e);
                         return;
