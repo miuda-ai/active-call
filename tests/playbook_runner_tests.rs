@@ -153,6 +153,7 @@ async fn test_playbook_run_flow() -> Result<()> {
         is_filler: None,
         confidence: None,
         task_id: None,
+        refer: None,
     };
 
     // Send event

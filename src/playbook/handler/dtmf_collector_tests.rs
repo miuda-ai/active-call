@@ -457,6 +457,7 @@ async fn test_collector_on_event_ignores_asr() -> Result<()> {
         is_filler: None,
         confidence: None,
         task_id: None,
+        refer: None,
     };
 
     let commands = handler.on_event(&event).await?;
