@@ -1017,7 +1017,9 @@ impl ActiveCall {
             );
             if let Some(ringtone_url) = ringtone {
                 drop(state);
-                self.do_play(ringtone_url, None, None, None, None).await.ok();
+                self.do_play(ringtone_url, None, None, None, None)
+                    .await
+                    .ok();
             } else {
                 info!(session_id = self.session_id, "no ringtone to play");
             }
@@ -1356,6 +1358,7 @@ impl ActiveCall {
             caller: Some(caller),
             callee: Some(callee.clone()),
             sip: refer_option.as_ref().and_then(|o| o.sip.clone()),
+            vad: refer_option.as_ref().and_then(|o| o.vad.clone()),
             asr: refer_option.as_ref().and_then(|o| o.asr.clone()),
             denoise: refer_option.as_ref().and_then(|o| o.denoise.clone()),
             recorder,
