@@ -533,7 +533,9 @@ impl Invitation {
     ) -> Result<()> {
         if let Some(call) = self.get_pending_call(&dialog_id) {
             call.dialog.reject(code, reason).ok();
-            call.token.cancel();
+            // Don't cancel the token here; the caller (do_reject) yields first so the
+            // app.rs join!(dialog.handle, invite_loop) task gets to run and actually
+            // transmit the queued 603 response before the token cancellation drops it.
         }
         match self.dialog_layer.get_dialog(&dialog_id) {
             Some(dialog) => {

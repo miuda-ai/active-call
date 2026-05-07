@@ -963,7 +963,13 @@ impl ActiveCall {
                     ?code,
                     "rejecting call"
                 );
-                self.invitation.hangup(id, code, reason).await
+                let result = self.invitation.hangup(id, code, reason).await;
+                // Yield so the tokio scheduler can run the dialog.handle task and
+                // flush the queued 603 Decline UDP packet before the token cancel
+                // drops that future.
+                tokio::task::yield_now().await;
+                self.cancel_token.cancel();
+                result
             }
             None => {
                 let ready = self.call_state.write().await.ready_to_answer.take();
@@ -976,6 +982,7 @@ impl ActiveCall {
                     );
                     let dialog_id = dialog.id();
                     dialog.reject(code, reason).ok();
+                    tokio::task::yield_now().await;
                     self.invitation.dialog_layer.remove_dialog(&dialog_id);
                     self.cancel_token.cancel();
                 }
