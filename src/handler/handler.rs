@@ -108,23 +108,27 @@ pub async fn call_handler_core(
     event_sender_to_client: tokio::sync::mpsc::UnboundedSender<crate::event::SessionEvent>,
     extras: Option<HashMap<String, serde_json::Value>>,
     playbook_name: Option<String>,
+    detach: bool,
 ) -> Option<HashMap<String, serde_json::Value>> {
     let _cancel_guard = cancel_token.clone().drop_guard();
     let track_config = TrackConfig::default();
 
-    let active_call = Arc::new(ActiveCall::new(
-        call_type.clone(),
-        cancel_token.clone(),
-        session_id.clone(),
-        app_state.invitation.clone(),
-        app_state.clone(),
-        track_config,
-        Some(audio_receiver),
-        dump_events,
-        server_side_track,
-        extras,
-        None,
-    ));
+    let active_call = Arc::new(
+        ActiveCall::new(
+            call_type.clone(),
+            cancel_token.clone(),
+            session_id.clone(),
+            app_state.invitation.clone(),
+            app_state.clone(),
+            track_config,
+            Some(audio_receiver),
+            dump_events,
+            server_side_track,
+            extras,
+            None,
+        )
+        .with_detach(detach),
+    );
 
     // Load playbook: prefer direct parameter, fall back to pending_playbooks
     // (pending_playbooks is used by the run_playbook HTTP endpoint)
@@ -322,6 +326,7 @@ pub async fn call_handler(
     let server_side_track = params.server_side_track.clone();
     let dump_events = params.dump_events.unwrap_or(true);
     let ping_interval = params.ping_interval.unwrap_or(20);
+    let detach = params.detach.unwrap_or(false);
 
     let resp = ws.on_upgrade(move |socket| async move {
         let (mut ws_sender, mut ws_receiver) = socket.split();
@@ -349,6 +354,7 @@ pub async fn call_handler(
                 event_sender_to_client,
                 None, // extras — not used for WebSocket calls
                 None, // playbook_name — falls back to pending_playbooks
+                detach,
             )
             .await;
         });
@@ -365,7 +371,7 @@ pub async fn call_handler(
                                 continue;
                             }
                         };
-                        if let Err(_) = command_sender.send(command) {
+                        if command_sender.send(command).is_err() && !detach {
                             break;
                         }
                     }
@@ -398,13 +404,18 @@ pub async fn call_handler(
             }
         };
 
-        select! {
-            _ = recv_from_ws_loop => {
-                info!(session_id, "WebSocket receive loop ended");
-            },
-            _ = send_to_ws_loop => {
-                info!(session_id, "WebSocket send loop ended");
-            },
+        if detach {
+            join!(recv_from_ws_loop, send_to_ws_loop);
+            info!(session_id, "WebSocket detached session closed");
+        } else {
+            select! {
+                _ = recv_from_ws_loop => {
+                    info!(session_id, "WebSocket receive loop ended");
+                },
+                _ = send_to_ws_loop => {
+                    info!(session_id, "WebSocket send loop ended");
+                },
+            }
         }
 
         cancel_token.cancel();
@@ -626,6 +637,7 @@ mod tests {
             event_sender,
             Some(extras), // extras passed directly
             None,         // no playbook
+            false,        // detach
         )
         .await;
 

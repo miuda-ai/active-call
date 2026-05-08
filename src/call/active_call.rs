@@ -224,6 +224,7 @@ pub struct CallParams {
     #[serde(rename = "ping")]
     pub ping_interval: Option<u32>,
     pub server_side_track: Option<String>,
+    pub detach: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
@@ -261,6 +262,8 @@ pub struct ActiveCallState {
     pub audio_receiver: Option<WebsocketBytesReceiver>,
     pub ready_to_answer: Option<(String, Option<Box<dyn Track>>, ServerInviteDialog)>,
     pub pending_asr_resume: Option<(u32, TranscriptionOption)>,
+    // In detach mode, cancel only this token to hang up the main call without closing the session
+    pub main_call_token: Option<CancellationToken>,
 }
 
 pub type ActiveCallRef = Arc<ActiveCall>;
@@ -279,6 +282,7 @@ pub struct ActiveCall {
     pub cmd_sender: CommandSender,
     pub dump_events: bool,
     pub server_side_track_id: TrackId,
+    pub detach: bool,
 }
 
 pub struct ActiveCallGuard {
@@ -377,7 +381,13 @@ impl ActiveCall {
             cmd_sender,
             dump_events,
             server_side_track_id: server_side_track_id.unwrap_or("server-side-track".to_string()),
+            detach: false,
         }
+    }
+
+    pub fn with_detach(mut self, detach: bool) -> Self {
+        self.detach = detach;
+        self
     }
 
     pub async fn enqueue_command(&self, command: Command) -> Result<()> {
@@ -1271,13 +1281,27 @@ impl ActiveCall {
             _ => reason.unwrap_or(CallRecordHangupReason::BySystem),
         };
 
-        self.media_stream
-            .stop(Some(hangup_reason.to_string()), initiator);
+        if self.detach {
+            // Set reason before cancelling so on_terminated() sees it and uses it in the event.
+            self.call_state
+                .write()
+                .await
+                .set_hangup_reason(hangup_reason);
+            // Cancel only the main call's SIP dialog token, keeping the session and referred
+            // call alive. The dialog's Drop handler sends BYE and the hangup event.
+            let main_token = self.call_state.write().await.main_call_token.take();
+            if let Some(token) = main_token {
+                token.cancel();
+            }
+        } else {
+            self.media_stream
+                .stop(Some(hangup_reason.to_string()), initiator);
 
-        self.call_state
-            .write()
-            .await
-            .set_hangup_reason(hangup_reason);
+            self.call_state
+                .write()
+                .await
+                .set_hangup_reason(hangup_reason);
+        }
         Ok(())
     }
 
@@ -1680,6 +1704,16 @@ impl ActiveCall {
         Ok(track)
     }
 
+    async fn make_main_call_token(&self) -> CancellationToken {
+        if self.detach {
+            let token = self.cancel_token.child_token();
+            self.call_state.write().await.main_call_token = Some(token.clone());
+            token
+        } else {
+            self.cancel_token.clone()
+        }
+    }
+
     async fn setup_caller_track(&self, option: &CallOption) -> Result<()> {
         let hangup_headers = option
             .sip
@@ -1714,9 +1748,10 @@ impl ActiveCall {
                     .find_dialog_id_by_session_id(&self.session_id)
                 {
                     if let Some(pending_dialog) = self.invitation.get_pending_call(&dialog_id) {
+                        let dialog_token = self.make_main_call_token().await;
                         return self
                             .prepare_incoming_sip_track(
-                                self.cancel_token.clone(),
+                                dialog_token,
                                 self.call_state.clone(),
                                 &self.session_id,
                                 pending_dialog,
@@ -1752,9 +1787,10 @@ impl ActiveCall {
                 let mut invite_option = option.build_invite_option()?;
                 invite_option.call_id = Some(self.session_id.clone());
 
+                let dialog_token = self.make_main_call_token().await;
                 match self
                     .create_outgoing_sip_track(
-                        self.cancel_token.clone(),
+                        dialog_token,
                         self.call_state.clone(),
                         &self.session_id,
                         invite_option,
@@ -1804,9 +1840,10 @@ impl ActiveCall {
                     .find_dialog_id_by_session_id(&self.session_id)
                 {
                     if let Some(pending_dialog) = self.invitation.get_pending_call(&dialog_id) {
+                        let dialog_token = self.make_main_call_token().await;
                         return self
                             .prepare_incoming_sip_track(
-                                self.cancel_token.clone(),
+                                dialog_token,
                                 self.call_state.clone(),
                                 &self.session_id,
                                 pending_dialog,

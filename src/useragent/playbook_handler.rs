@@ -216,6 +216,7 @@ impl InvitationHandler for PlaybookInvitationHandler {
                                 event_sender,
                                 extras_for_call,
                                 Some(playbook_for_call),
+                                false, // detach
                             )
                             .await;
                             let _ = extras_tx.send(result);
