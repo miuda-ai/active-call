@@ -213,6 +213,139 @@ mod tests {
 
         Ok(())
     }
+
+    async fn make_active_call(detach: bool) -> Arc<ActiveCall> {
+        let mut config = Config::default();
+        config.udp_port = 0;
+        config.media_cache_path = "/tmp/mediacache".to_string();
+        let app_state = AppStateBuilder::new()
+            .with_config(config)
+            .with_stream_engine(Arc::new(StreamEngine::default()))
+            .build()
+            .await
+            .unwrap();
+
+        let cancel_token = CancellationToken::new();
+        Arc::new(
+            ActiveCall::new(
+                ActiveCallType::Sip,
+                cancel_token,
+                "test-session".to_string(),
+                app_state.invitation.clone(),
+                app_state.clone(),
+                TrackConfig::default(),
+                None,
+                false,
+                None,
+                None,
+                None,
+            )
+            .with_detach(detach),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_detach_hangup_keeps_session_alive() -> Result<()> {
+        let active_call = make_active_call(true).await;
+
+        // Simulate the token that would be created when a SIP dialog is set up
+        let main_token = active_call.cancel_token.child_token();
+        active_call.call_state.write().await.main_call_token = Some(main_token.clone());
+
+        active_call.do_hangup(None, None, None).await?;
+
+        // Session token must still be alive
+        assert!(
+            !active_call.cancel_token.is_cancelled(),
+            "session cancel_token should NOT be cancelled in detach mode"
+        );
+        // Main-call token must be cancelled
+        assert!(
+            main_token.is_cancelled(),
+            "main_call_token should be cancelled by do_hangup"
+        );
+        // Token should be taken out of state
+        assert!(
+            active_call
+                .call_state
+                .read()
+                .await
+                .main_call_token
+                .is_none(),
+            "main_call_token should be cleared from state after hangup"
+        );
+        // Hangup reason must be set before the token was cancelled (race-free ordering)
+        assert!(
+            active_call
+                .call_state
+                .read()
+                .await
+                .hangup_reason
+                .is_some(),
+            "hangup_reason should be set"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_no_detach_hangup_stops_media_stream() -> Result<()> {
+        let active_call = make_active_call(false).await;
+
+        active_call.do_hangup(None, None, None).await?;
+
+        assert!(
+            active_call.media_stream.cancel_token.is_cancelled(),
+            "media_stream cancel_token should be cancelled in non-detach mode"
+        );
+        assert!(
+            !active_call.cancel_token.is_cancelled(),
+            "session cancel_token should not be directly cancelled by do_hangup"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_detach_make_main_call_token_is_child() -> Result<()> {
+        let active_call = make_active_call(true).await;
+
+        let child_token = active_call.make_main_call_token().await;
+
+        assert!(
+            !child_token.is_cancelled(),
+            "child token should not be cancelled initially"
+        );
+
+        // Cancelling the session token must cascade to the child
+        active_call.cancel_token.cancel();
+
+        assert!(
+            child_token.is_cancelled(),
+            "child token should be cancelled when session token is cancelled"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_no_detach_make_main_call_token_is_session_token() -> Result<()> {
+        let active_call = make_active_call(false).await;
+
+        let token = active_call.make_main_call_token().await;
+
+        // In non-detach mode, the returned token IS the session token
+        assert_eq!(
+            token.is_cancelled(),
+            active_call.cancel_token.is_cancelled(),
+            "non-detach token should mirror the session token state"
+        );
+
+        active_call.cancel_token.cancel();
+
+        assert!(
+            token.is_cancelled(),
+            "token should be cancelled when session token is cancelled"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Deserialize)]
@@ -1784,8 +1917,26 @@ impl ActiveCall {
                     }
                 }
 
+                // Reset per-call state so a re-invite in detach mode starts clean.
+                // answer must be None or create_outgoing_sip_track will skip storing the new SDP.
+                // ssrc must be fresh so auto_hangup triggers don't fire for the wrong call.
+                {
+                    let mut cs = self.call_state.write().await;
+                    cs.answer = None;
+                    cs.ring_time = None;
+                    cs.answer_time = None;
+                    cs.hangup_reason = None;
+                    cs.ssrc = rand::random::<u32>();
+                    cs.auto_hangup = None;
+                }
+
                 let mut invite_option = option.build_invite_option()?;
-                invite_option.call_id = Some(self.session_id.clone());
+                // Call-ID must be unique per dialog; reusing session_id breaks re-invites.
+                invite_option.call_id = Some(format!(
+                    "{}.{}",
+                    self.session_id,
+                    rand::random::<u32>()
+                ));
 
                 let dialog_token = self.make_main_call_token().await;
                 match self

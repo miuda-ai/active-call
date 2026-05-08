@@ -650,4 +650,73 @@ mod tests {
             "session-scoped extras should be preserved"
         );
     }
+
+    #[tokio::test]
+    async fn test_call_handler_core_detach_survives_hangup() {
+        use crate::app::AppStateBuilder;
+        use crate::call::{ActiveCallType, Command};
+        use crate::config::Config;
+
+        let mut config = Config::default();
+        config.udp_port = 0;
+        let app_state = AppStateBuilder::new()
+            .with_config(config)
+            .build()
+            .await
+            .expect("Failed to build app state");
+
+        let cancel_token = CancellationToken::new();
+        let (_audio_sender, audio_receiver) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+        let (command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel::<Command>();
+        let (event_sender, _event_receiver) =
+            tokio::sync::mpsc::unbounded_channel::<crate::event::SessionEvent>();
+
+        // Spawn call_handler_core with detach=true
+        let handle = tokio::spawn(call_handler_core(
+            ActiveCallType::Sip,
+            "test-detach-survives".to_string(),
+            app_state,
+            cancel_token,
+            audio_receiver,
+            None,
+            false,
+            0,
+            command_receiver,
+            event_sender,
+            None,
+            None,
+            true, // detach
+        ));
+
+        // Give the handler a moment to start
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Send Hangup and wait briefly — in detach mode the handler should NOT exit
+        command_sender
+            .send(Command::Hangup {
+                reason: None,
+                initiator: None,
+                headers: None,
+            })
+            .ok();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        assert!(
+            !handle.is_finished(),
+            "call_handler_core should remain alive after Hangup in detach mode"
+        );
+
+        // Dropping the command sender (simulating WS disconnect) should end the session
+        drop(command_sender);
+        let result = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            handle,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "call_handler_core should terminate after command sender is dropped"
+        );
+    }
 }

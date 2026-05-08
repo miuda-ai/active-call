@@ -273,6 +273,7 @@ async fn main() -> Result<()> {
                 event_sender,
                 None,     // extras
                 playbook, // playbook_name — passed directly
+                false,    // detach
             )
             .await;
         });
