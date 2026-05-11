@@ -645,6 +645,7 @@ impl LlmHandler {
                     reason: Some("DTMF Hangup".to_string()),
                     initiator: Some("ai".to_string()),
                     headers,
+                    refer: None,
                 }])
             }
         }
@@ -1318,6 +1319,7 @@ impl LlmHandler {
                     reason: reason.clone(),
                     initiator: initiator.clone(),
                     headers,
+                    refer: None,
                 });
                 Ok(false)
             }
@@ -1728,6 +1730,7 @@ impl LlmHandler {
                 reason: Some("Max follow-up reached".to_string()),
                 initiator: Some("system".to_string()),
                 headers,
+                refer: None,
             }]);
         }
 
@@ -1756,6 +1759,7 @@ impl LlmHandler {
                     reason: args["reason"].as_str().map(|s| s.to_string()),
                     initiator: Some("ai".to_string()),
                     headers,
+                    refer: None,
                 }])
             }
             "transfer_call" | "refer_call" => {

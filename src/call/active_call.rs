@@ -252,7 +252,7 @@ mod tests {
         let main_token = active_call.cancel_token.child_token();
         active_call.call_state.write().await.main_call_token = Some(main_token.clone());
 
-        active_call.do_hangup(None, None, None).await?;
+        active_call.do_hangup(None, None, None, None).await?;
 
         // Session token must still be alive
         assert!(
@@ -291,7 +291,7 @@ mod tests {
     async fn test_no_detach_hangup_stops_media_stream() -> Result<()> {
         let active_call = make_active_call(false).await;
 
-        active_call.do_hangup(None, None, None).await?;
+        active_call.do_hangup(None, None, None, None).await?;
 
         assert!(
             active_call.media_stream.cancel_token.is_cancelled(),
@@ -346,6 +346,99 @@ mod tests {
         );
         Ok(())
     }
+
+    async fn setup_refer_token(active_call: &Arc<ActiveCall>) -> CancellationToken {
+        let refer_token = active_call.cancel_token.child_token();
+        active_call.call_state.write().await.refer_call_token = Some(refer_token.clone());
+        refer_token
+    }
+
+    // refer: None — detach mode: main call and refer call both cancelled, session stays alive.
+    #[tokio::test]
+    async fn test_hangup_none_detach_cancels_both() -> Result<()> {
+        let active_call = make_active_call(true).await;
+        let main_token = active_call.cancel_token.child_token();
+        active_call.call_state.write().await.main_call_token = Some(main_token.clone());
+        let refer_token = setup_refer_token(&active_call).await;
+
+        active_call.do_hangup(None, None, None, None).await?;
+
+        assert!(!active_call.cancel_token.is_cancelled(), "session should stay alive");
+        assert!(main_token.is_cancelled(), "main call should be cancelled");
+        assert!(refer_token.is_cancelled(), "refer call should be cancelled");
+        Ok(())
+    }
+
+    // refer: None — non-detach mode: media stream stopped and refer call cancelled.
+    #[tokio::test]
+    async fn test_hangup_none_no_detach_cancels_refer() -> Result<()> {
+        let active_call = make_active_call(false).await;
+        let refer_token = setup_refer_token(&active_call).await;
+
+        active_call.do_hangup(None, None, None, None).await?;
+
+        assert!(active_call.media_stream.cancel_token.is_cancelled(), "media stream should stop");
+        assert!(refer_token.is_cancelled(), "refer call should be cancelled");
+        Ok(())
+    }
+
+    // refer: Some(true) — detach mode: only refer call cancelled, main call untouched.
+    #[tokio::test]
+    async fn test_hangup_refer_true_detach_cancels_refer_only() -> Result<()> {
+        let active_call = make_active_call(true).await;
+        let main_token = active_call.cancel_token.child_token();
+        active_call.call_state.write().await.main_call_token = Some(main_token.clone());
+        let refer_token = setup_refer_token(&active_call).await;
+
+        active_call.do_hangup(None, None, None, Some(true)).await?;
+
+        assert!(!active_call.cancel_token.is_cancelled(), "session should stay alive");
+        assert!(!main_token.is_cancelled(), "main call should NOT be cancelled");
+        assert!(refer_token.is_cancelled(), "refer call should be cancelled");
+        Ok(())
+    }
+
+    // refer: Some(true) — non-detach mode: only refer call cancelled, media stream untouched.
+    #[tokio::test]
+    async fn test_hangup_refer_true_no_detach_cancels_refer_only() -> Result<()> {
+        let active_call = make_active_call(false).await;
+        let refer_token = setup_refer_token(&active_call).await;
+
+        active_call.do_hangup(None, None, None, Some(true)).await?;
+
+        assert!(!active_call.media_stream.cancel_token.is_cancelled(), "media stream should NOT stop");
+        assert!(refer_token.is_cancelled(), "refer call should be cancelled");
+        Ok(())
+    }
+
+    // refer: Some(false) — detach mode: only main call cancelled, refer call stays alive.
+    #[tokio::test]
+    async fn test_hangup_refer_false_detach_cancels_main_only() -> Result<()> {
+        let active_call = make_active_call(true).await;
+        let main_token = active_call.cancel_token.child_token();
+        active_call.call_state.write().await.main_call_token = Some(main_token.clone());
+        let refer_token = setup_refer_token(&active_call).await;
+
+        active_call.do_hangup(None, None, None, Some(false)).await?;
+
+        assert!(!active_call.cancel_token.is_cancelled(), "session should stay alive");
+        assert!(main_token.is_cancelled(), "main call should be cancelled");
+        assert!(!refer_token.is_cancelled(), "refer call should NOT be cancelled");
+        Ok(())
+    }
+
+    // refer: Some(false) — non-detach mode: main_call_token is None, so nothing is cancelled.
+    #[tokio::test]
+    async fn test_hangup_refer_false_no_detach_is_noop() -> Result<()> {
+        let active_call = make_active_call(false).await;
+        let refer_token = setup_refer_token(&active_call).await;
+
+        active_call.do_hangup(None, None, None, Some(false)).await?;
+
+        assert!(!active_call.media_stream.cancel_token.is_cancelled(), "media stream should NOT stop");
+        assert!(!refer_token.is_cancelled(), "refer call should NOT be cancelled");
+        Ok(())
+    }
 }
 
 #[derive(Deserialize)]
@@ -397,6 +490,8 @@ pub struct ActiveCallState {
     pub pending_asr_resume: Option<(u32, TranscriptionOption)>,
     // In detach mode, cancel only this token to hang up the main call without closing the session
     pub main_call_token: Option<CancellationToken>,
+    // Cancel this token to hang up only the refer call, leaving the main call alive
+    pub refer_call_token: Option<CancellationToken>,
 }
 
 pub type ActiveCallRef = Arc<ActiveCall>;
@@ -675,7 +770,7 @@ impl ActiveCall {
                                     session_id = self.session_id,
                                     ssrc, "auto hangup when track end track_id:{}", track_id
                                 );
-                                self.do_hangup(Some(hangup_reason), None, None).await.ok();
+                                self.do_hangup(Some(hangup_reason), None, None, None).await.ok();
                             }
                         }
 
@@ -704,7 +799,7 @@ impl ActiveCall {
                             session_id = self.session_id,
                             track_id, "inactivity timeout reached, hanging up"
                         );
-                        self.do_hangup(Some(CallRecordHangupReason::InactivityTimeout), None, None)
+                        self.do_hangup(Some(CallRecordHangupReason::InactivityTimeout), None, None, None)
                             .await
                             .ok();
                     }
@@ -884,12 +979,13 @@ impl ActiveCall {
                 reason,
                 initiator,
                 headers,
+                refer,
             } => {
                 let reason = reason.map(|r| {
                     r.parse::<CallRecordHangupReason>()
                         .unwrap_or(CallRecordHangupReason::BySystem)
                 });
-                self.do_hangup(reason, initiator, headers).await
+                self.do_hangup(reason, initiator, headers, refer).await
             }
             Command::Refer {
                 caller,
@@ -1013,7 +1109,7 @@ impl ActiveCall {
                     code: None,
                 };
                 self.event_sender.send(error_event).ok();
-                self.do_hangup(Some(CallRecordHangupReason::BySystem), None, None)
+                self.do_hangup(Some(CallRecordHangupReason::BySystem), None, None, None)
                     .await
                     .ok();
                 return Err(e);
@@ -1049,7 +1145,7 @@ impl ActiveCall {
                     code: Some(486),
                 };
                 self.event_sender.send(rejet_event).ok();
-                self.do_hangup(Some(CallRecordHangupReason::BySystem), None, None)
+                self.do_hangup(Some(CallRecordHangupReason::BySystem), None, None, None)
                     .await
                     .ok();
                 return Err(anyhow::anyhow!("no pending call to accept"));
@@ -1385,26 +1481,42 @@ impl ActiveCall {
         reason: Option<CallRecordHangupReason>,
         initiator: Option<String>,
         headers: Option<HashMap<String, String>>,
+        refer: Option<bool>,
     ) -> Result<()> {
         info!(
             session_id = self.session_id,
             ?reason,
             ?initiator,
             ?headers,
+            ?refer,
             "do_hangup"
         );
+
+        // Hang up only the refer call, leaving the main call alive.
+        if refer == Some(true) {
+            if let Some(headers) = headers {
+                if let Some(refer_state) = self.call_state.read().await.refer_callstate.clone() {
+                    let h_val = serde_json::to_value(&headers).unwrap_or_default();
+                    let mut rs = refer_state.write().await;
+                    let mut extras = rs.extras.take().unwrap_or_default();
+                    extras.insert("_hangup_headers".to_string(), h_val);
+                    rs.extras = Some(extras);
+                }
+            }
+            let token = self.call_state.write().await.refer_call_token.take();
+            if let Some(token) = token {
+                token.cancel();
+            }
+            return Ok(());
+        }
 
         // Store headers in extras if provided
         if let Some(headers) = headers {
             let h_val = serde_json::to_value(&headers).unwrap_or_default();
-
-            {
-                let mut state = self.call_state.write().await;
-                let mut extras = state.extras.take().unwrap_or_default();
-                extras.insert("_hangup_headers".to_string(), h_val.clone());
-                state.extras = Some(extras);
-            }
-        } else {
+            let mut state = self.call_state.write().await;
+            let mut extras = state.extras.take().unwrap_or_default();
+            extras.insert("_hangup_headers".to_string(), h_val);
+            state.extras = Some(extras);
         }
 
         let hangup_reason = match initiator.as_deref() {
@@ -1414,7 +1526,8 @@ impl ActiveCall {
             _ => reason.unwrap_or(CallRecordHangupReason::BySystem),
         };
 
-        if self.detach {
+        // refer: Some(false) — hang up main call, keep refer call alive (always use detach logic).
+        if self.detach || refer == Some(false) {
             // Set reason before cancelling so on_terminated() sees it and uses it in the event.
             self.call_state
                 .write()
@@ -1434,6 +1547,14 @@ impl ActiveCall {
                 .write()
                 .await
                 .set_hangup_reason(hangup_reason);
+        }
+
+        // refer: None — plain hangup means kill everything, including any active refer call.
+        if refer.is_none() {
+            let refer_token = self.call_state.write().await.refer_call_token.take();
+            if let Some(token) = refer_token {
+                token.cancel();
+            }
         }
         Ok(())
     }
@@ -1590,10 +1711,13 @@ impl ActiveCall {
             "do_refer"
         );
 
+        let refer_cancel_token = self.cancel_token.child_token();
+        self.call_state.write().await.refer_call_token = Some(refer_cancel_token.clone());
+
         let r = tokio::time::timeout(
             Duration::from_secs(timeout_secs as u64),
             self.create_outgoing_sip_track(
-                self.cancel_token.child_token(),
+                refer_cancel_token,
                 refer_call_state.clone(),
                 &track_id,
                 invite_option,
@@ -1605,7 +1729,9 @@ impl ActiveCall {
         .await;
 
         {
-            self.call_state.write().await.moh = None;
+            let mut cs = self.call_state.write().await;
+            cs.moh = None;
+            cs.refer_call_token = None;
         }
 
         let result = match r {
