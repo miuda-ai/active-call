@@ -76,6 +76,7 @@ pub enum Command {
         reason: Option<String>,
         initiator: Option<String>,
         headers: Option<HashMap<String, String>>,
+        refer: Option<bool>,
     },
     Refer {
         caller: String,
