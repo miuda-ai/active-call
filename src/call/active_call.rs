@@ -1474,6 +1474,10 @@ impl ActiveCall {
         match result {
             Ok(answer) => {
                 self.media_stream.set_track_refer(&track_id, Some(true)).await;
+                let forward_dtmf = refer_option.as_ref().and_then(|o| o.forward_dtmf).unwrap_or(true);
+                if !forward_dtmf {
+                    self.media_stream.set_track_dtmf_forward(&track_id, false).await;
+                }
                 self.event_sender
                     .send(SessionEvent::Answer {
                         timestamp: crate::media::get_timestamp(),

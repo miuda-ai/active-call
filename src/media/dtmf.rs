@@ -22,6 +22,7 @@ pub struct DtmfDetector {
     last_event: AtomicU8,
     last_duration: AtomicU16,
     pub refer: Option<bool>,
+    pub suppress_dtmf_forward: bool,
 }
 
 #[derive(Debug)]
@@ -80,6 +81,7 @@ impl DtmfDetector {
             last_event: AtomicU8::new(0xFF),
             last_duration: AtomicU16::new(0),
             refer: None,
+            suppress_dtmf_forward: false,
         }
     }
 

@@ -32,6 +32,7 @@ async fn test_refer_option_pause_parent_asr_field() {
         asr: None,
         sip: None,
         call_id: None,
+        forward_dtmf: None,
     };
 
     assert_eq!(refer_option.pause_parent_asr, Some(true));
@@ -45,6 +46,7 @@ async fn test_refer_option_pause_parent_asr_field() {
         asr: None,
         sip: None,
         call_id: None,
+        forward_dtmf: None,
     };
 
     assert_eq!(refer_option_false.pause_parent_asr, Some(false));
@@ -59,6 +61,7 @@ async fn test_refer_option_pause_parent_asr_field() {
         asr: None,
         sip: None,
         call_id: None,
+        forward_dtmf: None,
     };
     assert_eq!(none_refer.pause_parent_asr, None);
 }
@@ -135,6 +138,7 @@ async fn test_refer_option_serialization() -> Result<()> {
         asr: None,
         sip: None,
         call_id: None,
+        forward_dtmf: None,
     };
 
     let json = serde_json::to_string(&refer_option)?;
