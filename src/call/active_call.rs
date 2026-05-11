@@ -1492,33 +1492,6 @@ impl ActiveCall {
             "do_hangup"
         );
 
-        // Hang up only the refer call, leaving the main call alive.
-        if refer == Some(true) {
-            if let Some(headers) = headers {
-                if let Some(refer_state) = self.call_state.read().await.refer_callstate.clone() {
-                    let h_val = serde_json::to_value(&headers).unwrap_or_default();
-                    let mut rs = refer_state.write().await;
-                    let mut extras = rs.extras.take().unwrap_or_default();
-                    extras.insert("_hangup_headers".to_string(), h_val);
-                    rs.extras = Some(extras);
-                }
-            }
-            let token = self.call_state.write().await.refer_call_token.take();
-            if let Some(token) = token {
-                token.cancel();
-            }
-            return Ok(());
-        }
-
-        // Store headers in extras if provided
-        if let Some(headers) = headers {
-            let h_val = serde_json::to_value(&headers).unwrap_or_default();
-            let mut state = self.call_state.write().await;
-            let mut extras = state.extras.take().unwrap_or_default();
-            extras.insert("_hangup_headers".to_string(), h_val);
-            state.extras = Some(extras);
-        }
-
         let hangup_reason = match initiator.as_deref() {
             Some("caller") => CallRecordHangupReason::ByCaller,
             Some("callee") => CallRecordHangupReason::ByCallee,
@@ -1526,34 +1499,53 @@ impl ActiveCall {
             _ => reason.unwrap_or(CallRecordHangupReason::BySystem),
         };
 
-        // refer: Some(false) — hang up main call, keep refer call alive (always use detach logic).
-        if self.detach || refer == Some(false) {
-            // Set reason before cancelling so on_terminated() sees it and uses it in the event.
-            self.call_state
-                .write()
-                .await
-                .set_hangup_reason(hangup_reason);
-            // Cancel only the main call's SIP dialog token, keeping the session and referred
-            // call alive. The dialog's Drop handler sends BYE and the hangup event.
-            let main_token = self.call_state.write().await.main_call_token.take();
-            if let Some(token) = main_token {
-                token.cancel();
+        match refer {
+            Some(true) => {
+                // Hang up only the refer call, leaving the main call alive.
+                if let Some(refer_state) = self.call_state.read().await.refer_callstate.clone() {
+                    if let Some(headers) = headers {
+                        let h_val = serde_json::to_value(&headers).unwrap_or_default();
+                        let mut rs = refer_state.write().await;
+                        let mut extras = rs.extras.take().unwrap_or_default();
+                        extras.insert("_hangup_headers".to_string(), h_val);
+                        rs.extras = Some(extras);
+                    }
+                    // Set reason before cancelling so on_terminated() sees it and uses it in the event.
+                    refer_state.write().await.set_hangup_reason(hangup_reason);
+                }
+                if let Some(token) = self.call_state.write().await.refer_call_token.take() {
+                    token.cancel();
+                }
             }
-        } else {
-            self.media_stream
-                .stop(Some(hangup_reason.to_string()), initiator);
+            _ => {
+                // Store headers in main call state.
+                if let Some(headers) = headers {
+                    let h_val = serde_json::to_value(&headers).unwrap_or_default();
+                    let mut state = self.call_state.write().await;
+                    let mut extras = state.extras.take().unwrap_or_default();
+                    extras.insert("_hangup_headers".to_string(), h_val);
+                    state.extras = Some(extras);
+                }
 
-            self.call_state
-                .write()
-                .await
-                .set_hangup_reason(hangup_reason);
-        }
+                if self.detach || refer == Some(false) {
+                    // Hang up main call only; keep session (and refer call for Some(false)) alive.
+                    // Set reason before cancelling so on_terminated() sees it and uses it in the event.
+                    self.call_state.write().await.set_hangup_reason(hangup_reason);
+                    if let Some(token) = self.call_state.write().await.main_call_token.take() {
+                        token.cancel();
+                    }
+                } else {
+                    self.media_stream
+                        .stop(Some(hangup_reason.to_string()), initiator);
+                    self.call_state.write().await.set_hangup_reason(hangup_reason);
+                }
 
-        // refer: None — plain hangup means kill everything, including any active refer call.
-        if refer.is_none() {
-            let refer_token = self.call_state.write().await.refer_call_token.take();
-            if let Some(token) = refer_token {
-                token.cancel();
+                // refer: None — plain hangup kills everything, including any active refer call.
+                if refer.is_none() {
+                    if let Some(token) = self.call_state.write().await.refer_call_token.take() {
+                        token.cancel();
+                    }
+                }
             }
         }
         Ok(())
