@@ -1721,9 +1721,7 @@ impl ActiveCall {
         .await;
 
         {
-            let mut cs = self.call_state.write().await;
-            cs.moh = None;
-            cs.refer_call_token = None;
+            self.call_state.write().await.moh = None;
         }
 
         let result = match r {
