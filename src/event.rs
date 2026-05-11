@@ -120,11 +120,13 @@ pub enum SessionEvent {
         track_id: String,
         timestamp: u64,
         digit: String,
+        refer: Option<bool>,
     },
     Hold {
         track_id: String,
         timestamp: u64,
         on_hold: bool,
+        refer: Option<bool>,
     },
     TransferRequest {
         track_id: String,

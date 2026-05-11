@@ -1473,6 +1473,7 @@ impl ActiveCall {
 
         match result {
             Ok(answer) => {
+                self.media_stream.set_track_refer(&track_id, Some(true)).await;
                 self.event_sender
                     .send(SessionEvent::Answer {
                         timestamp: crate::media::get_timestamp(),

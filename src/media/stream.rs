@@ -407,6 +407,12 @@ impl MediaStream {
         Ok(())
     }
 
+    pub async fn set_track_refer(&self, track_id: &TrackId, refer: Option<bool>) {
+        if let Some((_, dtmf)) = self.tracks.lock().await.get_mut(track_id) {
+            dtmf.refer = refer;
+        }
+    }
+
     async fn handle_forward_track(&self, mut packet_receiver: TrackPacketReceiver) {
         let event_sender = self.event_sender.clone();
         while let Some(packet) = packet_receiver.recv().await {
@@ -432,6 +438,7 @@ impl MediaStream {
                                         track_id: packet.track_id.to_string(),
                                         timestamp: packet.timestamp,
                                         digit,
+                                        refer: dtmf_detector.refer,
                                     })
                                     .ok();
                             }
