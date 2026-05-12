@@ -22,6 +22,7 @@ pub mod handler;
 pub mod locator;
 pub mod media;
 pub mod net_tool;
+pub mod main_builder;
 
 #[cfg(feature = "offline")]
 pub mod offline;
