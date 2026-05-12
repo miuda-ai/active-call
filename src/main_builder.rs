@@ -374,14 +374,21 @@ impl MainBuilder {
                     break;
                 }
                 res = &mut shutdown_task, if canceled => {
-                    if let Err(e) = res {
-                        warn!("Graceful AppState shutdown failed: {}", e);
-                        app_state.stop();
+                    match res {
+                        Ok(()) => {
+                            info!("Graceful AppState shutdown completed");
+                        }
+                        Err(e) => {
+                            warn!("Graceful AppState shutdown failed: {}", e);
+                            app_state.stop();
+                        }
                     }
+                    break;
                 }
                 signal = &mut shutdown_signal, if !canceled => {
                     match signal {
                         Ok(ShutdownSignal::CtrlC) => info!("SIGINT (Ctrl-C) received"),
+                        #[cfg(unix)]
                         Ok(ShutdownSignal::SigTerm) => info!("SIGTERM received"),
                         Err(e) => {
                             warn!("Shutdown signal handler failed: {}", e);
@@ -422,6 +429,7 @@ pub async fn index() -> impl IntoResponse {
 
 enum ShutdownSignal {
     CtrlC,
+    #[cfg(unix)]
     SigTerm,
 }
 
