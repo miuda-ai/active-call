@@ -753,6 +753,7 @@ impl ActiveCall {
                 callee,
                 options,
             } => self.do_refer(caller, callee, options).await,
+            Command::Bridge { target_session_id } => self.do_bridge(target_session_id).await,
             Command::Mute { track_id } => self.do_mute(track_id).await,
             Command::Unmute { track_id } => self.do_unmute(track_id).await,
             Command::Pause {} => self.do_pause().await,
@@ -1017,7 +1018,9 @@ impl ActiveCall {
             );
             if let Some(ringtone_url) = ringtone {
                 drop(state);
-                self.do_play(ringtone_url, None, None, None, None).await.ok();
+                self.do_play(ringtone_url, None, None, None, None)
+                    .await
+                    .ok();
             } else {
                 info!(session_id = self.session_id, "no ringtone to play");
             }
@@ -1504,6 +1507,61 @@ impl ActiveCall {
                 return Err(e.into());
             }
         }
+        Ok(())
+    }
+
+    async fn do_bridge(&self, target_session_id: String) -> Result<()> {
+        let target = {
+            let calls = self.app_state.active_calls.lock().unwrap();
+            calls.get(&target_session_id).cloned()
+        };
+        let target = target.ok_or_else(|| {
+            anyhow::anyhow!("bridge target session not found: {}", target_session_id)
+        })?;
+
+        if target.session_id == self.session_id {
+            return Err(anyhow::anyhow!("cannot bridge a call to itself").into());
+        }
+
+        // Bridge lifetime: cancelled when either call cancels, or by either
+        // ForwardingProcessor when its destination channel is dropped.
+        let bridge_token = CancellationToken::new();
+        let self_token = self.cancel_token.clone();
+        let target_token = target.cancel_token.clone();
+        let bridge_token_watcher = bridge_token.clone();
+        let session_id = self.session_id.clone();
+        let target_session_id_log = target_session_id.clone();
+        crate::spawn(async move {
+            select! {
+                _ = self_token.cancelled() => {}
+                _ = target_token.cancelled() => {}
+                _ = bridge_token_watcher.cancelled() => {}
+            }
+            bridge_token_watcher.cancel();
+            info!(
+                session_id,
+                target = target_session_id_log,
+                "audio bridge torn down"
+            );
+        });
+
+        // The caller-side track (RTC/WebRTC/WebSocket/SIP) is registered under
+        // session_id and is the one whose processor chain sees audio received
+        // from the remote endpoint. server_side_track_id is for server-originated
+        // playback (TTS/files) and is not what we want to tap.
+        self.media_stream
+            .bridge_to(&target.media_stream, &self.session_id, bridge_token.clone())
+            .await?;
+        target
+            .media_stream
+            .bridge_to(&self.media_stream, &target.session_id, bridge_token.clone())
+            .await?;
+
+        info!(
+            session_id = self.session_id,
+            target = target_session_id,
+            "audio bridge established"
+        );
         Ok(())
     }
 

@@ -83,6 +83,13 @@ pub enum Command {
         callee: String,
         options: Option<ReferOption>,
     },
+    /// Bridge audio with another established call.
+    /// Both calls remain in their own session/event flow; only audio is patched
+    /// between them bidirectionally. Call flow is handled externally.
+    Bridge {
+        /// session_id of the other call to bridge audio with
+        target_session_id: String,
+    },
     Mute {
         track_id: Option<String>,
     },
