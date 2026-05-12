@@ -3,5 +3,5 @@ use anyhow::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    MainBuilder::main()
+    MainBuilder::default().run().await
 }

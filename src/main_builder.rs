@@ -29,23 +29,12 @@ pub struct MainBuilder {
     pub router: Router<Arc<AppStateInner>>,
     /// If None - default will be used
     pub stream_engine: Option<Arc<StreamEngine>>,
-    /// Will use Handle::current, otherwise creates this default runtime
-    pub runtime: Option<tokio::runtime::Runtime>,
     /// To keep the logging guard alive
     pub guard_holder: Option<WorkerGuard>,
 }
 
 impl MainBuilder {
-    pub fn main() -> Result<()> {
-        Self::default()?.run()
-    }
-
-    pub fn default() -> Result<Self> {
-        let cli = Cli::parse();
-        Self::from_cli(cli)
-    }
-
-    pub fn from_cli(cli: Cli) -> Result<Self> {
+    pub fn from_cli(cli: Cli) -> Self {
         let config = if let Some(path) = &cli.conf {
             Config::load(&path).unwrap_or_else(|e| {
                 println!("Failed to load config from {}: {}, using defaults", path, e);
@@ -54,7 +43,7 @@ impl MainBuilder {
         } else {
             Config::default()
         };
-        Ok(Self::new(cli, config))
+        Self::new(cli, config)
     }
 
     pub fn new(cli: Cli, config: Config) -> Self {
@@ -62,7 +51,6 @@ impl MainBuilder {
         MainBuilder {
             cli,
             config,
-            runtime: None,
             stream_engine: None,
             router: Self::default_router(),
             guard_holder: None,
@@ -127,24 +115,15 @@ impl MainBuilder {
         config
     }
 
-    pub fn run(&mut self) -> Result<()> {
+    pub async fn run(mut self) -> Result<()> {
         Self::init();
         #[cfg(feature = "offline")]
-        self.handle_offline()?;
+        if self.handle_offline()? {
+            return Ok(());
+        }
         self.setup_logging()?;
         info!("Starting active-call service...");
 
-        if let Ok(current) = tokio::runtime::Handle::try_current() {
-            current.block_on(self.run_async())
-        } else if let Some(ref rt) = self.runtime {
-            rt.block_on(self.run_async())
-        } else {
-            self.runtime = Some(tokio::runtime::Runtime::new()?);
-            self.runtime.as_ref().unwrap().block_on(self.run_async())
-        }
-    }
-
-    async fn run_async(&self) -> Result<()> {
         let app_state = self.build_app_state().await?;
         self.handle_cli_direct_call(app_state.clone()).await;
         let listener = self.build_tcp_listener()?;
@@ -160,7 +139,7 @@ impl MainBuilder {
     }
 
     #[cfg(feature = "offline")]
-    fn handle_offline(&self) -> Result<()> {
+    fn handle_offline(&self) -> Result<bool> {
         use crate::offline::{ModelDownloader, ModelType, OfflineConfig, init_offline_models};
         use std::path::PathBuf;
 
@@ -180,7 +159,7 @@ impl MainBuilder {
             println!("✓ Models downloaded to: {}", models_dir.display());
 
             if self.cli.exit_after_download {
-                return Ok(());
+                return Ok(true);
             }
         }
 
@@ -199,7 +178,7 @@ impl MainBuilder {
             );
         }
 
-        Ok(())
+        Ok(false)
     }
 
     fn setup_logging(&mut self) -> Result<()> {
@@ -425,6 +404,12 @@ impl MainBuilder {
             }
         }
         Ok(())
+    }
+}
+
+impl Default for MainBuilder {
+    fn default() -> Self {
+        Self::from_cli(Cli::parse())
     }
 }
 
