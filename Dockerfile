@@ -17,7 +17,6 @@ RUN --mount=type=cache,target=/var/cache/apt \
     apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     tzdata \
-    libopus0 \
     curl \
     wget \
     && rm -rf /var/lib/apt/lists/*
