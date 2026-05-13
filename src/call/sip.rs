@@ -533,7 +533,6 @@ impl Invitation {
     ) -> Result<()> {
         if let Some(call) = self.get_pending_call(&dialog_id) {
             call.dialog.reject(code, reason).ok();
-            call.token.cancel();
         }
         match self.dialog_layer.get_dialog(&dialog_id) {
             Some(dialog) => {
@@ -548,7 +547,6 @@ impl Invitation {
     pub async fn reject(&self, dialog_id: DialogId) -> Result<()> {
         if let Some(call) = self.get_pending_call(&dialog_id) {
             call.dialog.reject(None, None).ok();
-            call.token.cancel();
         }
         match self.dialog_layer.get_dialog(&dialog_id) {
             Some(dialog) => {

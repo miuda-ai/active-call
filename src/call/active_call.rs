@@ -963,7 +963,11 @@ impl ActiveCall {
                     ?code,
                     "rejecting call"
                 );
-                self.invitation.hangup(id, code, reason).await
+                let result = self.invitation.hangup(id, code, reason).await;
+                if result.is_ok() {
+                    self.cancel_token.cancel();
+                }
+                result
             }
             None => {
                 let ready = self.call_state.write().await.ready_to_answer.take();
