@@ -10,6 +10,7 @@ use crate::media::{
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio::{
@@ -32,6 +33,8 @@ pub struct MediaStream {
     recorder_sender: mpsc::UnboundedSender<AudioFrame>,
     recorder_receiver: Mutex<Option<mpsc::UnboundedReceiver<AudioFrame>>>,
     recorder_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Pause flag shared with ForwardingProcessor; set when this stream is held.
+    bridge_forward_paused: Arc<AtomicBool>,
 }
 
 const CALLEE_TRACK_ID: &str = "callee-track";
@@ -87,6 +90,7 @@ impl MediaStreamBuilder {
             recorder_sender,
             recorder_receiver: Mutex::new(Some(recorder_receiver)),
             recorder_handle: Mutex::new(None),
+            bridge_forward_paused: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -291,6 +295,7 @@ impl MediaStream {
                 HoldTrack::hold_track(track.as_mut());
             }
         }
+        self.bridge_forward_paused.store(true, Ordering::Relaxed);
     }
 
     pub async fn resume_track(&self, id: Option<TrackId>) {
@@ -303,6 +308,7 @@ impl MediaStream {
                 HoldTrack::resume_track(track.as_mut());
             }
         }
+        self.bridge_forward_paused.store(false, Ordering::Relaxed);
     }
 
     pub async fn suppress_forwarding(&self, track_id: &TrackId) {
@@ -352,8 +358,12 @@ impl MediaStream {
         cancel_token: CancellationToken,
     ) -> Result<()> {
         let inject_track_id = format!("bridge-{}", uuid::Uuid::new_v4());
-        let processor =
-            ForwardingProcessor::new(other.packet_sender.clone(), inject_track_id, cancel_token);
+        let processor = ForwardingProcessor::new(
+            other.packet_sender.clone(),
+            inject_track_id,
+            cancel_token,
+            self.bridge_forward_paused.clone(),
+        );
         self.append_processor(my_track_id, Box::new(processor))
             .await
     }
@@ -388,6 +398,9 @@ pub struct ForwardingProcessor {
     sender: TrackPacketSender,
     inject_track_id: TrackId,
     cancel_token: CancellationToken,
+    /// Shared with `MediaStream::bridge_forward_paused`; set to true while the
+    /// source call is on hold so that silence frames don't leak to the peer.
+    paused: Arc<AtomicBool>,
 }
 
 impl ForwardingProcessor {
@@ -395,11 +408,13 @@ impl ForwardingProcessor {
         sender: TrackPacketSender,
         inject_track_id: TrackId,
         cancel_token: CancellationToken,
+        paused: Arc<AtomicBool>,
     ) -> Self {
         Self {
             sender,
             inject_track_id,
             cancel_token,
+            paused,
         }
     }
 }
@@ -407,6 +422,9 @@ impl ForwardingProcessor {
 impl Processor for ForwardingProcessor {
     fn process_frame(&mut self, frame: &mut AudioFrame) -> Result<()> {
         if self.cancel_token.is_cancelled() {
+            return Ok(());
+        }
+        if self.paused.load(Ordering::Relaxed) {
             return Ok(());
         }
         // Drop DTMF (telephone-event) RTP frames so digits stay on their
