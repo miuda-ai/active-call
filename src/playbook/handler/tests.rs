@@ -505,11 +505,8 @@ async fn test_rag_iteration_limit() -> Result<()> {
     };
 
     let commands = handler.on_event(&event).await?;
-    // After 3 attempts (MAX_RAG_ATTEMPTS), it should stop and return the last raw response
-    assert_eq!(commands.len(), 1);
-    if let Command::Tts { text, .. } = &commands[0] {
-        assert_eq!(text, rag_instruction);
-    }
+    // After MAX_RAG_ATTEMPTS, tool-only JSON should not be spoken back to the caller.
+    assert!(commands.is_empty());
 
     Ok(())
 }
