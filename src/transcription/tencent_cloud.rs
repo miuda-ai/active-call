@@ -191,6 +191,7 @@ impl TencentCloudAsrClientBuilder {
                     audio_rx,
                     event_sender.clone(),
                     token,
+                    inner.option.refer,
                 )
                 .await
                 {
@@ -356,6 +357,7 @@ impl TencentCloudAsrClient {
         mut audio_rx: mpsc::UnboundedReceiver<Vec<u8>>,
         event_sender: EventSender,
         token: CancellationToken,
+        refer: Option<bool>,
     ) -> Result<()> {
         let (mut ws_sender, mut ws_receiver) = ws_stream.split();
         let begin_time = crate::media::get_timestamp();
@@ -394,6 +396,7 @@ impl TencentCloudAsrClient {
                                             is_filler: None,
                                             confidence: None,
                                             task_id: response.task_id.take(),
+                                            refer,
                                         }
                                     } else {
                                         SessionEvent::AsrDelta {
@@ -406,6 +409,7 @@ impl TencentCloudAsrClient {
                                             is_filler: None,
                                             confidence: None,
                                             task_id: response.task_id.take(),
+                                            refer,
                                         }
                                     };
                                     event_sender.send(event).ok()?;

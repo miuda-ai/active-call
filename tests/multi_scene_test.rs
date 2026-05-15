@@ -167,6 +167,7 @@ async fn test_scene_transition_logic() -> Result<()> {
         is_filler: Some(false),
         confidence: Some(1.0),
         task_id: None,
+        refer: None,
     };
 
     let commands = handler.on_event(&event).await?;

@@ -297,6 +297,7 @@ impl AliyunAsrClient {
         let track_id_for_recv = ctx.track_id.clone();
         let track_id_for_send = ctx.track_id.clone();
         let aliyun_task_id_for_finish = aliyun_task_id.clone();
+        let refer = ctx.option.refer;
 
         let recv_loop = async move {
             let track_id = track_id_for_recv;
@@ -357,6 +358,7 @@ impl AliyunAsrClient {
                                         is_filler: None,
                                         confidence: None,
                                         task_id: None,
+                                        refer,
                                     }
                                 } else {
                                     SessionEvent::AsrDelta {
@@ -369,6 +371,7 @@ impl AliyunAsrClient {
                                         is_filler: None,
                                         confidence: None,
                                         task_id: None,
+                                        refer,
                                     }
                                 };
                                 event_sender.send(event).ok();

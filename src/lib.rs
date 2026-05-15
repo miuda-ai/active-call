@@ -170,6 +170,7 @@ pub struct ReferOption {
     pub denoise: Option<bool>,
     pub timeout: Option<u32>,
     pub moh: Option<String>,
+    pub vad: Option<VADOption>,
     pub asr: Option<TranscriptionOption>,
     /// hangup after the call is ended
     pub auto_hangup: Option<bool>,

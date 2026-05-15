@@ -68,6 +68,7 @@ impl MockAsrClientBuilder {
                             is_filler: None,
                             confidence: None,
                             task_id: None,
+                            refer: None,
                         };
                         let _ = event_sender.send(event);
                     }

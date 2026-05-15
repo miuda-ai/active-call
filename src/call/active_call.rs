@@ -460,6 +460,7 @@ impl ActiveCall {
                 if expire > 0 && crate::media::get_timestamp() >= start_time + expire as u64 {
                     info!(session_id = self.session_id, "wait input timeout reached");
                     *input_timeout_expire.lock().await = (0, 0);
+                    let is_refer = self.call_state.read().await.is_refer;
                     event_sender
                         .send(SessionEvent::Silence {
                             track_id: self.server_side_track_id.clone(),
@@ -467,6 +468,7 @@ impl ActiveCall {
                             start_time,
                             duration: expire as u64,
                             samples: None,
+                            refer: Some(is_refer),
                         })
                         .ok();
                 }
@@ -1021,7 +1023,9 @@ impl ActiveCall {
             );
             if let Some(ringtone_url) = ringtone {
                 drop(state);
-                self.do_play(ringtone_url, None, None, None, None).await.ok();
+                self.do_play(ringtone_url, None, None, None, None)
+                    .await
+                    .ok();
             } else {
                 info!(session_id = self.session_id, "no ringtone to play");
             }
@@ -1360,7 +1364,20 @@ impl ActiveCall {
             caller: Some(caller),
             callee: Some(callee.clone()),
             sip: refer_option.as_ref().and_then(|o| o.sip.clone()),
-            asr: refer_option.as_ref().and_then(|o| o.asr.clone()),
+            vad: refer_option
+                .as_ref()
+                .and_then(|o| o.vad.clone())
+                .map(|mut opts| {
+                    opts.refer = Some(true);
+                    opts
+                }),
+            asr: refer_option
+                .as_ref()
+                .and_then(|o| o.asr.clone())
+                .map(|mut opts| {
+                    opts.refer = Some(true);
+                    opts
+                }),
             denoise: refer_option.as_ref().and_then(|o| o.denoise.clone()),
             recorder,
             ..Default::default()

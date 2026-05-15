@@ -30,6 +30,7 @@ async fn test_refer_option_pause_parent_asr_field() {
         timeout: None,
         moh: None,
         asr: None,
+        vad: None,
         sip: None,
         call_id: None,
     };
@@ -43,6 +44,7 @@ async fn test_refer_option_pause_parent_asr_field() {
         timeout: None,
         moh: None,
         asr: None,
+        vad: None,
         sip: None,
         call_id: None,
     };
@@ -57,6 +59,7 @@ async fn test_refer_option_pause_parent_asr_field() {
         timeout: None,
         moh: None,
         asr: None,
+        vad: None,
         sip: None,
         call_id: None,
     };
@@ -133,6 +136,7 @@ async fn test_refer_option_serialization() -> Result<()> {
         timeout: None,
         moh: None,
         asr: None,
+        vad: None,
         sip: None,
         call_id: None,
     };
