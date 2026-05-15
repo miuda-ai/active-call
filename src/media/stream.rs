@@ -407,6 +407,18 @@ impl MediaStream {
         Ok(())
     }
 
+    pub async fn set_track_refer(&self, track_id: &TrackId, refer: Option<bool>) {
+        if let Some((_, dtmf)) = self.tracks.lock().await.get_mut(track_id) {
+            dtmf.refer = refer;
+        }
+    }
+
+    pub async fn set_track_dtmf_forward(&self, track_id: &TrackId, forward: bool) {
+        if let Some((_, dtmf)) = self.tracks.lock().await.get_mut(track_id) {
+            dtmf.suppress_dtmf_forward = !forward;
+        }
+    }
+
     async fn handle_forward_track(&self, mut packet_receiver: TrackPacketReceiver) {
         let event_sender = self.event_sender.clone();
         while let Some(packet) = packet_receiver.recv().await {
@@ -416,31 +428,41 @@ impl MediaStream {
                     .await
                     .contains(&packet.track_id)
             };
-            // Process the packet with each track
-            for (track, dtmf_detector) in self.tracks.lock().await.values_mut() {
+
+            let is_dtmf = matches!(&packet.samples,
+                Samples::RTP { payload_type, .. } if *payload_type >= 96 && *payload_type <= 127);
+
+            let mut tracks = self.tracks.lock().await;
+
+            // Check once whether the source track suppresses DTMF forwarding.
+            let source_suppresses_dtmf = is_dtmf
+                && tracks
+                    .get(&packet.track_id)
+                    .map(|(_, d)| d.suppress_dtmf_forward)
+                    .unwrap_or(false);
+
+            for (track, dtmf_detector) in tracks.values_mut() {
                 if track.id() == &packet.track_id {
-                    match &packet.samples {
-                        Samples::RTP {
-                            payload_type,
-                            payload,
-                            ..
-                        } => {
-                            if let Some(digit) = dtmf_detector.detect_rtp(*payload_type, payload) {
-                                debug!(track_id = track.id(), digit, "DTMF detected");
-                                event_sender
-                                    .send(SessionEvent::Dtmf {
-                                        track_id: packet.track_id.to_string(),
-                                        timestamp: packet.timestamp,
-                                        digit,
-                                    })
-                                    .ok();
-                            }
+                    if let Samples::RTP { payload_type, payload, .. } = &packet.samples {
+                        if let Some(digit) = dtmf_detector.detect_rtp(*payload_type, payload) {
+                            debug!(track_id = track.id(), digit, "DTMF detected");
+                            event_sender
+                                .send(SessionEvent::Dtmf {
+                                    track_id: packet.track_id.to_string(),
+                                    timestamp: packet.timestamp,
+                                    digit,
+                                    refer: dtmf_detector.refer,
+                                })
+                                .ok();
                         }
-                        _ => {}
                     }
                     continue;
                 }
                 if suppressed {
+                    continue;
+                }
+                // Skip DTMF forwarding if source or destination has it suppressed.
+                if source_suppresses_dtmf || (is_dtmf && dtmf_detector.suppress_dtmf_forward) {
                     continue;
                 }
                 if packet.track_id == QUEUE_HOLD_TRACK_ID && track.id() == CALLEE_TRACK_ID {
