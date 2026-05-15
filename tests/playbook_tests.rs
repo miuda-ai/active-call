@@ -1,4 +1,8 @@
-use active_call::playbook::{LlmConfig, Playbook, PlaybookConfig};
+use active_call::{
+    playbook::{LlmConfig, Playbook, PlaybookConfig},
+    synthesis::SynthesisType,
+    transcription::TranscriptionType,
+};
 use dotenvy::dotenv;
 use reqwest::Client;
 use serde_json::json;
@@ -67,6 +71,27 @@ Hello, I am an AI assistant.
     );
 
     fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn test_ai_agent_1002_playbook_has_aliyun_voice_stack_and_greeting() {
+    let playbook = Playbook::load("config/playbook/ai_agent_1002.md")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        playbook.config.asr.as_ref().and_then(|asr| asr.provider.clone()),
+        Some(TranscriptionType::Aliyun)
+    );
+    assert_eq!(
+        playbook.config.tts.as_ref().and_then(|tts| tts.provider.clone()),
+        Some(SynthesisType::Aliyun)
+    );
+    assert!(playbook.config.llm.is_some(), "ai_agent_1002.md should configure LLM");
+    assert_eq!(
+        playbook.config.greeting.as_deref(),
+        Some("Hello, this is IVR 1002. 你好，这里是 IVR 1002，请问有什么可以帮您？")
+    );
 }
 
 #[tokio::test]

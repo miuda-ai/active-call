@@ -123,12 +123,24 @@ async fn test_playbook_run_flow() -> Result<()> {
         runner.run().await;
     });
 
-    // Simulate Answer event to let runner proceed to dialogue loop
+    // Simulate Answer event. SIP media commands should still wait for MediaReady.
     active_call.event_sender.send(SessionEvent::Answer {
         track_id: "track1".to_string(),
         timestamp: 0,
         sdp: "".to_string(),
         refer: None,
+    })?;
+
+    let greeting_before_media =
+        tokio::time::timeout(std::time::Duration::from_millis(200), cmd_rx.recv()).await;
+    assert!(
+        greeting_before_media.is_err(),
+        "SIP greeting should wait for MediaReady"
+    );
+
+    active_call.event_sender.send(SessionEvent::MediaReady {
+        track_id: "track1".to_string(),
+        timestamp: 1,
     })?;
 
     // 6. Assert Greeting (on_start)
@@ -247,12 +259,16 @@ async fn test_playbook_hangup_flow() -> Result<()> {
         runner.run().await;
     });
 
-    // Simulate Answer event
+    // Simulate Answer and MediaReady events for SIP media commands.
     active_call.event_sender.send(SessionEvent::Answer {
         track_id: "test-hangup".to_string(),
         timestamp: 0,
         sdp: "".to_string(),
         refer: None,
+    })?;
+    active_call.event_sender.send(SessionEvent::MediaReady {
+        track_id: "test-hangup".to_string(),
+        timestamp: 1,
     })?;
 
     // 1. Check TTS
@@ -506,10 +522,13 @@ async fn test_playbook_media_wait_flow() -> Result<()> {
         panic!("Did not receive Accept command");
     }
 
-    // 2. We should NOT receive TTS yet (it should be waiting for Answer event)
+    // 2. We should NOT receive TTS yet (it should be waiting for Answer and MediaReady)
     let tts_received =
         tokio::time::timeout(std::time::Duration::from_millis(200), cmd_rx.recv()).await;
-    assert!(tts_received.is_err(), "TTS should have waited for Answer");
+    assert!(
+        tts_received.is_err(),
+        "TTS should have waited for Answer and MediaReady"
+    );
 
     // 3. Send Answer event
     active_call.event_sender.send(SessionEvent::Answer {
@@ -517,6 +536,18 @@ async fn test_playbook_media_wait_flow() -> Result<()> {
         timestamp: 1000,
         sdp: "".to_string(),
         refer: None,
+    })?;
+
+    let tts_after_answer =
+        tokio::time::timeout(std::time::Duration::from_millis(200), cmd_rx.recv()).await;
+    assert!(
+        tts_after_answer.is_err(),
+        "SIP TTS should still wait for MediaReady after Answer"
+    );
+
+    active_call.event_sender.send(SessionEvent::MediaReady {
+        track_id: "track1".to_string(),
+        timestamp: 1001,
     })?;
 
     // 4. NOW we should receive TTS
