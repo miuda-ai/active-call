@@ -43,6 +43,10 @@ pub enum SessionEvent {
         sdp: String,
         refer: Option<bool>,
     },
+    MediaReady {
+        track_id: String,
+        timestamp: u64,
+    },
     Reject {
         track_id: String,
         timestamp: u64,

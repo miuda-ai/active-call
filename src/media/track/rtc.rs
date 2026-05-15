@@ -22,7 +22,10 @@ use rustrtc::{
     },
 };
 use std::{
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::Mutex;
@@ -66,6 +69,8 @@ pub struct RtcTrack {
     rtc_config: RtcTrackConfig,
     processor_chain: ProcessorChain,
     packet_sender: Arc<Mutex<Option<TrackPacketSender>>>,
+    event_sender: Arc<Mutex<Option<EventSender>>>,
+    media_ready_sent: Arc<AtomicBool>,
     cancel_token: CancellationToken,
     local_source: Option<Arc<SampleStreamSource>>,
     encoder: TrackCodec,
@@ -93,6 +98,8 @@ impl RtcTrack {
             rtc_config,
             processor_chain,
             packet_sender: Arc::new(Mutex::new(None)),
+            event_sender: Arc::new(Mutex::new(None)),
+            media_ready_sent: Arc::new(AtomicBool::new(false)),
             cancel_token,
             local_source: None,
             encoder: TrackCodec::new(),
@@ -211,6 +218,8 @@ impl RtcTrack {
             self.track_id.clone(),
             self.processor_chain.clone(),
             payload_type,
+            self.event_sender.clone(),
+            self.media_ready_sent.clone(),
         );
 
         Ok(())
@@ -222,6 +231,8 @@ impl RtcTrack {
         track_id: TrackId,
         processor_chain: ProcessorChain,
         default_payload_type: u8,
+        event_sender: Arc<Mutex<Option<EventSender>>>,
+        media_ready_sent: Arc<AtomicBool>,
     ) {
         let cancel_token = self.cancel_token.clone();
         let packet_sender = self.packet_sender.clone();
@@ -229,6 +240,10 @@ impl RtcTrack {
         let pc_stats = pc.clone();
         let pc_state = pc.clone();
         let track_id_log = track_id.clone();
+        let is_rtp_media = matches!(
+            self.rtc_config.mode,
+            TransportMode::Rtp | TransportMode::Srtp
+        );
         let is_webrtc = self.rtc_config.mode != TransportMode::Rtp;
 
         crate::spawn(async move {
@@ -267,7 +282,24 @@ impl RtcTrack {
                         if let PeerConnectionEvent::Track(transceiver) = event {
                             if let Some(receiver) = transceiver.receiver() {
                                 let track = receiver.track();
-                                info!(track_id=%track_id_log, "New track received (SSRC latching complete)");
+                                if is_rtp_media {
+                                    let maybe_sender = event_sender.lock().await.clone();
+                                    if let Some(sender) = maybe_sender {
+                                        if media_ready_sent
+                                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                                            .is_ok()
+                                        {
+                                            let result = sender.send(SessionEvent::MediaReady {
+                                                track_id: track_id_log.clone(),
+                                                timestamp: crate::media::get_timestamp(),
+                                            });
+                                            if result.is_err() {
+                                                media_ready_sent.store(false, Ordering::SeqCst);
+                                            }
+                                        }
+                                    }
+                                }
+                                info!(track_id=%track_id_log, "New track received");
 
                                 let (f1, f2) = Self::create_track_workers(
                                     track,
@@ -295,7 +327,7 @@ impl RtcTrack {
                         }
                     }
 
-                    // Handle State Changes (WebRTC Only)
+                    // Handle state changes for transports that expose them.
                     res = async {
                         if let Some(rx) = state_rx.as_mut() {
                             rx.changed().await
@@ -696,6 +728,7 @@ impl Track for RtcTrack {
         packet_sender: TrackPacketSender,
     ) -> Result<()> {
         *self.packet_sender.lock().await = Some(packet_sender.clone());
+        *self.event_sender.lock().await = Some(event_sender.clone());
         let token_clone = self.cancel_token.clone();
         let event_sender_clone = event_sender.clone();
         let track_id = self.track_id.clone();
