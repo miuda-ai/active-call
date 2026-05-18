@@ -54,6 +54,7 @@ impl TrackConfig {
 }
 
 pub mod file;
+pub mod forwarding;
 pub mod media_pass;
 pub mod rtc;
 pub mod track_codec;

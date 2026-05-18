@@ -547,6 +547,46 @@ Commands are sent as JSON messages through the WebSocket connection. All timesta
 }
 ```
 
+### Audio Bridge Commands
+
+#### Bridge Command
+**Purpose:** Connects audio between this active call session and another active call session.
+
+The bridge is a media-only operation. It creates separate internal bridge tracks for the two sessions and forwards audio packets between them. It does not replace the normal server-side track used by TTS/play/refer, and it does not send SIP signaling or hang up either call. Call lifecycle remains controlled by each call's own WebSocket client, SIP peer, or explicit `hangup` command.
+
+**Fields:**
+- `command` (string): Always "bridge"
+- `targetSessionId` (string): Session ID of the other active call
+
+```json
+{
+  "command": "bridge",
+  "targetSessionId": "session-b"
+}
+```
+
+**Notes:**
+- Send the command on either session's WebSocket after both sessions are established.
+- The target session must still be active and must not be the same session.
+- Re-sending `bridge` for the same pair replaces the existing bridge tracks for that pair.
+- If either call ends, its bridge track stops and the peer bridge task exits; the other call remains active until its own client or SIP peer ends it.
+
+#### Unbridge Command
+**Purpose:** Removes the audio bridge between this active call session and another active call session.
+
+`unbridge` removes the internal bridge tracks from both sessions when both sessions are active. If the target session has already ended, it removes the local bridge track only. It is safe to send after one side has already hung up.
+
+**Fields:**
+- `command` (string): Always "unbridge"
+- `targetSessionId` (string): Session ID of the other call
+
+```json
+{
+  "command": "unbridge",
+  "targetSessionId": "session-b"
+}
+```
+
 ### Audio Track Control Commands
 
 #### Mute Command

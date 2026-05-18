@@ -84,10 +84,16 @@ pub enum Command {
         options: Option<ReferOption>,
     },
     /// Bridge audio with another established call.
-    /// Both calls remain in their own session/event flow; only audio is patched
-    /// between them bidirectionally. Call flow is handled externally.
+    /// This creates separate bridge tracks for the two sessions and patches
+    /// audio bidirectionally. It does not replace the server-side track and
+    /// does not control hangup; each call keeps its own session/event flow.
     Bridge {
         /// session_id of the other call to bridge audio with
+        target_session_id: String,
+    },
+    /// Remove audio bridge tracks with another established call.
+    Unbridge {
+        /// session_id of the other call to unbridge from
         target_session_id: String,
     },
     Mute {

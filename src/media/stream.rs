@@ -10,7 +10,6 @@ use crate::media::{
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio::{
@@ -33,8 +32,6 @@ pub struct MediaStream {
     recorder_sender: mpsc::UnboundedSender<AudioFrame>,
     recorder_receiver: Mutex<Option<mpsc::UnboundedReceiver<AudioFrame>>>,
     recorder_handle: Mutex<Option<JoinHandle<()>>>,
-    /// Pause flag shared with ForwardingProcessor; set when this stream is held.
-    bridge_forward_paused: Arc<AtomicBool>,
 }
 
 const CALLEE_TRACK_ID: &str = "callee-track";
@@ -90,7 +87,6 @@ impl MediaStreamBuilder {
             recorder_sender,
             recorder_receiver: Mutex::new(Some(recorder_receiver)),
             recorder_handle: Mutex::new(None),
-            bridge_forward_paused: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -295,7 +291,6 @@ impl MediaStream {
                 HoldTrack::hold_track(track.as_mut());
             }
         }
-        self.bridge_forward_paused.store(true, Ordering::Relaxed);
     }
 
     pub async fn resume_track(&self, id: Option<TrackId>) {
@@ -308,7 +303,6 @@ impl MediaStream {
                 HoldTrack::resume_track(track.as_mut());
             }
         }
-        self.bridge_forward_paused.store(false, Ordering::Relaxed);
     }
 
     pub async fn suppress_forwarding(&self, track_id: &TrackId) {
@@ -344,29 +338,6 @@ impl MediaStream {
         }
     }
 
-    /// Patch processed audio frames from `my_track_id` on this stream into
-    /// `other`'s packet pipeline. This is one direction of a bridge; the
-    /// caller should also call this on `other` to make it bidirectional.
-    ///
-    /// `cancel_token` controls the lifetime of the forwarding; when it fires,
-    /// the processor becomes a no-op. Pass a token tied to both calls so the
-    /// bridge tears down as soon as either side ends.
-    pub async fn bridge_to(
-        &self,
-        other: &MediaStream,
-        my_track_id: &TrackId,
-        cancel_token: CancellationToken,
-    ) -> Result<()> {
-        let inject_track_id = format!("bridge-{}", uuid::Uuid::new_v4());
-        let processor = ForwardingProcessor::new(
-            other.packet_sender.clone(),
-            inject_track_id,
-            cancel_token,
-            self.bridge_forward_paused.clone(),
-        );
-        self.append_processor(my_track_id, Box::new(processor))
-            .await
-    }
 }
 
 #[derive(Clone)]
@@ -384,61 +355,6 @@ impl Processor for RecorderProcessor {
     fn process_frame(&mut self, frame: &mut AudioFrame) -> Result<()> {
         let frame_clone = frame.clone();
         let _ = self.sender.send(frame_clone);
-        Ok(())
-    }
-}
-
-/// Forwards processed audio frames into another MediaStream's packet pipeline,
-/// rewriting the track_id so the destination's source-skip filter does not drop
-/// the frame. Used to bridge audio between two active calls.
-///
-/// The processor becomes a no-op once `cancel_token` fires, so that when either
-/// bridged call ends we stop cloning frames into a dead channel.
-pub struct ForwardingProcessor {
-    sender: TrackPacketSender,
-    inject_track_id: TrackId,
-    cancel_token: CancellationToken,
-    /// Shared with `MediaStream::bridge_forward_paused`; set to true while the
-    /// source call is on hold so that silence frames don't leak to the peer.
-    paused: Arc<AtomicBool>,
-}
-
-impl ForwardingProcessor {
-    pub fn new(
-        sender: TrackPacketSender,
-        inject_track_id: TrackId,
-        cancel_token: CancellationToken,
-        paused: Arc<AtomicBool>,
-    ) -> Self {
-        Self {
-            sender,
-            inject_track_id,
-            cancel_token,
-            paused,
-        }
-    }
-}
-
-impl Processor for ForwardingProcessor {
-    fn process_frame(&mut self, frame: &mut AudioFrame) -> Result<()> {
-        if self.cancel_token.is_cancelled() {
-            return Ok(());
-        }
-        if self.paused.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        // Drop DTMF (telephone-event) RTP frames so digits stay on their
-        // originating call and don't leak across the bridge.
-        if let Samples::RTP { payload_type, .. } = &frame.samples {
-            if *payload_type >= 96 && *payload_type <= 127 {
-                return Ok(());
-            }
-        }
-        let mut f = frame.clone();
-        f.track_id = self.inject_track_id.clone();
-        if self.sender.send(f).is_err() {
-            self.cancel_token.cancel();
-        }
         Ok(())
     }
 }
