@@ -42,7 +42,15 @@ use audio_codec::CodecType;
 use chrono::{DateTime, Utc};
 use rsipstack::dialog::{invitation::InviteOption, server_dialog::ServerInviteDialog};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 use tokio::{fs::File, select, sync::Mutex, sync::RwLock, sync::mpsc, time::sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -262,6 +270,7 @@ pub struct ActiveCallState {
     pub audio_receiver: Option<WebsocketBytesReceiver>,
     pub ready_to_answer: Option<(String, Option<Box<dyn Track>>, ServerInviteDialog)>,
     pub pending_asr_resume: Option<(u32, TranscriptionOption)>,
+    pub bridge_paused: Arc<AtomicBool>,
 }
 
 pub type ActiveCallRef = Arc<ActiveCall>;
@@ -669,6 +678,13 @@ impl ActiveCall {
                                 .await;
                             continue;
                         }
+                    }
+                    SessionEvent::Hold { on_hold, .. } => {
+                        self.call_state
+                            .read()
+                            .await
+                            .bridge_paused
+                            .store(on_hold, Ordering::Relaxed);
                     }
                     _ => {}
                 }
@@ -1543,6 +1559,9 @@ impl ActiveCall {
         let (self_bridge_sender, self_bridge_receiver) = mpsc::channel(25);
         let (target_bridge_sender, target_bridge_receiver) = mpsc::channel(25);
 
+        let self_paused = self.call_state.read().await.bridge_paused.clone();
+        let target_paused = target.call_state.read().await.bridge_paused.clone();
+
         let self_forwarding_track = ForwardingTrack::new(
             self_bridge_track_id.clone(),
             self.session_id.clone(),
@@ -1551,6 +1570,7 @@ impl ActiveCall {
             self.track_config.clone(),
             self.cancel_token.child_token(),
             rand::random::<u32>(),
+            self_paused,
         );
 
         let target_forwarding_track = ForwardingTrack::new(
@@ -1561,6 +1581,7 @@ impl ActiveCall {
             target.track_config.clone(),
             target.cancel_token.child_token(),
             rand::random::<u32>(),
+            target_paused,
         );
 
         self.media_stream

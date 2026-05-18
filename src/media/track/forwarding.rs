@@ -4,6 +4,10 @@ use crate::media::track::{Track, TrackConfig, TrackPacketSender};
 use crate::media::{AudioFrame, Samples, TrackId};
 use anyhow::Result;
 use async_trait::async_trait;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -18,6 +22,7 @@ pub struct ForwardingTrack {
     config: TrackConfig,
     cancel_token: CancellationToken,
     ssrc: u32,
+    paused: Arc<AtomicBool>,
 }
 
 impl ForwardingTrack {
@@ -29,6 +34,7 @@ impl ForwardingTrack {
         config: TrackConfig,
         cancel_token: CancellationToken,
         ssrc: u32,
+        paused: Arc<AtomicBool>,
     ) -> Self {
         Self {
             processor_chain: ProcessorChain::new(config.samplerate),
@@ -39,6 +45,7 @@ impl ForwardingTrack {
             config,
             cancel_token,
             ssrc,
+            paused,
         }
     }
 }
@@ -103,7 +110,11 @@ impl Track for ForwardingTrack {
                 }
             };
             cancel_token.cancel();
-            info!(track_id, reason = stop_reason, "audio bridge forwarding task stopped");
+            info!(
+                track_id,
+                reason = stop_reason,
+                "audio bridge forwarding task stopped"
+            );
         });
         Ok(())
     }
@@ -114,7 +125,10 @@ impl Track for ForwardingTrack {
     }
 
     async fn send_packet(&mut self, packet: &AudioFrame) -> Result<()> {
-        if self.cancel_token.is_cancelled() || packet.track_id != self.source_peer_track_id {
+        if self.cancel_token.is_cancelled()
+            || self.paused.load(Ordering::Relaxed)
+            || packet.track_id != self.source_peer_track_id
+        {
             return Ok(());
         }
 
