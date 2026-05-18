@@ -10,7 +10,7 @@ use futures::{SinkExt, StreamExt};
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{future::Future, pin::Pin};
 use tokio::{net::TcpStream, sync::mpsc};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
@@ -21,12 +21,11 @@ use uuid::Uuid;
 /// Aliyun DashScope Paraformer real-time speech recognition API
 /// https://help.aliyun.com/zh/model-studio/paraformer-real-time-speech-recognition-api/
 struct AliyunAsrClientInner {
-    audio_tx: mpsc::UnboundedSender<Vec<u8>>,
     option: TranscriptionOption,
 }
 
 pub struct AliyunAsrClient {
-    inner: Arc<AliyunAsrClientInner>,
+    audio_tx: mpsc::UnboundedSender<Vec<u8>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -527,18 +526,13 @@ impl AliyunAsrClientBuilder {
             _ => None,
         };
 
-        let inner = Arc::new(AliyunAsrClientInner {
-            audio_tx,
-            option: self.option.clone(),
-        });
-
-        let client = AliyunAsrClient {
-            inner: inner.clone(),
-        };
-
         let track_id = self.track_id.unwrap_or_else(|| Uuid::new_v4().to_string());
         let token = self.token.unwrap_or_default();
         let event_sender = self.event_sender;
+        let inner = AliyunAsrClientInner {
+            option: self.option,
+        };
+        let client = AliyunAsrClient { audio_tx };
 
         crate::spawn(async move {
             let res = async move {
@@ -572,7 +566,7 @@ impl AliyunAsrClientBuilder {
                 info!(%track_id, option=?inner.option, "Starting Aliyun ASR client");
                 let ctx = WebSocketContext {
                     track_id: track_id.clone(),
-                    option: self.option,
+                    option: inner.option.clone(),
                 };
 
                 match AliyunAsrClient::handle_websocket_message(
@@ -616,8 +610,7 @@ impl AliyunAsrClientBuilder {
 impl TranscriptionClient for AliyunAsrClient {
     fn send_audio(&self, samples: &[Sample], _src_packet: Option<&SourcePacket>) -> Result<()> {
         let audio_data = samples_to_bytes(samples);
-        self.inner
-            .audio_tx
+        self.audio_tx
             .send(audio_data)
             .map_err(|_| anyhow!("Failed to send audio data"))?;
         Ok(())
