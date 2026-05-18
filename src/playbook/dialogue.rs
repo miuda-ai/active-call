@@ -27,6 +27,7 @@ mod tests {
                 reason: Some("start".to_string()),
                 initiator: Some("tester".to_string()),
                 headers: None,
+                refer: None,
             }])
         }
 
@@ -36,6 +37,7 @@ mod tests {
                     reason: Some("event".to_string()),
                     initiator: Some("tester".to_string()),
                     headers: None,
+                    refer: None,
                 }])
             } else {
                 Ok(vec![])

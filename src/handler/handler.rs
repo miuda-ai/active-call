@@ -608,6 +608,7 @@ mod tests {
                 reason: None,
                 initiator: None,
                 headers: None,
+                refer: None,
             })
             .ok();
         drop(command_sender);

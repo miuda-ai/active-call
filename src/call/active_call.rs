@@ -213,6 +213,83 @@ mod tests {
 
         Ok(())
     }
+
+    async fn make_active_call() -> Arc<ActiveCall> {
+        let mut config = Config::default();
+        config.udp_port = 0;
+        config.media_cache_path = "/tmp/mediacache".to_string();
+        let app_state = AppStateBuilder::new()
+            .with_config(config)
+            .with_stream_engine(Arc::new(StreamEngine::default()))
+            .build()
+            .await
+            .unwrap();
+        Arc::new(ActiveCall::new(
+            ActiveCallType::Sip,
+            CancellationToken::new(),
+            "test-session".to_string(),
+            app_state.invitation.clone(),
+            app_state.clone(),
+            TrackConfig::default(),
+            None,
+            false,
+            None,
+            None,
+            None,
+        ))
+    }
+
+    // refer=Some(true): only the refer call is cancelled, media stream stays alive.
+    #[tokio::test]
+    async fn test_hangup_refer_true_cancels_refer_only() -> Result<()> {
+        let active_call = make_active_call().await;
+
+        let refer_token = active_call.cancel_token.child_token();
+        let refer_state = Arc::new(RwLock::new(ActiveCallState {
+            ssrc: 1,
+            is_refer: true,
+            ..Default::default()
+        }));
+        {
+            let mut cs = active_call.call_state.write().await;
+            cs.refer_call_token = Some(refer_token.clone());
+            cs.refer_callstate = Some(refer_state.clone());
+        }
+
+        active_call.do_hangup(None, None, None, Some(true)).await?;
+
+        assert!(refer_token.is_cancelled(), "refer token should be cancelled");
+        assert!(
+            !active_call.media_stream.cancel_token.is_cancelled(),
+            "media stream should NOT stop"
+        );
+        assert!(
+            refer_state.read().await.hangup_reason.is_some(),
+            "hangup_reason should be set on refer state"
+        );
+        Ok(())
+    }
+
+    // refer=None: media stream stops and the refer token is also cancelled.
+    #[tokio::test]
+    async fn test_hangup_none_cancels_refer_too() -> Result<()> {
+        let active_call = make_active_call().await;
+
+        let refer_token = active_call.cancel_token.child_token();
+        {
+            let mut cs = active_call.call_state.write().await;
+            cs.refer_call_token = Some(refer_token.clone());
+        }
+
+        active_call.do_hangup(None, None, None, None).await?;
+
+        assert!(refer_token.is_cancelled(), "refer token should be cancelled");
+        assert!(
+            active_call.media_stream.cancel_token.is_cancelled(),
+            "media stream should stop"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Deserialize)]
@@ -261,6 +338,8 @@ pub struct ActiveCallState {
     pub audio_receiver: Option<WebsocketBytesReceiver>,
     pub ready_to_answer: Option<(String, Option<Box<dyn Track>>, ServerInviteDialog)>,
     pub pending_asr_resume: Option<(u32, TranscriptionOption)>,
+    // Cancel this token to hang up only the refer call, leaving the main call alive
+    pub refer_call_token: Option<CancellationToken>,
 }
 
 pub type ActiveCallRef = Arc<ActiveCall>;
@@ -534,7 +613,9 @@ impl ActiveCall {
                                     session_id = self.session_id,
                                     ssrc, "auto hangup when track end track_id:{}", track_id
                                 );
-                                self.do_hangup(Some(hangup_reason), None, None).await.ok();
+                                self.do_hangup(Some(hangup_reason), None, None, None)
+                                    .await
+                                    .ok();
                             }
                         }
 
@@ -563,9 +644,14 @@ impl ActiveCall {
                             session_id = self.session_id,
                             track_id, "inactivity timeout reached, hanging up"
                         );
-                        self.do_hangup(Some(CallRecordHangupReason::InactivityTimeout), None, None)
-                            .await
-                            .ok();
+                        self.do_hangup(
+                            Some(CallRecordHangupReason::InactivityTimeout),
+                            None,
+                            None,
+                            None,
+                        )
+                        .await
+                        .ok();
                     }
                     SessionEvent::Hangup { refer, .. } => {
                         // Check if we need to resume ASR after refer hangup
@@ -743,12 +829,13 @@ impl ActiveCall {
                 reason,
                 initiator,
                 headers,
+                refer,
             } => {
                 let reason = reason.map(|r| {
                     r.parse::<CallRecordHangupReason>()
                         .unwrap_or(CallRecordHangupReason::BySystem)
                 });
-                self.do_hangup(reason, initiator, headers).await
+                self.do_hangup(reason, initiator, headers, refer).await
             }
             Command::Refer {
                 caller,
@@ -872,7 +959,7 @@ impl ActiveCall {
                     code: None,
                 };
                 self.event_sender.send(error_event).ok();
-                self.do_hangup(Some(CallRecordHangupReason::BySystem), None, None)
+                self.do_hangup(Some(CallRecordHangupReason::BySystem), None, None, None)
                     .await
                     .ok();
                 return Err(e);
@@ -908,7 +995,7 @@ impl ActiveCall {
                     code: Some(486),
                 };
                 self.event_sender.send(rejet_event).ok();
-                self.do_hangup(Some(CallRecordHangupReason::BySystem), None, None)
+                self.do_hangup(Some(CallRecordHangupReason::BySystem), None, None, None)
                     .await
                     .ok();
                 return Err(anyhow::anyhow!("no pending call to accept"));
@@ -1250,27 +1337,16 @@ impl ActiveCall {
         reason: Option<CallRecordHangupReason>,
         initiator: Option<String>,
         headers: Option<HashMap<String, String>>,
+        refer: Option<bool>,
     ) -> Result<()> {
         info!(
             session_id = self.session_id,
             ?reason,
             ?initiator,
             ?headers,
+            ?refer,
             "do_hangup"
         );
-
-        // Store headers in extras if provided
-        if let Some(headers) = headers {
-            let h_val = serde_json::to_value(&headers).unwrap_or_default();
-
-            {
-                let mut state = self.call_state.write().await;
-                let mut extras = state.extras.take().unwrap_or_default();
-                extras.insert("_hangup_headers".to_string(), h_val.clone());
-                state.extras = Some(extras);
-            }
-        } else {
-        }
 
         let hangup_reason = match initiator.as_deref() {
             Some("caller") => CallRecordHangupReason::ByCaller,
@@ -1279,13 +1355,55 @@ impl ActiveCall {
             _ => reason.unwrap_or(CallRecordHangupReason::BySystem),
         };
 
-        self.media_stream
-            .stop(Some(hangup_reason.to_string()), initiator);
-
-        self.call_state
-            .write()
-            .await
-            .set_hangup_reason(hangup_reason);
+        match refer {
+            Some(true) => {
+                // Hang up only the refer call, leaving the main call alive.
+                let (refer_state, refer_token) = {
+                    let mut state = self.call_state.write().await;
+                    (state.refer_callstate.clone(), state.refer_call_token.take())
+                };
+                let mut has_refer_state = false;
+                if let Some(refer_state) = refer_state {
+                    has_refer_state = true;
+                    let mut refer_state = refer_state.write().await;
+                    if let Some(headers) = headers {
+                        let h_val = serde_json::to_value(&headers).unwrap_or_default();
+                        let mut extras = refer_state.extras.take().unwrap_or_default();
+                        extras.insert("_hangup_headers".to_string(), h_val);
+                        refer_state.extras = Some(extras);
+                    }
+                    // Set reason before cancelling so on_terminated() sees it.
+                    refer_state.set_hangup_reason(hangup_reason);
+                }
+                if let Some(token) = refer_token {
+                    token.cancel();
+                }
+                if has_refer_state {
+                    self.media_stream
+                        .remove_track(&self.server_side_track_id, false)
+                        .await;
+                }
+            }
+            _ => {
+                let refer_token = {
+                    let mut state = self.call_state.write().await;
+                    if let Some(headers) = headers {
+                        let h_val = serde_json::to_value(&headers).unwrap_or_default();
+                        let mut extras = state.extras.take().unwrap_or_default();
+                        extras.insert("_hangup_headers".to_string(), h_val);
+                        state.extras = Some(extras);
+                    }
+                    state.set_hangup_reason(hangup_reason.clone());
+                    state.refer_call_token.take()
+                };
+                self.media_stream
+                    .stop(Some(hangup_reason.to_string()), initiator);
+                if let Some(token) = refer_token {
+                    token.cancel();
+                }
+            }
+        }
+        tokio::task::yield_now().await;
         Ok(())
     }
 
@@ -1360,7 +1478,7 @@ impl ActiveCall {
             caller
         };
 
-        let call_option = CallOption {
+        let mut call_option = CallOption {
             caller: Some(caller),
             callee: Some(callee.clone()),
             sip: refer_option.as_ref().and_then(|o| o.sip.clone()),
@@ -1382,6 +1500,7 @@ impl ActiveCall {
             recorder,
             ..Default::default()
         };
+        call_option.check_default();
 
         let mut invite_option = call_option.build_invite_option()?;
         invite_option.call_id = Some(ref_call_id);
@@ -1454,10 +1573,13 @@ impl ActiveCall {
             "do_refer"
         );
 
+        let refer_cancel_token = self.cancel_token.child_token();
+        self.call_state.write().await.refer_call_token = Some(refer_cancel_token.clone());
+
         let r = tokio::time::timeout(
             Duration::from_secs(timeout_secs as u64),
             self.create_outgoing_sip_track(
-                self.cancel_token.child_token(),
+                refer_cancel_token,
                 refer_call_state.clone(),
                 &track_id,
                 invite_option,
