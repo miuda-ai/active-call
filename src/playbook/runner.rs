@@ -1,5 +1,5 @@
 use crate::CallOption;
-use crate::call::{ActiveCallRef, Command};
+use crate::call::{ActiveCallRef, ActiveCallType, Command};
 use crate::event::EventReceiver;
 use anyhow::{Result, anyhow};
 use serde_json::json;
@@ -89,25 +89,38 @@ impl PlaybookRunner {
             let state = self.call.call_state.read().await;
             state.answer_time.is_some()
         };
+        let wait_for_media_ready =
+            matches!(self.call.call_type, ActiveCallType::Sip | ActiveCallType::B2bua);
+        let mut media_ready = !wait_for_media_ready;
 
         if let Ok(commands) = self.handler.on_start().await {
             for cmd in commands {
                 let is_media = matches!(cmd, Command::Tts { .. } | Command::Play { .. });
 
-                if is_media && !answered {
-                    info!("Waiting for call establishment before executing media command...");
+                if is_media && (!answered || !media_ready) {
+                    info!(
+                        wait_for_media_ready,
+                        "Waiting for call media readiness before executing media command..."
+                    );
                     while let Ok(event) = self.event_receiver.recv().await {
                         match &event {
                             crate::event::SessionEvent::Answer { .. } => {
-                                info!("Call established, proceeding to execute media command");
+                                info!("Call established");
                                 answered = true;
-                                break;
+                            }
+                            crate::event::SessionEvent::MediaReady { .. } => {
+                                info!("Call media ready");
+                                media_ready = true;
                             }
                             crate::event::SessionEvent::Hangup { .. } => {
-                                info!("Call hung up before established, stopping");
+                                info!("Call hung up before media command, stopping");
                                 return;
                             }
                             _ => {}
+                        }
+                        if answered && media_ready {
+                            info!("Proceeding to execute media command");
+                            break;
                         }
                     }
                 }

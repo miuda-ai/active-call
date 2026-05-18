@@ -348,6 +348,7 @@ impl AppStateInner {
 
                     let dialog_id = dialog.id();
                     let dialog_id_str = dialog_id.to_string();
+                    let dialog_id_for_cleanup = dialog_id.clone();
                     let token = self.token.child_token();
                     let pending_dialog = PendingDialog {
                         token: token.clone(),
@@ -368,57 +369,118 @@ impl AppStateInner {
                         .and_then(|t| parse_duration(t).ok())
                         .unwrap_or_else(|| Duration::from_secs(60));
 
-                    let token_ref = token.clone();
-                    let guard_ref = guard.clone();
-                    crate::spawn(async move {
-                        select! {
-                            _ = token_ref.cancelled() => {}
-                            _ = tokio::time::sleep(accept_timeout) => {}
-                        }
-                        guard_ref.drop_async().await;
-                    });
-
                     let mut dialog_ref = dialog.clone();
-                    let token_ref = token.clone();
                     let routing_state = self.routing_state.clone();
                     let dialog_for_reject = dialog.clone();
-                    let guard_ref = guard.clone();
+                    let invitation_for_cleanup = self.invitation.clone();
                     crate::spawn(async move {
-                        let invite_loop = async {
-                            match invitation_handler
-                                .on_invite(
-                                    dialog_id_str.clone(),
-                                    token.clone(),
-                                    dialog.clone(),
-                                    routing_state,
-                                )
-                                .await
-                            {
-                                Ok(_) => (),
-                                Err(e) => {
-                                    // Webhook failed, reject the call immediately
-                                    info!(id = dialog_id_str, "error handling invite: {:?}", e);
-                                    let reason = format!("Failed to process invite: {}", e);
-                                    if let Err(reject_err) = dialog_for_reject.reject(
-                                        Some(rsipstack::rsip::StatusCode::ServiceUnavailable),
-                                        Some(reason),
+                        info!(id = dialog_id_str, "incoming invite task started");
+                        let _pending_guard = guard;
+                        let token_ref = token.clone();
+                        let accept_timeout_sleep = tokio::time::sleep(accept_timeout);
+                        let invite_handler = invitation_handler
+                            .on_invite(
+                                dialog_id_str.clone(),
+                                token.clone(),
+                                dialog.clone(),
+                                routing_state,
+                            );
+                        let dialog_handle = dialog_ref.handle(&mut tx);
+                        tokio::pin!(accept_timeout_sleep);
+                        tokio::pin!(invite_handler);
+                        tokio::pin!(dialog_handle);
+
+                        let mut cancel_done = false;
+                        let mut accept_timeout_done = false;
+                        let mut invite_done = false;
+                        loop {
+                            let mut reject_request = None;
+
+                            select! {
+                                _ = token_ref.cancelled(), if !cancel_done => {
+                                    cancel_done = true;
+                                    reject_request = Some((
+                                        rsipstack::rsip::StatusCode::ServiceUnavailable,
+                                        "invite cancelled".to_string(),
+                                        "cancelled",
+                                    ));
+                                }
+                                _ = &mut accept_timeout_sleep, if !accept_timeout_done
+                                    && dialog_for_reject.state().can_cancel() => {
+                                    accept_timeout_done = true;
+                                    reject_request = Some((
+                                        rsipstack::rsip::StatusCode::RequestTimeout,
+                                        "accept timeout".to_string(),
+                                        "accept timeout",
+                                    ));
+                                }
+                                result = &mut invite_handler, if !invite_done => {
+                                    invite_done = true;
+                                    match result {
+                                        Ok(_) => {
+                                            info!(id = dialog_id_str, "invite handler completed");
+                                        }
+                                        Err(e) => {
+                                            info!(id = dialog_id_str, "error handling invite: {:?}", e);
+                                            reject_request = Some((
+                                                rsipstack::rsip::StatusCode::ServiceUnavailable,
+                                                format!("Failed to process invite: {}", e),
+                                                "invite handler error",
+                                            ));
+                                        }
+                                    }
+                                }
+                                result = &mut dialog_handle => {
+                                    match result {
+                                        Ok(_) => {
+                                            info!(id = dialog_id_str, "dialog handling finished");
+                                        }
+                                        Err(e) => {
+                                            info!(
+                                                id = dialog_id_str,
+                                                "dialog handling ended with error: {:?}", e
+                                            );
+                                        }
+                                    }
+                                    if matches!(
+                                        dialog_for_reject.state(),
+                                        rsipstack::dialog::dialog::DialogState::Terminated(_, _)
                                     ) {
                                         info!(
                                             id = dialog_id_str,
-                                            "error rejecting call: {:?}", reject_err
+                                            "terminated invite dialog finished, cancelling invite token"
                                         );
+                                        token_ref.cancel();
                                     }
-                                    // Cancel token to stop dialog handling
-                                    token.cancel();
-                                    guard_ref.drop_async().await;
+                                    info!(id = dialog_id_str, "incoming invite task finished");
+                                    break;
                                 }
                             }
-                        };
-                        select! {
-                            _ = token_ref.cancelled() => {}
-                            _ = async {
-                                let (_,_ ) = tokio::join!(dialog_ref.handle(&mut tx), invite_loop);
-                             } => {}
+
+                            if let Some((code, reason, source)) = reject_request {
+                                if dialog_for_reject.state().can_cancel() {
+                                    info!(
+                                        id = dialog_id_str,
+                                        ?code,
+                                        %reason,
+                                        source,
+                                        "rejecting invite"
+                                    );
+                                    if let Err(e) =
+                                        dialog_for_reject.reject(Some(code), Some(reason))
+                                    {
+                                        info!(
+                                            id = dialog_id_str,
+                                            "error rejecting invite: {:?}", e
+                                        );
+                                    }
+                                    invitation_for_cleanup
+                                        .get_pending_call(&dialog_id_for_cleanup);
+                                    invitation_for_cleanup
+                                        .dialog_layer
+                                        .remove_dialog(&dialog_id_for_cleanup);
+                                }
+                            }
                         }
                     });
                 }

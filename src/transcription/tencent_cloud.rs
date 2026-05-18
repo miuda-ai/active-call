@@ -59,12 +59,11 @@ pub struct TencentCloudAsrResponse {
 }
 
 struct TencentCloudAsrClientInner {
-    audio_tx: mpsc::UnboundedSender<Vec<u8>>,
     option: TranscriptionOption,
 }
 
 pub struct TencentCloudAsrClient {
-    inner: Arc<TencentCloudAsrClientInner>,
+    audio_tx: mpsc::UnboundedSender<Vec<u8>>,
 }
 
 pub struct TencentCloudAsrClientBuilder {
@@ -135,18 +134,13 @@ impl TencentCloudAsrClientBuilder {
             _ => None,
         };
 
-        let inner = Arc::new(TencentCloudAsrClientInner {
-            audio_tx,
-            option: self.option,
-        });
-
-        let client = TencentCloudAsrClient {
-            inner: inner.clone(),
-        };
-
         let track_id = self.track_id.unwrap_or_else(|| Uuid::new_v4().to_string());
         let token = self.token.unwrap_or_default();
         let event_sender = self.event_sender;
+        let inner = TencentCloudAsrClientInner {
+            option: self.option,
+        };
+        let client = TencentCloudAsrClient { audio_tx };
 
         info!(track_id, "Starting TencentCloud ASR client");
 
@@ -191,6 +185,7 @@ impl TencentCloudAsrClientBuilder {
                     audio_rx,
                     event_sender.clone(),
                     token,
+                    inner.option.refer,
                 )
                 .await
                 {
@@ -356,6 +351,7 @@ impl TencentCloudAsrClient {
         mut audio_rx: mpsc::UnboundedReceiver<Vec<u8>>,
         event_sender: EventSender,
         token: CancellationToken,
+        refer: Option<bool>,
     ) -> Result<()> {
         let (mut ws_sender, mut ws_receiver) = ws_stream.split();
         let begin_time = crate::media::get_timestamp();
@@ -394,6 +390,7 @@ impl TencentCloudAsrClient {
                                             is_filler: None,
                                             confidence: None,
                                             task_id: response.task_id.take(),
+                                            refer,
                                         }
                                     } else {
                                         SessionEvent::AsrDelta {
@@ -406,6 +403,7 @@ impl TencentCloudAsrClient {
                                             is_filler: None,
                                             confidence: None,
                                             task_id: response.task_id.take(),
+                                            refer,
                                         }
                                     };
                                     event_sender.send(event).ok()?;
@@ -494,7 +492,7 @@ impl TencentCloudAsrClient {
 #[async_trait]
 impl TranscriptionClient for TencentCloudAsrClient {
     fn send_audio(&self, samples: &[Sample], _src_packet: Option<&SourcePacket>) -> Result<()> {
-        self.inner.audio_tx.send(samples_to_bytes(samples))?;
+        self.audio_tx.send(samples_to_bytes(samples))?;
         Ok(())
     }
 }

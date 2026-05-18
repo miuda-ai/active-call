@@ -109,6 +109,7 @@ async fn test_autohangup_headers_stored_in_extras() -> Result<()> {
         confidence: None,
         task_id: None,
         timestamp: 0,
+        refer: None,
     };
 
     let _ = handler.on_event(&event).await?;
@@ -201,6 +202,7 @@ async fn test_autohangup_without_sip_config() -> Result<()> {
         confidence: None,
         task_id: None,
         timestamp: 0,
+        refer: None,
     };
 
     let _ = handler.on_event(&event).await?;
@@ -304,6 +306,7 @@ async fn test_autohangup_headers_with_template_variables() -> Result<()> {
         confidence: None,
         task_id: None,
         timestamp: 0,
+        refer: None,
     };
 
     let _ = handler.on_event(&event).await?;

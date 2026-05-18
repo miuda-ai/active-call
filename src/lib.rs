@@ -170,6 +170,7 @@ pub struct ReferOption {
     pub denoise: Option<bool>,
     pub timeout: Option<u32>,
     pub moh: Option<String>,
+    pub vad: Option<VADOption>,
     pub asr: Option<TranscriptionOption>,
     /// hangup after the call is ended
     pub auto_hangup: Option<bool>,
@@ -177,6 +178,8 @@ pub struct ReferOption {
     pub call_id: Option<String>,
     /// Pause parent call's ASR during refer call, will resume after refer ends (if auto_hangup is false)
     pub pause_parent_asr: Option<bool>,
+    /// If false, DTMF RTP packets are not forwarded between the main call and the refer call
+    pub forward_dtmf: Option<bool>,
 }
 
 #[skip_serializing_none]

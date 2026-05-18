@@ -145,6 +145,7 @@ async fn handler_applies_tool_instructions() -> Result<()> {
         is_filler: None,
         confidence: None,
         task_id: None,
+        refer: None,
     };
 
     let commands = handler.on_event(&event).await?;
@@ -200,6 +201,7 @@ async fn handler_requeries_after_rag() -> Result<()> {
         is_filler: None,
         confidence: None,
         task_id: None,
+        refer: None,
     };
 
     let commands = handler.on_event(&event).await?;
@@ -263,6 +265,7 @@ async fn test_full_dialogue_flow() -> Result<()> {
         is_filler: None,
         confidence: None,
         task_id: None,
+        refer: None,
     };
     let commands = handler.on_event(&event).await?;
     // "Hello! How can I help you today?" -> split into two + EOS
@@ -284,6 +287,7 @@ async fn test_full_dialogue_flow() -> Result<()> {
         is_filler: None,
         confidence: None,
         task_id: None,
+        refer: None,
     };
     let commands = handler.on_event(&event).await?;
     assert_eq!(commands.len(), 1);
@@ -310,6 +314,7 @@ async fn test_full_dialogue_flow() -> Result<()> {
         is_filler: None,
         confidence: None,
         task_id: None,
+        refer: None,
     };
     let commands = handler.on_event(&event).await?;
     // Should have Tts with auto_hangup
@@ -358,6 +363,7 @@ async fn test_xml_tools_and_sentence_splitting() -> Result<()> {
         is_filler: None,
         confidence: None,
         task_id: None,
+        refer: None,
     };
 
     let commands = handler.on_event(&event).await?;
@@ -440,6 +446,7 @@ async fn test_interruption_logic() -> Result<()> {
         is_filler: None,
         confidence: None,
         task_id: None,
+        refer: None,
     };
     handler.on_event(&event).await?;
     assert!(handler.is_speaking);
@@ -458,6 +465,7 @@ async fn test_interruption_logic() -> Result<()> {
         is_filler: None,
         confidence: None,
         task_id: None,
+        refer: None,
     };
     let commands = handler.on_event(&event).await?;
     assert_eq!(commands.len(), 1);
@@ -502,14 +510,12 @@ async fn test_rag_iteration_limit() -> Result<()> {
         is_filler: None,
         confidence: None,
         task_id: None,
+        refer: None,
     };
 
     let commands = handler.on_event(&event).await?;
-    // After 3 attempts (MAX_RAG_ATTEMPTS), it should stop and return the last raw response
-    assert_eq!(commands.len(), 1);
-    if let Command::Tts { text, .. } = &commands[0] {
-        assert_eq!(text, rag_instruction);
-    }
+    // After MAX_RAG_ATTEMPTS, tool-only JSON should not be spoken back to the caller.
+    assert!(commands.is_empty());
 
     Ok(())
 }
@@ -555,6 +561,7 @@ async fn test_follow_up_logic() -> Result<()> {
         start_time: 0,
         duration: 50,
         samples: None,
+        refer: None,
     };
     let commands = handler.on_event(&event).await?;
     assert!(commands.is_empty(), "Should not trigger if < timeout");
@@ -570,6 +577,7 @@ async fn test_follow_up_logic() -> Result<()> {
         start_time: 0,
         duration: 100,
         samples: None,
+        refer: None,
     };
     let commands = handler.on_event(&event).await?;
     assert_eq!(commands.len(), 1, "Should trigger follow-up 1");
@@ -601,6 +609,7 @@ async fn test_follow_up_logic() -> Result<()> {
         start_time: 0,
         duration: 100,
         samples: None,
+        refer: None,
     };
     let commands = handler.on_event(&event).await?;
     assert_eq!(commands.len(), 1, "Should trigger follow-up 2");
@@ -627,6 +636,7 @@ async fn test_follow_up_logic() -> Result<()> {
         start_time: 0,
         duration: 100,
         samples: None,
+        refer: None,
     };
     let commands = handler.on_event(&event).await?;
     assert_eq!(commands.len(), 1, "Should hangup after max count");
@@ -643,6 +653,7 @@ async fn test_follow_up_logic() -> Result<()> {
         is_filler: None,
         confidence: None,
         task_id: None,
+        refer: None,
     };
 
     let _ = handler.on_event(&event).await?;
@@ -684,6 +695,7 @@ async fn test_interruption_protection_period() -> Result<()> {
         is_filler: None,
         confidence: None,
         task_id: None,
+        refer: None,
     };
     handler.on_event(&event).await?;
     assert!(handler.is_speaking);
@@ -699,6 +711,7 @@ async fn test_interruption_protection_period() -> Result<()> {
         is_filler: None,
         confidence: None,
         task_id: None,
+        refer: None,
     };
     let commands = handler.on_event(&event).await?;
     // Should be ignored due to protection period
@@ -739,6 +752,7 @@ async fn test_interruption_filler_word() -> Result<()> {
         is_filler: None,
         confidence: None,
         task_id: None,
+        refer: None,
     };
     handler.on_event(&event).await?;
     assert!(handler.is_speaking);
@@ -757,6 +771,7 @@ async fn test_interruption_filler_word() -> Result<()> {
         is_filler: Some(true),
         confidence: None,
         task_id: None,
+        refer: None,
     };
     let commands = handler.on_event(&event).await?;
     // Should be ignored
@@ -774,6 +789,7 @@ async fn test_interruption_filler_word() -> Result<()> {
         is_filler: Some(false),
         confidence: None,
         task_id: None,
+        refer: None,
     };
     let commands = handler.on_event(&event).await?;
     // Should trigger interruption
@@ -808,6 +824,7 @@ async fn test_eou_early_response() -> Result<()> {
         completed: true,
         interrupt_point: None,
         text: Some("User's final utterance".to_string()),
+        refer: None,
     };
     let commands = handler.on_event(&event).await?;
     assert_eq!(commands.len(), 1);
@@ -897,6 +914,7 @@ async fn test_rolling_summary() -> Result<()> {
         is_filler: None,
         confidence: None,
         task_id: None,
+        refer: None,
     };
 
     let commands = handler.on_event(&event).await?;

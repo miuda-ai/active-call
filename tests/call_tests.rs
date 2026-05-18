@@ -68,6 +68,7 @@ impl MockAsrClientBuilder {
                             is_filler: None,
                             confidence: None,
                             task_id: None,
+                            refer: None,
                         };
                         let _ = event_sender.send(event);
                     }
@@ -333,6 +334,7 @@ async fn test_webrtc_call_workflow() -> Result<()> {
         reason: None,
         initiator: None,
         headers: None,
+        refer: None,
     };
     ws_stream
         .send(Message::Text(serde_json::to_string(&hangup_cmd)?.into()))

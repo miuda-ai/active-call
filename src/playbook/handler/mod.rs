@@ -645,6 +645,7 @@ impl LlmHandler {
                     reason: Some("DTMF Hangup".to_string()),
                     initiator: Some("ai".to_string()),
                     headers,
+                    refer: None,
                 }])
             }
         }
@@ -1318,6 +1319,7 @@ impl LlmHandler {
                     reason: reason.clone(),
                     initiator: initiator.clone(),
                     headers,
+                    refer: None,
                 });
                 Ok(false)
             }
@@ -1511,7 +1513,10 @@ impl LlmHandler {
                 let text = res.text().await.unwrap_or_default();
                 self.history.push(ChatMessage {
                     role: "system".to_string(),
-                    content: format!("HTTP tool response ({}): {}", status, text),
+                    content: format!(
+                        "HTTP tool response ({}): {}\nThe HTTP request has already completed. Answer the user from this result in natural language; do not emit another http tool call for the same user request.",
+                        status, text
+                    ),
                 });
             }
             Err(e) => {
@@ -1728,6 +1733,7 @@ impl LlmHandler {
                 reason: Some("Max follow-up reached".to_string()),
                 initiator: Some("system".to_string()),
                 headers,
+                refer: None,
             }]);
         }
 
@@ -1756,6 +1762,7 @@ impl LlmHandler {
                     reason: args["reason"].as_str().map(|s| s.to_string()),
                     initiator: Some("ai".to_string()),
                     headers,
+                    refer: None,
                 }])
             }
             "transfer_call" | "refer_call" => {
@@ -1802,6 +1809,24 @@ impl LlmHandler {
 
             if wait_input_timeout.is_none() {
                 wait_input_timeout = structured.wait_input_timeout;
+            }
+
+            let has_tools = structured
+                .tools
+                .as_ref()
+                .map(|tools| !tools.is_empty())
+                .unwrap_or(false);
+
+            if attempts >= MAX_RAG_ATTEMPTS
+                && has_tools
+                && structured
+                    .text
+                    .as_ref()
+                    .map(|text| text.trim().is_empty())
+                    .unwrap_or(true)
+            {
+                warn!("Reached RAG iteration limit with tool-only response; suppressing raw tool JSON");
+                break None;
             }
 
             let mut rerun_for_rag = false;

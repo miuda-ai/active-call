@@ -428,6 +428,7 @@ async fn test_collector_on_event_dtmf_routing() -> Result<()> {
         digit: "5".to_string(),
         track_id: "test-track".to_string(),
         timestamp: crate::media::get_timestamp(),
+        refer: None,
     };
 
     let _commands = handler.on_event(&event).await?;
@@ -457,6 +458,7 @@ async fn test_collector_on_event_ignores_asr() -> Result<()> {
         is_filler: None,
         confidence: None,
         task_id: None,
+        refer: None,
     };
 
     let commands = handler.on_event(&event).await?;

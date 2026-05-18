@@ -43,6 +43,10 @@ pub enum SessionEvent {
         sdp: String,
         refer: Option<bool>,
     },
+    MediaReady {
+        track_id: String,
+        timestamp: u64,
+    },
     Reject {
         track_id: String,
         timestamp: u64,
@@ -94,12 +98,14 @@ pub enum SessionEvent {
         start_time: u64,
         is_filler: Option<bool>,
         confidence: Option<f32>,
+        refer: Option<bool>,
     },
     Silence {
         track_id: String,
         timestamp: u64,
         start_time: u64,
         duration: u64,
+        refer: Option<bool>,
         #[serde(skip)]
         samples: Option<PcmBuf>,
     },
@@ -110,6 +116,7 @@ pub enum SessionEvent {
         completed: bool,
         interrupt_point: Option<String>,
         text: Option<String>,
+        refer: Option<bool>,
     },
     ///Inactivity timeout
     Inactivity {
@@ -120,11 +127,13 @@ pub enum SessionEvent {
         track_id: String,
         timestamp: u64,
         digit: String,
+        refer: Option<bool>,
     },
     Hold {
         track_id: String,
         timestamp: u64,
         on_hold: bool,
+        refer: Option<bool>,
     },
     TransferRequest {
         track_id: String,
@@ -164,6 +173,7 @@ pub enum SessionEvent {
         is_filler: Option<bool>,
         confidence: Option<f32>,
         task_id: Option<String>,
+        refer: Option<bool>,
     },
     AsrDelta {
         track_id: String,
@@ -175,6 +185,7 @@ pub enum SessionEvent {
         is_filler: Option<bool>,
         confidence: Option<f32>,
         task_id: Option<String>,
+        refer: Option<bool>,
     },
     Metrics {
         timestamp: u64,

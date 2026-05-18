@@ -277,10 +277,12 @@ impl DialogStateReceiverGuard {
                     if body_str.starts_with("Signal=") {
                         let digit = body_str.trim_start_matches("Signal=").chars().next();
                         if let Some(digit) = digit {
+                            let is_refer = states.call_state.read().await.is_refer;
                             states.event_sender.send(crate::event::SessionEvent::Dtmf {
                                 track_id: states.track_id.clone(),
                                 timestamp: crate::media::get_timestamp(),
                                 digit: digit.to_string(),
+                                refer: Some(is_refer),
                             })?;
                         }
                     }
@@ -288,6 +290,7 @@ impl DialogStateReceiverGuard {
                 }
                 DialogState::Updated(dialog_id, _req, tx_handle) => {
                     info!(session_id = states.session_id, %dialog_id, "dialog update received");
+                    let is_refer = states.call_state.read().await.is_refer;
                     let mut answer_sdp = None;
                     if let Some(sdp_body) = _req.body().get(..) {
                         let sdp_str = String::from_utf8_lossy(sdp_body);
@@ -322,6 +325,7 @@ impl DialogStateReceiverGuard {
                                     track_id: states.track_id.clone(),
                                     timestamp: crate::media::get_timestamp(),
                                     on_hold: is_on_hold,
+                                    refer: Some(is_refer),
                                 })
                                 .ok();
 
@@ -355,6 +359,7 @@ impl DialogStateReceiverGuard {
                                         track_id: states.track_id.clone(),
                                         timestamp: crate::media::get_timestamp(),
                                         on_hold: true,
+                                        refer: Some(is_refer),
                                     })
                                     .ok();
                             } else {
@@ -368,6 +373,7 @@ impl DialogStateReceiverGuard {
                                         track_id: states.track_id.clone(),
                                         timestamp: crate::media::get_timestamp(),
                                         on_hold: false,
+                                        refer: Some(is_refer),
                                     })
                                     .ok();
                             }
@@ -533,7 +539,6 @@ impl Invitation {
     ) -> Result<()> {
         if let Some(call) = self.get_pending_call(&dialog_id) {
             call.dialog.reject(code, reason).ok();
-            call.token.cancel();
         }
         match self.dialog_layer.get_dialog(&dialog_id) {
             Some(dialog) => {
@@ -548,7 +553,6 @@ impl Invitation {
     pub async fn reject(&self, dialog_id: DialogId) -> Result<()> {
         if let Some(call) = self.get_pending_call(&dialog_id) {
             call.dialog.reject(None, None).ok();
-            call.token.cancel();
         }
         match self.dialog_layer.get_dialog(&dialog_id) {
             Some(dialog) => {

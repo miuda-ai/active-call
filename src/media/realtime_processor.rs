@@ -190,6 +190,7 @@ async fn run_realtime_loop(
                                 start_time: v["audio_start_ms"].as_u64().unwrap_or_default(),
                                 is_filler: None,
                                 confidence: None,
+                                refer: None,
                             }).ok();
 
                             // Immediately signal interruption to stop current local playback
@@ -209,6 +210,7 @@ async fn run_realtime_loop(
                                     end_time: None,
                                     is_filler: None,
                                     confidence: None,
+                                    refer: None,
                                 }).ok();
                             }
                         }
