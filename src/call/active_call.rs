@@ -1354,7 +1354,9 @@ impl ActiveCall {
                     let mut state = self.call_state.write().await;
                     (state.refer_callstate.clone(), state.refer_call_token.take())
                 };
+                let mut has_refer_state = false;
                 if let Some(refer_state) = refer_state {
+                    has_refer_state = true;
                     let mut refer_state = refer_state.write().await;
                     if let Some(headers) = headers {
                         let h_val = serde_json::to_value(&headers).unwrap_or_default();
@@ -1367,6 +1369,11 @@ impl ActiveCall {
                 }
                 if let Some(token) = refer_token {
                     token.cancel();
+                }
+                if has_refer_state {
+                    self.media_stream
+                        .remove_track(&self.server_side_track_id, false)
+                        .await;
                 }
             }
             _ => {
