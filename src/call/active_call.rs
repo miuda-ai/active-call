@@ -1470,7 +1470,7 @@ impl ActiveCall {
             caller
         };
 
-        let call_option = CallOption {
+        let mut call_option = CallOption {
             caller: Some(caller),
             callee: Some(callee.clone()),
             sip: refer_option.as_ref().and_then(|o| o.sip.clone()),
@@ -1479,6 +1479,7 @@ impl ActiveCall {
             recorder,
             ..Default::default()
         };
+        call_option.check_default();
 
         let mut invite_option = call_option.build_invite_option()?;
         invite_option.call_id = Some(ref_call_id);
