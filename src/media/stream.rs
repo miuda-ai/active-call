@@ -337,6 +337,7 @@ impl MediaStream {
             Err(anyhow::anyhow!("Track {} not found", track_id))
         }
     }
+
 }
 
 #[derive(Clone)]

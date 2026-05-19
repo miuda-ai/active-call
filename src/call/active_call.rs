@@ -13,6 +13,7 @@ use crate::{
         track::{
             Track, TrackConfig,
             file::FileTrack,
+            forwarding::ForwardingTrack,
             media_pass::MediaPassTrack,
             rtc::{RtcTrack, RtcTrackConfig},
             tts::SynthesisHandle,
@@ -41,8 +42,16 @@ use audio_codec::CodecType;
 use chrono::{DateTime, Utc};
 use rsipstack::dialog::{invitation::InviteOption, server_dialog::ServerInviteDialog};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
-use tokio::{fs::File, select, sync::Mutex, sync::RwLock, time::sleep};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
+use tokio::{fs::File, select, sync::Mutex, sync::RwLock, sync::mpsc, time::sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -338,6 +347,7 @@ pub struct ActiveCallState {
     pub audio_receiver: Option<WebsocketBytesReceiver>,
     pub ready_to_answer: Option<(String, Option<Box<dyn Track>>, ServerInviteDialog)>,
     pub pending_asr_resume: Option<(u32, TranscriptionOption)>,
+    pub bridge_paused: Arc<AtomicBool>,
     // Cancel this token to hang up only the refer call, leaving the main call alive
     pub refer_call_token: Option<CancellationToken>,
 }
@@ -757,6 +767,13 @@ impl ActiveCall {
                             continue;
                         }
                     }
+                    SessionEvent::Hold { on_hold, .. } => {
+                        self.call_state
+                            .read()
+                            .await
+                            .bridge_paused
+                            .store(on_hold, Ordering::Relaxed);
+                    }
                     _ => {}
                 }
             }
@@ -842,6 +859,8 @@ impl ActiveCall {
                 callee,
                 options,
             } => self.do_refer(caller, callee, options).await,
+            Command::Bridge { target_session_id } => self.do_bridge(target_session_id).await,
+            Command::Unbridge { target_session_id } => self.do_unbridge(target_session_id).await,
             Command::Mute { track_id } => self.do_mute(track_id).await,
             Command::Unmute { track_id } => self.do_unmute(track_id).await,
             Command::Pause {} => self.do_pause().await,
@@ -1652,6 +1671,117 @@ impl ActiveCall {
                 return Err(e.into());
             }
         }
+        Ok(())
+    }
+
+    fn bridge_track_id(source_session_id: &str, target_session_id: &str) -> TrackId {
+        format!("bridge:{}:to:{}", source_session_id, target_session_id)
+    }
+
+    async fn do_bridge(&self, target_session_id: String) -> Result<()> {
+        let target = {
+            let calls = self.app_state.active_calls.lock().unwrap();
+            calls.get(&target_session_id).cloned()
+        };
+        let target = target.ok_or_else(|| {
+            anyhow::anyhow!("bridge target session not found: {}", target_session_id)
+        })?;
+
+        if target.session_id == self.session_id {
+            return Err(anyhow::anyhow!("cannot bridge a call to itself").into());
+        }
+
+        let self_bridge_track_id = Self::bridge_track_id(&self.session_id, &target.session_id);
+        let target_bridge_track_id = Self::bridge_track_id(&target.session_id, &self.session_id);
+
+        self.media_stream
+            .remove_track(&self_bridge_track_id, false)
+            .await;
+        target
+            .media_stream
+            .remove_track(&target_bridge_track_id, false)
+            .await;
+
+        let (self_bridge_sender, self_bridge_receiver) = mpsc::channel(25);
+        let (target_bridge_sender, target_bridge_receiver) = mpsc::channel(25);
+
+        let self_paused = self.call_state.read().await.bridge_paused.clone();
+        let target_paused = target.call_state.read().await.bridge_paused.clone();
+
+        let self_forwarding_track = ForwardingTrack::new(
+            self_bridge_track_id.clone(),
+            self.session_id.clone(),
+            target_bridge_sender,
+            self_bridge_receiver,
+            self.track_config.clone(),
+            self.cancel_token.child_token(),
+            rand::random::<u32>(),
+            self_paused,
+        );
+
+        let target_forwarding_track = ForwardingTrack::new(
+            target_bridge_track_id.clone(),
+            target.session_id.clone(),
+            self_bridge_sender,
+            target_bridge_receiver,
+            target.track_config.clone(),
+            target.cancel_token.child_token(),
+            rand::random::<u32>(),
+            target_paused,
+        );
+
+        self.media_stream
+            .update_track(Box::new(self_forwarding_track), None)
+            .await;
+        target
+            .media_stream
+            .update_track(Box::new(target_forwarding_track), None)
+            .await;
+
+        info!(
+            session_id = self.session_id,
+            target = target_session_id,
+            self_bridge_track_id,
+            target_bridge_track_id,
+            "audio bridge established"
+        );
+        Ok(())
+    }
+
+    async fn do_unbridge(&self, target_session_id: String) -> Result<()> {
+        let target = {
+            let calls = self.app_state.active_calls.lock().unwrap();
+            calls.get(&target_session_id).cloned()
+        };
+
+        let self_bridge_track_id = Self::bridge_track_id(&self.session_id, &target_session_id);
+        self.media_stream
+            .remove_track(&self_bridge_track_id, false)
+            .await;
+
+        if let Some(target) = target {
+            let target_bridge_track_id =
+                Self::bridge_track_id(&target.session_id, &self.session_id);
+            target
+                .media_stream
+                .remove_track(&target_bridge_track_id, false)
+                .await;
+            info!(
+                session_id = self.session_id,
+                target = target.session_id,
+                self_bridge_track_id,
+                target_bridge_track_id,
+                "audio bridge removed"
+            );
+        } else {
+            info!(
+                session_id = self.session_id,
+                target = target_session_id,
+                self_bridge_track_id,
+                "audio bridge removed locally; target session not active"
+            );
+        }
+
         Ok(())
     }
 
