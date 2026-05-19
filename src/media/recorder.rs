@@ -351,6 +351,9 @@ impl Recorder {
     }
 
     fn get_channel_index(&self, track_id: &str) -> usize {
+        if track_id.starts_with("bridge:") {
+            return 1;
+        }
         let mut channels = self.channels.lock().unwrap();
         if let Some(&channel_idx) = channels.get(track_id) {
             channel_idx % 2
