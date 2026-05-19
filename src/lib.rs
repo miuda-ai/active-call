@@ -69,6 +69,7 @@ pub struct CallOption {
     pub eou: Option<EouOption>,
     pub realtime: Option<RealtimeOption>,
     pub subscribe: Option<bool>,
+    pub enable_ice_lite: Option<bool>,
 }
 
 impl Default for CallOption {
@@ -93,6 +94,7 @@ impl Default for CallOption {
             eou: None,
             realtime: None,
             subscribe: None,
+            enable_ice_lite: None,
         }
     }
 }
