@@ -11,7 +11,7 @@ use std::sync::{
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 
 pub struct ForwardingTrack {
     track_id: TrackId,
@@ -87,6 +87,7 @@ impl Track for ForwardingTrack {
             .ok_or_else(|| anyhow::anyhow!("forwarding track already started"))?;
         let track_id = self.track_id.clone();
         let cancel_token = self.cancel_token.clone();
+        let mut processor_chain = self.processor_chain.clone();
 
         crate::spawn(async move {
             let stop_reason = loop {
@@ -98,6 +99,9 @@ impl Track for ForwardingTrack {
                         match packet {
                             Some(mut packet) => {
                                 packet.track_id = track_id.clone();
+                                if let Err(e) = processor_chain.process_frame(&mut packet) {
+                                    warn!(track_id, "processor_chain process_frame error: {:?}", e);
+                                }
                                 if packet_sender.send(packet).is_err() {
                                     break "media stream closed";
                                 }
