@@ -1024,6 +1024,9 @@ impl ActiveCall {
             option = self.invite_or_accept(option, "accept".to_string()).await?;
         } else {
             option.check_default();
+            if let Some(opt) = self.build_record_option(&option) {
+                self.media_stream.update_recorder_option(opt).await;
+            }
             self.call_state.write().await.option = Some(option.clone());
         }
         info!(session_id = self.session_id, ?option, "accepting call");
