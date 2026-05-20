@@ -65,6 +65,12 @@ pub trait Track: Send + Sync {
     fn ssrc(&self) -> u32;
     fn id(&self) -> &TrackId;
     fn config(&self) -> &TrackConfig;
+    fn set_paused(&self, _paused: bool) -> bool {
+        false
+    }
+    fn is_paused(&self) -> bool {
+        false
+    }
     fn processor_chain(&mut self) -> &mut ProcessorChain;
     fn insert_processor(&mut self, processor: Box<dyn Processor>) {
         self.processor_chain().insert_processor(processor);

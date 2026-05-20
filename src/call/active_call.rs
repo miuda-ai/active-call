@@ -9,7 +9,7 @@ use crate::{
         negotiate::strip_ipv6_candidates,
         processor::SubscribeProcessor,
         recorder::RecorderOption,
-        stream::{MediaStream, MediaStreamBuilder},
+        stream::{MediaStream, MediaStreamBuilder, SERVER_SIDE_TRACK_ID},
         track::{
             Track, TrackConfig,
             file::FileTrack,
@@ -422,6 +422,8 @@ impl ActiveCall {
     ) -> Self {
         let event_sender = crate::event::create_event_sender();
         let cmd_sender = tokio::sync::broadcast::Sender::<Command>::new(32);
+        let server_side_track_id =
+            server_side_track_id.unwrap_or(SERVER_SIDE_TRACK_ID.to_string());
         let media_stream_builder = MediaStreamBuilder::new(event_sender.clone())
             .with_id(session_id.clone())
             .with_cancel_token(cancel_token.child_token());
@@ -465,7 +467,7 @@ impl ActiveCall {
             invitation,
             cmd_sender,
             dump_events,
-            server_side_track_id: server_side_track_id.unwrap_or("server-side-track".to_string()),
+            server_side_track_id,
         }
     }
 
@@ -1346,9 +1348,15 @@ impl ActiveCall {
         Ok(())
     }
     async fn do_pause(&self) -> Result<()> {
+        self.media_stream
+            .pause_playback(self.server_side_track_id.clone())
+            .await?;
         Ok(())
     }
     async fn do_resume(&self) -> Result<()> {
+        self.media_stream
+            .resume_playback(self.server_side_track_id.clone())
+            .await?;
         Ok(())
     }
     async fn do_hangup(

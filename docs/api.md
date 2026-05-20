@@ -467,7 +467,9 @@ Commands are sent as JSON messages through the WebSocket connection. All timesta
 ```
 
 #### Pause Command
-**Purpose:** Pauses current playback.
+**Purpose:** Pauses current server-side file/TTS playback without ending the track.
+
+Pause targets the current server-side playback track. It freezes playback progress; it does not emit `trackEnd` while paused.
 
 ```json
 {
@@ -477,6 +479,8 @@ Commands are sent as JSON messages through the WebSocket connection. All timesta
 
 #### Resume Command
 **Purpose:** Resumes paused playback.
+
+Resume continues paused server-side file/TTS playback from the paused playback position.
 
 ```json
 {

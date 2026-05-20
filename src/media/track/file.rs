@@ -12,6 +12,10 @@ use hound::WavReader;
 use std::cmp::min;
 use std::fs::File;
 use std::io::BufReader;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Instant;
 use tokio::select;
 use tokio::time::Duration;
@@ -160,6 +164,7 @@ async fn process_audio_reader(
     packet_duration_ms: u32,
     target_sample_rate: u32,
     token: CancellationToken,
+    paused: Arc<AtomicBool>,
     packet_sender: TrackPacketSender,
 ) -> Result<()> {
     info!(
@@ -170,7 +175,17 @@ async fn process_audio_reader(
         let start_time = Instant::now();
         let mut ticker = tokio::time::interval(Duration::from_millis(packet_duration_ms as u64));
         let channels = audio_reader.channels();
-        while let Some((chunk, chunk_sample_rate)) = audio_reader.read_chunk(packet_duration_ms)? {
+        loop {
+            if paused.load(Ordering::Relaxed) {
+                ticker.tick().await;
+                continue;
+            }
+
+            let Some((chunk, chunk_sample_rate)) = audio_reader.read_chunk(packet_duration_ms)?
+            else {
+                break;
+            };
+
             let mut packet = AudioFrame {
                 track_id: track_id.to_string(),
                 timestamp: crate::media::get_timestamp(),
@@ -221,6 +236,7 @@ pub struct FileTrack {
     use_cache: bool,
     ssrc: u32,
     offset_ms: u32,
+    paused: Arc<AtomicBool>,
 }
 
 impl FileTrack {
@@ -236,6 +252,7 @@ impl FileTrack {
             use_cache: true,
             ssrc: 0,
             offset_ms: 0,
+            paused: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -295,6 +312,13 @@ impl Track for FileTrack {
     fn config(&self) -> &TrackConfig {
         &self.config
     }
+    fn set_paused(&self, paused: bool) -> bool {
+        self.paused.store(paused, Ordering::Relaxed);
+        true
+    }
+    fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
+    }
     fn processor_chain(&mut self) -> &mut ProcessorChain {
         &mut self.processor_chain
     }
@@ -324,6 +348,7 @@ impl Track for FileTrack {
         let start_time = crate::media::get_timestamp();
         let ssrc = self.ssrc;
         let offset_ms = self.offset_ms;
+        let paused = self.paused.clone();
         // Spawn async task to handle file streaming
         let play_id = self.play_id.clone();
         crate::spawn(async move {
@@ -392,6 +417,7 @@ impl Track for FileTrack {
                     packet_duration_ms,
                     offset_ms,
                     token,
+                    paused,
                     packet_sender,
                 )
                 .await;
@@ -458,6 +484,7 @@ async fn stream_audio_file(
     packet_duration_ms: u32,
     offset_ms: u32,
     token: CancellationToken,
+    paused: Arc<AtomicBool>,
     packet_sender: TrackPacketSender,
 ) -> Result<()> {
     let start_time = Instant::now();
@@ -491,6 +518,7 @@ async fn stream_audio_file(
         packet_duration_ms,
         target_sample_rate,
         token,
+        paused,
         packet_sender,
     )
     .await

@@ -36,6 +36,7 @@ pub struct MediaStream {
 
 const CALLEE_TRACK_ID: &str = "callee-track";
 const QUEUE_HOLD_TRACK_ID: &str = "queue-hold-track";
+pub const SERVER_SIDE_TRACK_ID: &str = "server-side-track";
 
 pub struct MediaStreamBuilder {
     cancel_token: Option<CancellationToken>,
@@ -278,6 +279,38 @@ impl MediaStream {
             for (track, _) in self.tracks.lock().await.values_mut() {
                 MuteProcessor::unmute_track(track.as_mut());
             }
+        }
+    }
+
+    pub async fn pause_playback(&self, id: TrackId) -> Result<()> {
+        self.set_playback_paused(id, true).await
+    }
+
+    pub async fn resume_playback(&self, id: TrackId) -> Result<()> {
+        self.set_playback_paused(id, false).await
+    }
+
+    async fn set_playback_paused(&self, id: TrackId, paused: bool) -> Result<()> {
+        if let Some((track, _)) = self.tracks.lock().await.get_mut(&id) {
+            if track.set_paused(paused) {
+                Ok(())
+            } else {
+                warn!(
+                    session_id = self.id,
+                    track_id = %id,
+                    paused,
+                    "pause state requested for track that does not support pausing"
+                );
+                Err(anyhow::anyhow!("track does not support pausing: {}", id))
+            }
+        } else {
+            warn!(
+                session_id = self.id,
+                track_id = %id,
+                paused,
+                "pause state requested for unknown track"
+            );
+            Err(anyhow::anyhow!("track not found: {}", id))
         }
     }
 

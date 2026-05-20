@@ -183,6 +183,73 @@ async fn test_tts_track_basic_non_streaming() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_tts_track_pause_buffers_until_resume() -> Result<()> {
+    let (command_tx, command_rx) = mpsc::unbounded_channel();
+    let track_id = "test-tts-pause-track".to_string();
+    let non_streaming_client = MockSynthesisClient::new(false);
+    let mut tts_track = TtsTrack::new(
+        track_id.clone(),
+        "test_session".to_string(),
+        false,
+        Some("pause-play".to_string()),
+        command_rx,
+        Box::new(non_streaming_client),
+    );
+
+    let (event_tx, mut event_rx) = broadcast::channel(16);
+    let (packet_tx, mut packet_rx) = mpsc::unbounded_channel();
+    tts_track.start(event_tx, packet_tx).await?;
+
+    assert!(tts_track.set_paused(true));
+    command_tx.send(SynthesisCommand {
+        text: "Pause me".to_string(),
+        end_of_stream: true,
+        ..Default::default()
+    })?;
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(120), packet_rx.recv())
+            .await
+            .is_err(),
+        "paused TTS playback should buffer without emitting packets"
+    );
+
+    while let Ok(event) = event_rx.try_recv() {
+        assert!(
+            !matches!(event, SessionEvent::TrackEnd { .. }),
+            "paused TTS playback should not emit TrackEnd"
+        );
+    }
+
+    assert!(tts_track.set_paused(false));
+    let frame = tokio::time::timeout(Duration::from_secs(1), packet_rx.recv())
+        .await
+        .expect("expected packet after resume")
+        .expect("packet channel closed");
+    assert_eq!(frame.track_id, track_id);
+
+    let timeout = tokio::time::sleep(Duration::from_secs(5));
+    tokio::pin!(timeout);
+    let mut track_end = false;
+    loop {
+        tokio::select! {
+            _ = &mut timeout => break,
+            event = event_rx.recv() => {
+                if let Ok(SessionEvent::TrackEnd { track_id: id, play_id, .. }) = event {
+                    assert_eq!(id, track_id);
+                    assert_eq!(play_id, Some("pause-play".to_string()));
+                    track_end = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    assert!(track_end, "TrackEnd should be emitted after resumed TTS drains");
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_tts_track_basic_streaming() -> Result<()> {
     // Create a command channel
     let (command_tx, command_rx) = mpsc::unbounded_channel();

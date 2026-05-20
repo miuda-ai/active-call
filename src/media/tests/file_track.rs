@@ -236,3 +236,46 @@ async fn test_mute_and_unmute() -> Result<()> {
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn test_file_track_pause_resume() -> Result<()> {
+    let (test_file, _temp_dir) = create_test_wav_file()?;
+    let track_id = "test_file_pause_track".to_string();
+    let mut file_track = FileTrack::new(track_id.clone())
+        .with_path(test_file)
+        .with_config(
+            crate::media::track::TrackConfig::default()
+                .with_sample_rate(16000)
+                .with_ptime(Duration::from_millis(10)),
+        );
+
+    let (event_sender, _) = broadcast::channel(16);
+    let (packet_sender, mut packet_receiver) = mpsc::unbounded_channel();
+    file_track.start(event_sender, packet_sender).await?;
+
+    let first_packet = tokio::time::timeout(Duration::from_secs(1), packet_receiver.recv())
+        .await
+        .expect("expected packet before pause")
+        .expect("packet channel closed");
+    assert_eq!(first_packet.track_id, track_id);
+
+    assert!(file_track.set_paused(true));
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    while packet_receiver.try_recv().is_ok() {}
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert!(
+        packet_receiver.try_recv().is_err(),
+        "paused file playback should not emit packets"
+    );
+
+    assert!(file_track.set_paused(false));
+    let resumed_packet = tokio::time::timeout(Duration::from_secs(1), packet_receiver.recv())
+        .await
+        .expect("expected packet after resume")
+        .expect("packet channel closed");
+    assert_eq!(resumed_packet.track_id, track_id);
+
+    file_track.stop().await?;
+    Ok(())
+}

@@ -95,6 +95,7 @@ struct TtsTask {
     cur_seq: usize,
     streaming: bool,
     graceful: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     // Jitter buffer state
     buffering_state: Option<Instant>,
     min_buffer_size: usize,
@@ -194,6 +195,13 @@ impl TtsTask {
                     self.client.stop().await?;
                 }
                 _ = ptimer.tick() => {
+                    if self.paused.load(Ordering::Relaxed) {
+                        for entry in self.emit_q.iter_mut() {
+                            entry.finish_at += self.ptime;
+                        }
+                        continue;
+                    }
+
                     samples.fill(0);
                     let mut i = 0;
 
@@ -882,6 +890,7 @@ pub struct TtsTrack {
     client: Mutex<Option<Box<dyn SynthesisClient>>>,
     ssrc: u32,
     graceful: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     min_buffer_duration: Duration,
     max_buffer_wait: Duration,
 }
@@ -928,6 +937,7 @@ impl TtsTrack {
             use_cache: true,
             client: Mutex::new(Some(client)),
             graceful: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
             ssrc: 0,
             min_buffer_duration: Duration::from_millis(200), // Default 200ms
             max_buffer_wait: Duration::from_millis(500),     // Default 500ms
@@ -981,6 +991,13 @@ impl Track for TtsTrack {
     fn config(&self) -> &TrackConfig {
         &self.config
     }
+    fn set_paused(&self, paused: bool) -> bool {
+        self.paused.store(paused, Ordering::Relaxed);
+        true
+    }
+    fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
+    }
     fn processor_chain(&mut self) -> &mut ProcessorChain {
         &mut self.processor_chain
     }
@@ -1029,6 +1046,7 @@ impl Track for TtsTrack {
             cur_seq: 0,
             streaming: self.streaming,
             graceful: self.graceful.clone(),
+            paused: self.paused.clone(),
             ssrc: self.ssrc,
             buffering_state: Some(Instant::now()),
             min_buffer_size: (self.config.samplerate as usize
@@ -1146,6 +1164,7 @@ mod tests {
             cur_seq: 0,
             streaming: true,
             graceful: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
             ssrc: 1234,
             buffering_state: Some(Instant::now()),
             min_buffer_size,
@@ -1251,6 +1270,7 @@ mod tests {
             cur_seq: 0,
             streaming: true,
             graceful: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
             ssrc: 5678,
             buffering_state: Some(Instant::now()),
             min_buffer_size,
@@ -1331,6 +1351,7 @@ mod tests {
             cur_seq: 0,
             streaming: true,
             graceful: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
             ssrc: 9999,
             buffering_state: Some(Instant::now()),
             min_buffer_size,
@@ -1420,6 +1441,7 @@ mod tests {
             cur_seq: 0,
             streaming: true,
             graceful: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
             ssrc: 1111,
             buffering_state: Some(Instant::now()),
             min_buffer_size,
@@ -1513,6 +1535,7 @@ mod tests {
             cur_seq: 0,
             streaming: false, // Non-streaming mode
             graceful: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
             ssrc: 7777,
             buffering_state: Some(Instant::now()), // Initial buffering
             min_buffer_size,
@@ -1727,6 +1750,7 @@ mod tests {
             cur_seq: 0,
             streaming: false, // Non-streaming mode
             graceful: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
             ssrc: 8888,
             buffering_state: Some(Instant::now()),
             min_buffer_size,
@@ -1843,6 +1867,7 @@ mod tests {
             cur_seq: 0,
             streaming: true, // Streaming mode
             graceful: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
             ssrc: 9999,
             buffering_state: Some(Instant::now()),
             min_buffer_size,
@@ -1957,6 +1982,7 @@ mod tests {
             cur_seq: 0,
             streaming: false,
             graceful: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
             ssrc: 1010,
             buffering_state: Some(Instant::now()),
             min_buffer_size,
