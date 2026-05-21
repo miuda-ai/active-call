@@ -437,6 +437,13 @@ impl MediaStream {
                 }
             });
             *self.recorder_handle.lock().await = Some(recorder_handle);
+
+            // Inject RecorderProcessor into tracks that were added before the recorder started
+            for (track, _) in self.tracks.lock().await.values_mut() {
+                track.insert_processor(Box::new(RecorderProcessor::new(
+                    self.recorder_sender.clone(),
+                )));
+            }
         }
         Ok(())
     }

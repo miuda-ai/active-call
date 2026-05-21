@@ -3,7 +3,6 @@ use audio_codec::{PcmBuf, samples_to_bytes};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
     path::Path,
     sync::{
         Mutex,
@@ -115,8 +114,6 @@ pub struct Recorder {
     option: RecorderOption,
     samples_written: AtomicUsize,
     cancel_token: CancellationToken,
-    channel_idx: AtomicUsize,
-    channels: Mutex<HashMap<String, usize>>,
     stereo_buf: Mutex<PcmBuf>,
     mono_buf: Mutex<PcmBuf>,
 }
@@ -132,8 +129,6 @@ impl Recorder {
             option,
             samples_written: AtomicUsize::new(0),
             cancel_token,
-            channel_idx: AtomicUsize::new(0),
-            channels: Mutex::new(HashMap::new()),
             stereo_buf: Mutex::new(Vec::new()),
             mono_buf: Mutex::new(Vec::new()),
         }
@@ -351,22 +346,10 @@ impl Recorder {
     }
 
     fn get_channel_index(&self, track_id: &str) -> usize {
-        if track_id.starts_with("bridge:") {
-            return 1;
-        }
-        let mut channels = self.channels.lock().unwrap();
-        if let Some(&channel_idx) = channels.get(track_id) {
-            channel_idx % 2
+        if track_id == self.session_id.as_str() {
+            0
         } else {
-            let new_idx = self.channel_idx.fetch_add(1, Ordering::SeqCst);
-            channels.insert(track_id.to_string(), new_idx);
-            info!(
-                session_id = self.session_id,
-                "Assigned channel {} to track: {}",
-                new_idx % 2,
-                track_id
-            );
-            new_idx % 2
+            1
         }
     }
 
