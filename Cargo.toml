@@ -12,11 +12,11 @@ categories = ["network-programming", "multimedia"]
 exclude = ["fixtures/**", "examples/**"]
 
 [features]
-default = ["opus", "offline", "ringback-detection"]
+default = ["opus", "offline"]
 opus = ["audio-codec/opus"]
 offline = ["dep:knf-rs-sys", "dep:ort", "dep:hf-hub", "dep:ndarray"]
 ringback-detection = ["dep:lele"]
-cross = ["opus", "offline", "ringback-detection", "aws-lc-rs/bindgen"]
+cross = ["opus", "offline", "aws-lc-rs/bindgen"]
 not_vad = []
 
 [dependencies]
