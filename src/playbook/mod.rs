@@ -2,7 +2,7 @@ use crate::media::recorder::RecorderOption;
 use crate::media::vad::VADOption;
 use crate::synthesis::SynthesisOption;
 use crate::transcription::TranscriptionOption;
-use crate::{EouOption, RealtimeOption, SipOption, media::ambiance::AmbianceOption};
+use crate::{EouOption, RealtimeOption, RingbackDetectionOption, SipOption, media::ambiance::AmbianceOption};
 use anyhow::{Result, anyhow};
 use minijinja::Environment;
 use serde::{Deserialize, Serialize};
@@ -57,6 +57,7 @@ pub struct PlaybookConfig {
     pub dtmf: Option<HashMap<String, DtmfAction>>,
     pub dtmf_collectors: Option<HashMap<String, DtmfCollectorConfig>>,
     pub realtime: Option<RealtimeOption>,
+    pub ringback_detection: Option<RingbackDetectionOption>,
     pub posthook: Option<PostHookConfig>,
     pub follow_up: Option<FollowUpConfig>,
     pub sip: Option<SipOption>,

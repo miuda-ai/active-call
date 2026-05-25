@@ -70,6 +70,7 @@ pub struct CallOption {
     pub realtime: Option<RealtimeOption>,
     pub subscribe: Option<bool>,
     pub enable_ice_lite: Option<bool>,
+    pub ringback_detection: Option<RingbackDetectionOption>,
 }
 
 impl Default for CallOption {
@@ -95,6 +96,7 @@ impl Default for CallOption {
             realtime: None,
             subscribe: None,
             enable_ice_lite: None,
+            ringback_detection: None,
         }
     }
 }
@@ -196,6 +198,23 @@ pub struct EouOption {
     /// max timeout in milliseconds
     pub timeout: Option<u32>,
     pub extra: Option<HashMap<String, String>>,
+}
+
+#[skip_serializing_none]
+#[derive(Clone, Debug, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RingbackDetectionOption {
+    pub enabled: Option<bool>,
+    /// Path to telcoclassifier_weights.bin (default: "./telcoclassifier_weights.bin")
+    pub model_weights_path: Option<String>,
+    /// Minimum audio accumulation (seconds) before first inference
+    pub min_buffer_secs: Option<f32>,
+    /// Seconds between consecutive inferences
+    pub detection_interval_secs: Option<f32>,
+    /// Confidence threshold for reporting a state
+    pub confidence_threshold: Option<f32>,
+    /// Only emit events on state change (ringing→human_voice etc.)
+    pub on_state_change_only: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Hash, Eq, PartialEq)]

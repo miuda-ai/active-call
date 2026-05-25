@@ -15,3 +15,4 @@ bank-demo/
 models/
 .venv*/
 .claude/
+*.bin

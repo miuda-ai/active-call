@@ -12,10 +12,11 @@ categories = ["network-programming", "multimedia"]
 exclude = ["fixtures/**", "examples/**"]
 
 [features]
-default = ["opus", "offline"]
+default = ["opus", "offline", "ringback-detection"]
 opus = ["audio-codec/opus"]
 offline = ["dep:knf-rs-sys", "dep:ort", "dep:hf-hub", "dep:ndarray"]
-cross = ["opus", "offline", "aws-lc-rs/bindgen"]
+ringback-detection = ["dep:lele"]
+cross = ["opus", "offline", "ringback-detection", "aws-lc-rs/bindgen"]
 not_vad = []
 
 [dependencies]
@@ -81,6 +82,9 @@ socket2 = { version = "0.6.3", features = ["all"] }
 realfft = "3.3"
 tempfile = "3.27.0"
 aws-lc-rs = "1"
+
+# Ringback detection model
+lele = { version = "0.1.10", default-features = false, optional = true }
 
 # Math / arrays (keep in sync with ort 2.0.0-rc.10 -> ndarray 0.16)
 ndarray = { version = "0.16.1", optional = true }

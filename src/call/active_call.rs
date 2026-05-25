@@ -2775,6 +2775,9 @@ impl ActiveCallState {
             if option.ambiance.is_none() {
                 option.ambiance = existing.ambiance.clone();
             }
+            if option.ringback_detection.is_none() {
+                option.ringback_detection = existing.ringback_detection.clone();
+            }
         }
         option
     }

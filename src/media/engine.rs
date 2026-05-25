@@ -31,6 +31,8 @@ use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
+#[cfg(feature = "ringback-detection")]
+use tracing::warn;
 
 pub type FnCreateVadProcessor = fn(
     token: CancellationToken,
@@ -356,6 +358,24 @@ impl StreamEngine {
                     processors.push(Box::new(inactivity_processor) as Box<dyn Processor>);
                 }
                 _ => {}
+            }
+
+            #[cfg(feature = "ringback-detection")]
+            if let Some(ref ringback_opt) = option.ringback_detection {
+                if ringback_opt.enabled.unwrap_or(false) {
+                    debug!(%track_id, "Adding RingbackDetectionProcessor");
+                    match
+                        crate::media::ringback_detection::processor::RingbackDetectionProcessor::new(
+                            track_id.clone(),
+                            cancel_token.child_token(),
+                            event_sender.clone(),
+                            ringback_opt.clone(),
+                            None,
+                        ) {
+                        Ok(p) => processors.push(Box::new(p) as Box<dyn Processor>),
+                        Err(e) => warn!(%track_id, "Failed to create RingbackDetectionProcessor: {}", e),
+                    }
+                }
             }
 
             Ok(processors)

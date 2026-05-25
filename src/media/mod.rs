@@ -12,6 +12,8 @@ pub mod negotiate;
 pub mod processor;
 pub mod realtime_processor;
 pub mod recorder;
+#[cfg(feature = "ringback-detection")]
+pub mod ringback_detection;
 pub mod stream;
 #[cfg(test)]
 mod tests;

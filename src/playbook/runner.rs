@@ -287,6 +287,9 @@ pub fn apply_playbook_config(option: &mut CallOption, config: &PlaybookConfig) {
     if let Some(sip) = config.sip.clone() {
         option.sip = Some(sip);
     }
+    if let Some(ringback) = config.ringback_detection.clone() {
+        option.ringback_detection = Some(ringback);
+    }
 }
 
 #[cfg(test)]

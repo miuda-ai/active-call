@@ -226,6 +226,20 @@ pub enum SessionEvent {
         sender: Option<String>,
         data: serde_json::Value,
     },
+    RingbackState {
+        track_id: String,
+        timestamp: u64,
+        /// Current line state: "ringing", "human_voice", "busy_tone", "silence", etc.
+        state: String,
+        /// Class index from the TelcoClassifier (3=ringing, 9=human_voice, ...)
+        state_index: u32,
+        /// Confidence of the prediction
+        confidence: f32,
+        /// Previous state (None on first detection)
+        prev_state: Option<String>,
+        prev_confidence: Option<f32>,
+        refer: Option<bool>,
+    },
 }
 
 impl Display for SessionEvent {
