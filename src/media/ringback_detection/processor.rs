@@ -110,7 +110,7 @@ impl RingbackDetectionProcessor {
         refer: Option<bool>,
     ) -> Result<Self> {
         let interval_secs = option.detection_interval_secs.unwrap_or(2.0);
-        let min_buffer_secs = option.min_buffer_secs.unwrap_or(5.0);
+        let min_buffer_secs = option.min_buffer_secs.unwrap_or(6.0);
         let num_samples_per_interval = (SAMPLE_RATE as f32 * interval_secs) as usize;
         let num_samples_min_buffer = (SAMPLE_RATE as f32 * min_buffer_secs) as usize;
 
@@ -145,7 +145,9 @@ impl RingbackDetectionProcessor {
                 tokio::select! {
                     _ = task_token.cancelled() => break,
                     Some(buf) = inference_rx.recv() => {
-                        task.run(&buf);
+                        tokio::task::block_in_place(|| {
+                            task.run(&buf);
+                        });
                     }
                 }
             }
@@ -155,13 +157,23 @@ impl RingbackDetectionProcessor {
         let flag = early_media_received.clone();
         let mut rx = event_sender.subscribe();
         let watch_token = cancel_token.child_token();
+        let stop_token = cancel_token.clone();
+        let watch_track_id = track_id.clone();
         crate::spawn(async move {
             loop {
                 tokio::select! {
                     _ = watch_token.cancelled() => break,
                     Ok(event) = rx.recv() => {
-                        if matches!(event, SessionEvent::Ringing { early_media: true, .. }) {
-                            flag.store(true, Ordering::Release);
+                        match &event {
+                            SessionEvent::Ringing { early_media: true, .. } => {
+                                flag.store(true, Ordering::Release);
+                            }
+                            SessionEvent::Answer { track_id, .. } if track_id == &watch_track_id => {
+                                debug!(track_id = watch_track_id, "answer received, stopping ringback detection");
+                                stop_token.cancel();
+                                break;
+                            }
+                            _ => {}
                         }
                     }
                 }
