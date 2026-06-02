@@ -1,12 +1,12 @@
 use super::model::TelcoClassifier;
-use crate::event::{EventSender, SessionEvent};
-use crate::media::{AudioFrame, Samples, get_timestamp};
-use crate::media::processor::Processor;
 use crate::RingbackDetectionOption;
+use crate::event::{EventSender, SessionEvent};
+use crate::media::processor::Processor;
+use crate::media::{AudioFrame, Samples, get_timestamp};
 use anyhow::{Context, Result};
 use lele::tensor::TensorView;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
@@ -14,9 +14,18 @@ use tracing::debug;
 const SAMPLE_RATE: u32 = 16000;
 const MODEL_NUM_SAMPLES: usize = 96000;
 const CLASS_NAMES: &[&str] = &[
-    "silence", "busy_tone", "fast_busy", "ringing",
-    "empty_number", "out_of_service", "user_unavailable",
-    "tts_voice", "answer_machine", "human_voice", "other",
+    "silence",
+    "busy_tone",
+    "fast_busy",
+    "ringing",
+    "empty_number",
+    "out_of_service",
+    "user_unavailable",
+    "user_busy",
+    "tts_voice",
+    "answer_machine",
+    "human_voice",
+    "other",
 ];
 
 struct InferenceTask {
@@ -118,12 +127,19 @@ impl RingbackDetectionProcessor {
             .model_weights_path
             .clone()
             .unwrap_or_else(|| "./telcoclassifier_weights.bin".to_string());
-        let weights_data = std::fs::read(&weights_path)
-            .with_context(|| format!("Failed to load ringback model weights from {}", weights_path))?;
+        let weights_data = std::fs::read(&weights_path).with_context(|| {
+            format!(
+                "Failed to load ringback model weights from {}",
+                weights_path
+            )
+        })?;
         let weights: &'static [u8] = Box::leak(weights_data.into_boxed_slice());
         let classifier = TelcoClassifier::new(weights);
 
-        let (inference_tx, mut inference_rx): (mpsc::UnboundedSender<Vec<f32>>, mpsc::UnboundedReceiver<Vec<f32>>) = mpsc::unbounded_channel();
+        let (inference_tx, mut inference_rx): (
+            mpsc::UnboundedSender<Vec<f32>>,
+            mpsc::UnboundedReceiver<Vec<f32>>,
+        ) = mpsc::unbounded_channel();
         let task_event_sender = event_sender.clone();
         let task_track_id = track_id.clone();
         let confidence_threshold = option.confidence_threshold.unwrap_or(0.5);
