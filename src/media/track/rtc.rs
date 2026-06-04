@@ -512,8 +512,8 @@ impl RtcTrack {
             // Negotiate primary audio codec
             let mut negotiated = None;
 
-            // If we are the offerer (receiving an Answer), we prioritize our own preferred codec order
-            // that is also present in the answer.
+            // When parsing an answer, prefer our configured codec order among accepted codecs.
+            // Offer parsing is provisional; the final outgoing PT is set from the answer.
             if sdp_type == rustrtc::sdp::SdpType::Answer && !self.rtc_config.codecs.is_empty() {
                 for preferred_codec in &self.rtc_config.codecs {
                     if *preferred_codec == CodecType::TelephoneEvent {
@@ -700,6 +700,7 @@ impl Track for RtcTrack {
 
         let mut answer = pc.create_answer().await?;
         crate::media::negotiate::intersect_answer(&sdp, &mut answer);
+        self.parse_sdp_payload_types(rustrtc::SdpType::Answer, &answer.to_sdp_string())?;
 
         pc.set_local_description(answer.clone())?;
 
@@ -936,6 +937,30 @@ mod tests {
             .parse_sdp_payload_types(rustrtc::SdpType::Offer, sdp3)
             .expect("parse offer");
         assert_eq!(track.get_payload_type(), 111);
+
+        // Case 4: Linphone can offer G729 first, but the final answer decides
+        // the outgoing payload type.
+        let mut rtc_config = RtcTrackConfig::default();
+        rtc_config.preferred_codec = Some(CodecType::PCMU);
+        rtc_config.codecs = vec![CodecType::PCMU, CodecType::PCMA];
+        let mut track4 = RtcTrack::new(
+            CancellationToken::new(),
+            "test-track-4".to_string(),
+            TrackConfig::default(),
+            rtc_config,
+        );
+
+        let sdp4 = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 1234 RTP/AVP 18 0 101\r\na=fmtp:18 annexb=yes\r\na=rtpmap:101 telephone-event/8000\r\n";
+        track4
+            .parse_sdp_payload_types(rustrtc::SdpType::Offer, sdp4)
+            .expect("parse offer");
+        assert_eq!(track4.get_payload_type(), 18);
+
+        let answer4 = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 1234 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+        track4
+            .parse_sdp_payload_types(rustrtc::SdpType::Answer, answer4)
+            .expect("parse answer");
+        assert_eq!(track4.get_payload_type(), 0);
     }
 
     #[tokio::test]
