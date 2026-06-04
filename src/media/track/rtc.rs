@@ -972,6 +972,8 @@ mod tests {
         let track_config = TrackConfig::default();
         let mut rtc_config = RtcTrackConfig::default();
         rtc_config.mode = TransportMode::Rtp;
+        rtc_config.preferred_codec = Some(CodecType::PCMU);
+        rtc_config.codecs = vec![CodecType::PCMU, CodecType::TelephoneEvent];
 
         let mut track = RtcTrack::new(cancel, track_id, track_config, rtc_config);
 
@@ -988,7 +990,7 @@ a=sendrecv\r\n";
 
         // This should not panic and should set up the transceiver
         let res = track.handshake(offer.to_string(), None).await;
-        assert!(res.is_ok());
+        assert!(res.is_ok(), "handshake failed: {res:?}");
 
         // We can inspect the PeerConnection to ensure it has a transceiver with a receiver
         if let Some(pc) = &track.peer_connection {

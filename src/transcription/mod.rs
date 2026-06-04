@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 mod aliyun;
+mod deepgram;
 mod tencent_cloud;
 
 #[cfg(feature = "offline")]
@@ -18,6 +19,8 @@ mod sensevoice;
 
 pub use aliyun::AliyunAsrClient;
 pub use aliyun::AliyunAsrClientBuilder;
+pub use deepgram::DeepgramAsrClient;
+pub use deepgram::DeepgramAsrClientBuilder;
 pub use tencent_cloud::TencentCloudAsrClient;
 pub use tencent_cloud::TencentCloudAsrClientBuilder;
 
@@ -59,6 +62,8 @@ pub enum TranscriptionType {
     TencentCloud,
     #[serde(rename = "aliyun")]
     Aliyun,
+    #[serde(rename = "deepgram")]
+    Deepgram,
     #[cfg(feature = "offline")]
     #[serde(rename = "sensevoice")]
     Sensevoice,
@@ -73,7 +78,9 @@ pub struct TranscriptionOption {
     pub language: Option<String>,
     pub app_id: Option<String>,
     pub secret_id: Option<String>,
+    #[serde(alias = "apiKey")]
     pub secret_key: Option<String>,
+    #[serde(alias = "model")]
     pub model_type: Option<String>,
     pub buffer_size: Option<usize>,
     pub samplerate: Option<u32>,
@@ -89,6 +96,7 @@ impl std::fmt::Display for TranscriptionType {
         match self {
             TranscriptionType::TencentCloud => write!(f, "tencent"),
             TranscriptionType::Aliyun => write!(f, "aliyun"),
+            TranscriptionType::Deepgram => write!(f, "deepgram"),
             #[cfg(feature = "offline")]
             TranscriptionType::Sensevoice => write!(f, "sensevoice"),
             TranscriptionType::Other(provider) => write!(f, "{}", provider),
@@ -105,6 +113,7 @@ impl<'de> Deserialize<'de> for TranscriptionType {
         match value.as_str() {
             "tencent" => Ok(TranscriptionType::TencentCloud),
             "aliyun" => Ok(TranscriptionType::Aliyun),
+            "deepgram" => Ok(TranscriptionType::Deepgram),
             #[cfg(feature = "offline")]
             "sensevoice" => Ok(TranscriptionType::Sensevoice),
             _ => Ok(TranscriptionType::Other(value)),
@@ -129,6 +138,11 @@ impl TranscriptionOption {
             Some(TranscriptionType::Aliyun) => {
                 if self.secret_key.is_none() {
                     self.secret_key = std::env::var("DASHSCOPE_API_KEY").ok();
+                }
+            }
+            Some(TranscriptionType::Deepgram) => {
+                if self.secret_key.is_none() {
+                    self.secret_key = std::env::var("DEEPGRAM_API_KEY").ok();
                 }
             }
             _ => {}

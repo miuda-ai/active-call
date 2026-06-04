@@ -95,6 +95,44 @@ async fn test_ai_agent_1002_playbook_has_aliyun_voice_stack_and_greeting() {
 }
 
 #[tokio::test]
+async fn test_original_style_deepgram_asr_tts_config_loads() {
+    let content = r#"---
+asr:
+  provider: "deepgram"
+  language: "en"
+  model: "nova-3"
+  apiKey: "dg-test-key"
+tts:
+  provider: "deepgram"
+  voice: "aura-2-thalia-en"
+  apiKey: "dg-test-key"
+llm:
+  provider: "openai"
+  model: "qwen-plus"
+  apiKey: "dashscope-test-key"
+  baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+---
+Test prompt
+"#;
+
+    let playbook = Playbook::parse(content).unwrap();
+
+    let asr = playbook.config.asr.as_ref().unwrap();
+    assert_eq!(asr.provider, Some(TranscriptionType::Deepgram));
+    assert_eq!(asr.model_type.as_deref(), Some("nova-3"));
+    assert_eq!(asr.secret_key.as_deref(), Some("dg-test-key"));
+
+    let tts = playbook.config.tts.as_ref().unwrap();
+    assert_eq!(tts.provider, Some(SynthesisType::Deepgram));
+    assert_eq!(tts.model.as_deref(), Some("aura-2-thalia-en"));
+    assert_eq!(tts.secret_key.as_deref(), Some("dg-test-key"));
+
+    let llm = playbook.config.llm.as_ref().unwrap();
+    assert_eq!(llm.model.as_deref(), Some("qwen-plus"));
+    assert_eq!(llm.api_key.as_deref(), Some("dashscope-test-key"));
+}
+
+#[tokio::test]
 async fn test_aliyun_llm_integration() {
     dotenv().ok();
     let api_key = std::env::var("ALIYUN_API_KEY").unwrap_or_default();

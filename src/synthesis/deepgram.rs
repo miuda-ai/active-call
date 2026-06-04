@@ -55,25 +55,48 @@ fn request_url(option: &SynthesisOption, protocol: &str) -> Url {
     let mut url = Url::parse(DEEPGRAM_BASE_URL).expect("Deepgram base url is invalid");
     url.set_scheme(protocol).expect("illegal url scheme");
 
+    let extra = option.extra.as_ref();
+    let encoding = option
+        .codec
+        .as_deref()
+        .map(|codec| match codec {
+            "pcm" | "linear16" => "linear16",
+            "pcmu" | "mulaw" => "mulaw",
+            "pcma" | "alaw" => "alaw",
+            other => other,
+        })
+        .unwrap_or("linear16");
+
     let mut query = url.query_pairs_mut();
 
-    if let Some(speaker) = option.speaker.as_ref() {
-        query.append_pair("model", speaker);
+    if extra.map(|e| !e.contains_key("model")).unwrap_or(true) {
+        if let Some(model) = option.model.as_ref().or(option.speaker.as_ref()) {
+            query.append_pair("model", model);
+        }
     }
 
-    if let Some(codec) = option.codec.as_ref() {
-        match codec.as_str() {
-            "pcm" => query.append_pair("encoding", "linear16"),
-            "pcmu" => query.append_pair("encoding", "mulaw"),
-            "pcma" => query.append_pair("encoding", "alaw"),
-            _ => query.append_pair("encoding", "linear16"),
-        };
-    } else {
-        query.append_pair("encoding", "linear16");
+    if extra.map(|e| !e.contains_key("encoding")).unwrap_or(true) {
+        query.append_pair("encoding", encoding);
     }
 
-    let samplerate = option.samplerate.unwrap_or(16000);
-    query.append_pair("sample_rate", samplerate.to_string().as_str());
+    if extra.map(|e| !e.contains_key("sample_rate")).unwrap_or(true)
+        && matches!(encoding, "linear16" | "mulaw" | "alaw")
+    {
+        let samplerate = option.samplerate.unwrap_or(16000);
+        query.append_pair("sample_rate", samplerate.to_string().as_str());
+    }
+
+    if extra.map(|e| !e.contains_key("container")).unwrap_or(true)
+        && matches!(encoding, "linear16" | "mulaw" | "alaw")
+    {
+        query.append_pair("container", "none");
+    }
+
+    if let Some(extra) = extra {
+        for (key, value) in extra {
+            query.append_pair(key, value);
+        }
+    }
 
     drop(query);
     url
@@ -97,6 +120,11 @@ async fn chunked_stream(
         .json(&payload)
         .send()
         .await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("Deepgram TTS request failed: {} {}", status, body));
+    }
     Ok(resp.bytes_stream().map_err(anyhow::Error::from))
 }
 

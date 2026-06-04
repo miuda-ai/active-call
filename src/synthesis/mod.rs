@@ -92,11 +92,13 @@ pub struct SynthesisOption {
     pub speed: Option<f32>,
     pub app_id: Option<String>,
     pub secret_id: Option<String>,
+    #[serde(alias = "apiKey")]
     pub secret_key: Option<String>,
     pub volume: Option<i32>,
     pub speaker: Option<String>,
     pub codec: Option<String>,
     pub subtitle: Option<bool>,
+    #[serde(alias = "voice")]
     pub model: Option<String>,
     pub language: Option<String>,
     /// emotion: neutral、sad、happy、angry、fear、news、story、radio、poetry、

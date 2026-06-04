@@ -18,8 +18,8 @@ use crate::{
         TencentCloudTtsBasicClient, TencentCloudTtsClient,
     },
     transcription::{
-        AliyunAsrClientBuilder, TencentCloudAsrClientBuilder, TranscriptionClient,
-        TranscriptionOption, TranscriptionType,
+        AliyunAsrClientBuilder, DeepgramAsrClientBuilder, TencentCloudAsrClientBuilder,
+        TranscriptionClient, TranscriptionOption, TranscriptionType,
     },
 };
 
@@ -94,6 +94,10 @@ impl Default for StreamEngine {
         engine.register_asr(
             TranscriptionType::Aliyun,
             Box::new(AliyunAsrClientBuilder::create),
+        );
+        engine.register_asr(
+            TranscriptionType::Deepgram,
+            Box::new(DeepgramAsrClientBuilder::create),
         );
 
         #[cfg(feature = "offline")]
