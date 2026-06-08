@@ -1,5 +1,6 @@
 use super::{
     INTERNAL_SAMPLERATE,
+    agc::AutomaticGainControl,
     asr_processor::AsrProcessor,
     denoiser::NoiseReducer,
     processor::Processor,
@@ -323,6 +324,11 @@ impl StreamEngine {
                     processors.push(vad_processor);
                 }
                 None => {}
+            }
+            if let Some(agc_option) = option.agc.clone() {
+                debug!(%track_id, "Adding AutomaticGainControl processor");
+                let agc = AutomaticGainControl::new(INTERNAL_SAMPLERATE as u32, agc_option)?;
+                processors.push(Box::new(agc) as Box<dyn Processor>);
             }
             match option.asr {
                 Some(mut option) => {

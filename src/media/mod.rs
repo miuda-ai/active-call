@@ -8,6 +8,7 @@ pub mod dtmf;
 pub mod engine;
 pub mod inactivity;
 pub mod loader;
+pub mod agc;
 pub mod negotiate;
 pub mod processor;
 pub mod realtime_processor;
@@ -53,6 +54,8 @@ pub struct AudioFrame {
     pub timestamp: u64,
     pub sample_rate: u32,
     pub channels: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speech_probability: Option<f32>,
 }
 
 impl Samples {

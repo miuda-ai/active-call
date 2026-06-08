@@ -228,6 +228,7 @@ pub struct SileroSession {
     current_timestamp: u64,
     processed_samples: u64,
     initialized_timestamp: bool,
+    last_score: Option<f32>,
 }
 
 impl SileroSession {
@@ -260,6 +261,7 @@ impl SileroSession {
             current_timestamp: 0,
             processed_samples: 0,
             initialized_timestamp: false,
+            last_score: None,
         }
     }
 }
@@ -536,6 +538,10 @@ impl TinySilero {
 }
 
 impl VadEngine for TinySilero {
+    fn last_probability(&self) -> Option<f32> {
+        self.session.last_score
+    }
+
     fn process(&mut self, frame: &mut AudioFrame) -> Vec<(bool, u64)> {
         let samples = match &frame.samples {
             Samples::PCM { samples } => samples,
@@ -565,6 +571,7 @@ impl VadEngine for TinySilero {
             let score = self.predict(&chunk_f32);
 
             self.session.buf_chunk_f32 = chunk_f32;
+            self.session.last_score = Some(score);
 
             let is_voice = score > self.config.voice_threshold;
 

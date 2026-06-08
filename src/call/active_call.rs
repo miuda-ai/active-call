@@ -1527,6 +1527,7 @@ impl ActiveCall {
                     opts
                 }),
             denoise: refer_option.as_ref().and_then(|o| o.denoise.clone()),
+            agc: refer_option.as_ref().and_then(|o| o.agc.clone()),
             recorder,
             ..Default::default()
         };
@@ -2762,6 +2763,9 @@ impl ActiveCallState {
             }
             if option.denoise.is_none() {
                 option.denoise = existing.denoise;
+            }
+            if option.agc.is_none() {
+                option.agc = existing.agc.clone();
             }
             if option.recorder.is_none() {
                 option.recorder = existing.recorder.clone();

@@ -241,6 +241,7 @@ The `mediaPass` option in `CallOption` configures the WebSocket connection for a
     "callee": "sip:agent@rustpbx.com",
     "codec": "pcmu",
     "denoise": true,
+    "agc": {},
     "mediaPass": {
       "url": "ws://ai-voice-processor.rustpbx.com:8090/stream",
       "inputSampleRate": 8000,
@@ -499,6 +500,7 @@ Resume continues paused server-side file/TTS playback from the paused playback p
 - `callee` (string): Address of Record (AOR) of the transfer target (e.g., sip:bob@rustpbx.com)
 - `options` (ReferOption, optional): Transfer configuration
   - `denoise` (boolean, optional): Enable noise reduction
+  - `agc` (AGCOption, optional): Enable Automatic Gain Control (AGC); use `{}` for defaults
   - `timeout` (number, optional): Transfer timeout in seconds
   - `moh` (string, optional): Music on hold URL to play during transfer
   - `asr` (TranscriptionOption, optional): Automatic Speech Recognition configuration
@@ -521,6 +523,7 @@ Resume continues paused server-side file/TTS playback from the paused playback p
   "callee": "sip:charlie@rustpbx.com",
   "options": {
     "denoise": true,
+    "agc": {},
     "timeout": 30,
     "moh": "http://rustpbx.com/hold_music.wav",
     "asr": {
@@ -666,6 +669,7 @@ The `CallOption` object is used in `invite` and `accept` commands and contains t
 ```json
 {
   "denoise": true,
+  "agc": {},
   "offer": "SDP offer string",
   "callee": "sip:callee@rustpbx.com",
   "caller": "sip:caller@rustpbx.com",
@@ -753,6 +757,7 @@ The `CallOption` object is used in `invite` and `accept` commands and contains t
 
 **CallOption Fields:**
 - `denoise` (boolean, optional): Enable noise reduction for audio processing
+- `agc` (AGCOption, optional): Enable Automatic Gain Control (AGC); use `{}` for defaults or specify fields
 - `offer` (string, optional): SDP offer string for WebRTC/SIP negotiation
 - `callee` (string, optional): Callee's SIP URI or phone number (e.g., "sip:bob@rustpbx.com")
 - `caller` (string, optional): Caller's SIP URI or phone number (e.g., "sip:alice@rustpbx.com")
@@ -772,6 +777,14 @@ The `CallOption` object is used in `invite` and `accept` commands and contains t
   - `endpoint` (string, optional): Custom ASR service endpoint URL
   - `extra` (object, optional): Additional provider-specific parameters
   - `startWhenAnswer` (boolean, optional): Start ASR when call is answered
+- `agc` (AGCOption, optional): Automatic Gain Control configuration (WebRTC AGC2); use `{}` for defaults. Requires `vad` to be configured upstream — AGC reads the per-frame speech probability written by the VAD.
+  - `headroomDb` (number, optional): Target headroom below 0 dBFS in dB (default: 5.0)
+  - `maxGainDb` (number, optional): Maximum gain in dB (default: 50.0)
+  - `initialGainDb` (number, optional): Initial gain in dB applied before the speech-level estimator is confident (default: 15.0)
+  - `maxGainChangeDbPerSecond` (number, optional): Maximum gain change in dB per second — controls both attack and release (default: 6.0)
+  - `maxOutputNoiseLevelDbfs` (number, optional): Noise floor cap in dBFS above which AGC will not amplify (default: -50.0)
+  - `adjacentSpeechFramesThreshold` (number, optional): Number of consecutive 10 ms speech sub-frames required before gain increase is allowed (default: 12, ≈120 ms)
+  - `enableLimiter` (boolean, optional): Run the soft-knee limiter after the adaptive gain stage (default: true)
 - `vad` (VADOption, optional): Voice Activity Detection configuration
   - `type` (string): VAD algorithm type ("silero")
   - `samplerate` (number): Audio sample rate for VAD processing (default: 16000)
@@ -860,6 +873,7 @@ The `ReferOption` object is used in the `refer` command and contains the followi
 
 **Fields:**
 - `denoise` (boolean, optional): Enable noise reduction during transfer
+- `agc` (AGCOption, optional): Enable Automatic Gain Control (AGC); use `{}` for defaults or specify fields
 - `timeout` (number, optional): Transfer timeout in seconds
 - `moh` (string, optional): Music on hold URL to play during transfer
 - `asr` (TranscriptionOption, optional): Automatic Speech Recognition configuration

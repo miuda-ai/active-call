@@ -1,4 +1,5 @@
 mod denoiser;
+mod agc;
 mod file_track;
 mod media_pass;
 mod perf_analysis;
