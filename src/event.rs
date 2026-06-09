@@ -239,6 +239,9 @@ pub enum SessionEvent {
         prev_state: Option<String>,
         prev_confidence: Option<f32>,
         refer: Option<bool>,
+        /// Whether this is the final determination
+        #[serde(default)]
+        is_final: bool,
     },
 }
 

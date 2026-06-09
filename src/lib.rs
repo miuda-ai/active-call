@@ -215,6 +215,10 @@ pub struct RingbackDetectionOption {
     pub confidence_threshold: Option<f32>,
     /// Only emit events on state change (ringing→human_voice etc.)
     pub on_state_change_only: Option<bool>,
+    /// Sliding window size for result accumulation (default: 6, i.e. 4+2)
+    pub sliding_window_size: Option<usize>,
+    /// Confidence threshold for immediate finalization (default: 0.9)
+    pub final_confidence_threshold: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Hash, Eq, PartialEq)]
