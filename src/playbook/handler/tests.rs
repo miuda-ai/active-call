@@ -993,6 +993,54 @@ async fn test_set_var_extraction() {
 }
 
 #[tokio::test]
+async fn test_message_tag_extraction() {
+    let config = LlmConfig::default();
+    let interruption = crate::playbook::InterruptionConfig::default();
+    let provider = Arc::new(TestProvider::new(vec![]));
+    let rag = Arc::new(RecordingRag::new());
+
+    let mut handler = LlmHandler::with_provider(
+        config,
+        provider,
+        rag,
+        interruption,
+        None,
+        std::collections::HashMap::new(),
+        None,
+        None,
+        None,
+        None,
+    );
+
+    let mut buffer =
+        r#"Hold on. <message body="customer_id=12345" contentType="text/plain" refer="true"/> Done."#
+            .to_string();
+    let cmds = handler
+        .extract_streaming_commands(&mut buffer, "test_p", false)
+        .await;
+
+    assert_eq!(cmds.len(), 3);
+    assert!(matches!(
+        &cmds[0],
+        Command::Tts { text, .. } if text == "Hold on. "
+    ));
+    assert!(matches!(
+        &cmds[1],
+        Command::Message {
+            body,
+            content_type: Some(content_type),
+            headers: None,
+            refer: Some(true),
+        } if body == "customer_id=12345" && content_type == "text/plain"
+    ));
+    assert!(matches!(
+        &cmds[2],
+        Command::Tts { text, .. } if text == " Done."
+    ));
+    assert_eq!(buffer, "");
+}
+
+#[tokio::test]
 async fn test_multiple_set_vars() {
     let config = LlmConfig::default();
     let interruption = crate::playbook::InterruptionConfig::default();

@@ -89,6 +89,7 @@ Simple tags that can be output by the model during streaming for real-time execu
 
 -   **Hang up**: `<hangup/>`
 -   **Transfer**: `<refer to="sip:1001@127.0.0.1"/>`
+-   **Send SIP metadata body**: `<message body="customer_id=12345"/>`
 -   **Play audio file**: `<play file="config/media/ding.wav"/>`
 -   **Switch scene**: `<goto scene="support"/>`
 

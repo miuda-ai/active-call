@@ -142,6 +142,13 @@ pub enum SessionEvent {
         referred_by: Option<String>,
         refer: Option<bool>,
     },
+    Message {
+        track_id: String,
+        timestamp: u64,
+        body: String,
+        content_type: Option<String>,
+        refer: Option<bool>,
+    },
     TrackStart {
         track_id: String,
         timestamp: u64,

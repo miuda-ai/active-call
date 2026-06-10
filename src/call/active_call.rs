@@ -861,6 +861,12 @@ impl ActiveCall {
                 callee,
                 options,
             } => self.do_refer(caller, callee, options).await,
+            Command::Message {
+                body,
+                content_type,
+                headers,
+                refer,
+            } => self.do_message(body, content_type, headers, refer).await,
             Command::Bridge { target_session_id } => self.do_bridge(target_session_id).await,
             Command::Unbridge { target_session_id } => self.do_unbridge(target_session_id).await,
             Command::Mute { track_id } => self.do_mute(track_id).await,
@@ -1533,7 +1539,7 @@ impl ActiveCall {
         call_option.check_default();
 
         let mut invite_option = call_option.build_invite_option()?;
-        invite_option.call_id = Some(ref_call_id);
+        invite_option.call_id = Some(ref_call_id.clone());
 
         let headers = invite_option.headers.get_or_insert_with(|| Vec::new());
 
@@ -1562,6 +1568,7 @@ impl ActiveCall {
 
         let ssrc = rand::random::<u32>();
         let refer_call_state = Arc::new(RwLock::new(ActiveCallState {
+            session_id: ref_call_id.clone(),
             start_time: Utc::now(),
             ssrc,
             option: Some(call_option.clone()),
@@ -1683,6 +1690,125 @@ impl ActiveCall {
             }
         }
         Ok(())
+    }
+
+    async fn do_message(
+        &self,
+        body: String,
+        content_type: Option<String>,
+        headers: Option<HashMap<String, String>>,
+        refer: Option<bool>,
+    ) -> Result<()> {
+        if !matches!(self.call_type, ActiveCallType::Sip | ActiveCallType::B2bua) {
+            return Err(anyhow::anyhow!("message command is only supported for SIP calls"));
+        }
+
+        let dialog_key = if refer == Some(true) {
+            let refer_state = self.call_state.read().await.refer_callstate.clone();
+            match refer_state {
+                Some(state) => Some(state.read().await.session_id.clone()),
+                None => None,
+            }
+        } else {
+            Some(self.call_state.read().await.session_id.clone())
+        };
+
+        let mut dialog = dialog_key
+            .as_ref()
+            .filter(|id| !id.is_empty())
+            .and_then(|id| self.invitation.dialog_layer.get_dialog_with(id));
+
+        if dialog.is_none() {
+            if let Some(target_id) = dialog_key.as_ref().filter(|id| !id.is_empty()) {
+                dialog = self
+                    .invitation
+                    .dialog_layer
+                    .all_dialog_ids()
+                    .into_iter()
+                    .filter_map(|id| self.invitation.dialog_layer.get_dialog_with(&id))
+                    .find(|dialog| dialog.id().to_string() == *target_id);
+            }
+        }
+
+        if dialog.is_none() && refer != Some(true) {
+            dialog = self
+                .invitation
+                .dialog_layer
+                .get_client_dialog_by_call_id(&self.session_id)
+                .into_iter()
+                .find(|d| {
+                    matches!(
+                        d.state(),
+                        rsipstack::dialog::dialog::DialogState::Confirmed(_, _)
+                    )
+                })
+                .map(rsipstack::dialog::dialog::Dialog::ClientInvite);
+        }
+
+        if dialog.is_none() && refer == Some(true) {
+            if let Some(call_id) = dialog_key.as_ref().filter(|id| !id.is_empty()) {
+                dialog = self
+                    .invitation
+                    .dialog_layer
+                    .get_client_dialog_by_call_id(call_id)
+                    .into_iter()
+                    .find(|d| {
+                        matches!(
+                            d.state(),
+                            rsipstack::dialog::dialog::DialogState::Confirmed(_, _)
+                        )
+                    })
+                    .map(rsipstack::dialog::dialog::Dialog::ClientInvite);
+            }
+        }
+
+        let dialog = dialog.ok_or_else(|| {
+            anyhow::anyhow!(
+                "no established SIP dialog found for message command, refer={}",
+                refer.unwrap_or_default()
+            )
+        })?;
+
+        let mut sip_headers = vec![rsipstack::rsip::Header::ContentType(
+            content_type
+                .clone()
+                .unwrap_or_else(|| "text/plain;charset=utf-8".to_string())
+                .into(),
+        )];
+        if let Some(headers) = headers {
+            sip_headers.extend(
+                headers
+                    .into_iter()
+                    .map(|(k, v)| rsipstack::rsip::Header::Other(k.into(), v.into())),
+            );
+        }
+
+        info!(
+            session_id = self.session_id,
+            dialog_id = %dialog.id(),
+            content_type = content_type.as_deref().unwrap_or("text/plain;charset=utf-8"),
+            refer = refer.unwrap_or_default(),
+            body = %body.chars().take(64).collect::<String>(),
+            "sending SIP MESSAGE"
+        );
+
+        let response = dialog
+            .message(Some(sip_headers), Some(body.into_bytes()))
+            .await?;
+        match response {
+            Some(resp)
+                if resp.status_code.kind() == rsipstack::rsip::StatusCodeKind::Successful =>
+            {
+                Ok(())
+            }
+            Some(resp) => Err(anyhow::anyhow!(
+                "SIP MESSAGE rejected with status {}",
+                resp.status_code
+            )),
+            None => Err(anyhow::anyhow!(
+                "SIP MESSAGE was not sent because dialog is not confirmed"
+            )),
+        }
     }
 
     fn bridge_track_id(source_session_id: &str, target_session_id: &str) -> TrackId {

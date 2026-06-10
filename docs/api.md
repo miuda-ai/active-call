@@ -551,6 +551,27 @@ Resume continues paused server-side file/TTS playback from the paused playback p
 }
 ```
 
+#### Message Command
+**Purpose:** Sends an in-dialog SIP MESSAGE with a MIME body. This is useful for metadata that needs to reach the operator side during an active SIP call; some SIP proxies can forward these messages as SMS.
+
+**Fields:**
+- `command` (string): Always "message"
+- `body` (string): SIP MESSAGE body to send. `text` is accepted as a deprecated alias.
+- `contentType` (string, optional): SIP message content type. Default: `text/plain;charset=utf-8`
+- `headers` (object, optional): Additional SIP headers
+- `refer` (boolean, optional): If true, send on the active refer dialog instead of the main call dialog
+
+```json
+{
+  "command": "message",
+  "body": "customer_id=12345 status=verified",
+  "contentType": "text/plain;charset=utf-8",
+  "headers": {
+    "X-Meta-Source": "active-call"
+  }
+}
+```
+
 ### Audio Bridge Commands
 
 #### Bridge Command

@@ -84,6 +84,16 @@ pub enum Command {
         callee: String,
         options: Option<ReferOption>,
     },
+    Message {
+        /// MIME body to send in a SIP MESSAGE request.
+        body: String,
+        /// Defaults to text/plain;charset=utf-8.
+        content_type: Option<String>,
+        /// Additional SIP headers for the MESSAGE request.
+        headers: Option<HashMap<String, String>>,
+        /// If true, send on the active refer dialog instead of the main call dialog.
+        refer: Option<bool>,
+    },
     /// Bridge audio with another established call.
     /// This creates separate bridge tracks for the two sessions and patches
     /// audio bidirectionally. It does not replace the server-side track and
@@ -146,5 +156,57 @@ impl RoutingState {
         let r = *counter % trunk_count;
         *counter += 1;
         return r;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Command;
+
+    #[test]
+    fn message_command_deserializes_body() {
+        let command: Command = serde_json::from_value(serde_json::json!({
+            "command": "message",
+            "body": "customer_id=12345",
+            "contentType": "text/plain"
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            command,
+            Command::Message {
+                body,
+                content_type: Some(content_type),
+                ..
+            } if body == "customer_id=12345" && content_type == "text/plain"
+        ));
+    }
+
+    #[test]
+    fn message_command_deserializes_legacy_text() {
+        let command: Command = serde_json::from_value(serde_json::json!({
+            "command": "message",
+            "text": "customer_id=12345"
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            command,
+            Command::Message { body, .. } if body == "customer_id=12345"
+        ));
+    }
+
+    #[test]
+    fn message_command_serializes_body() {
+        let command = Command::Message {
+            body: "customer_id=12345".to_string(),
+            content_type: None,
+            headers: None,
+            refer: None,
+        };
+        let value = serde_json::to_value(command).unwrap();
+
+        assert_eq!(value["body"], "customer_id=12345");
+        assert!(value.get("text").is_none());
     }
 }

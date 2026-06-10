@@ -288,6 +288,35 @@ impl DialogStateReceiverGuard {
                     }
                     tx_handle.reply(rsipstack::rsip::StatusCode::OK).await.ok();
                 }
+                DialogState::Message(dialog_id, req, tx_handle) => {
+                    let body_str = String::from_utf8_lossy(req.body()).to_string();
+                    let content_type = req.headers.iter().find_map(|h| {
+                        if let rsipstack::rsip::Header::ContentType(content_type) = h {
+                            Some(content_type.value().to_string())
+                        } else {
+                            None
+                        }
+                    });
+                    info!(
+                        session_id=states.session_id,
+                        %dialog_id,
+                        content_type=content_type.as_deref(),
+                        body=%body_str,
+                        "dialog message received"
+                    );
+                    let is_refer = states.call_state.read().await.is_refer;
+                    states
+                        .event_sender
+                        .send(crate::event::SessionEvent::Message {
+                            track_id: states.track_id.clone(),
+                            timestamp: crate::media::get_timestamp(),
+                            body: body_str,
+                            content_type,
+                            refer: Some(is_refer),
+                        })
+                        .ok();
+                    tx_handle.reply(rsipstack::rsip::StatusCode::OK).await.ok();
+                }
                 DialogState::Updated(dialog_id, _req, tx_handle) => {
                     info!(session_id = states.session_id, %dialog_id, "dialog update received");
                     let is_refer = states.call_state.read().await.is_refer;
