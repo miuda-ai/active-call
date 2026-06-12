@@ -263,6 +263,9 @@ pub fn apply_playbook_config(option: &mut CallOption, config: &PlaybookConfig) {
     if let Some(denoise) = config.denoise {
         option.denoise = Some(denoise);
     }
+    if let Some(agc) = config.agc.clone() {
+        option.agc = Some(agc);
+    }
     if let Some(ambiance) = config.ambiance.clone() {
         option.ambiance = Some(ambiance);
     }

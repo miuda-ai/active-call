@@ -40,6 +40,7 @@ llm:
 ```yaml
 greeting: "Hello, I am your AI assistant. How can I help you today?"
 denoise: true # Enable noise reduction
+agc: {} # Enable WebRTC AGC2 Automatic Gain Control (5 dB headroom, 15 dB initial gain). Requires `vad` to be set.
 interruption:
   strategy: "both" # Strategies: "none", "vad", "asr", "both"
   minSpeechMs: 500 # User must speak for at least 500ms to trigger interruption
