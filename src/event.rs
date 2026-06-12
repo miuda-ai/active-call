@@ -142,6 +142,13 @@ pub enum SessionEvent {
         referred_by: Option<String>,
         refer: Option<bool>,
     },
+    Message {
+        track_id: String,
+        timestamp: u64,
+        body: String,
+        content_type: Option<String>,
+        refer: Option<bool>,
+    },
     TrackStart {
         track_id: String,
         timestamp: u64,
@@ -239,6 +246,9 @@ pub enum SessionEvent {
         prev_state: Option<String>,
         prev_confidence: Option<f32>,
         refer: Option<bool>,
+        /// Whether this is the final determination
+        #[serde(default)]
+        is_final: bool,
     },
 }
 

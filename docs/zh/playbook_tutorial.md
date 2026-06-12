@@ -90,6 +90,7 @@ Playbook 支持两种方式触发系统动作：
 
 -   **挂断**: `<hangup/>`
 -   **转接**: `<refer to="sip:1001@127.0.0.1"/>`
+-   **发送 SIP 元信息正文**: `<message body="customer_id=12345"/>`
 -   **音效播放**: `<play file="config/media/ding.wav"/>`
 -   **场景跳转**: `<goto scene="support"/>`
 

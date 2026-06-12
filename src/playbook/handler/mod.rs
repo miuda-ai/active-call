@@ -19,6 +19,12 @@ mod dtmf_collector_tests;
 
 static RE_HANGUP: Lazy<Regex> = Lazy::new(|| Regex::new(r"<hangup\s*/>").unwrap());
 static RE_REFER: Lazy<Regex> = Lazy::new(|| Regex::new(r#"<refer\s+to="([^"]+)"\s*/>"#).unwrap());
+static RE_MESSAGE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"<message\s+(?:body|text)="([^"]+)"(?:\s+(?:content_type|contentType)="([^"]+)")?(?:\s+refer="(true|false)")?\s*/>"#,
+    )
+    .unwrap()
+});
 static RE_PLAY: Lazy<Regex> = Lazy::new(|| Regex::new(r#"<play\s+file="([^"]+)"\s*/>"#).unwrap());
 static RE_GOTO: Lazy<Regex> = Lazy::new(|| Regex::new(r#"<goto\s+scene="([^"]+)"\s*/>"#).unwrap());
 static RE_SET_VAR: Lazy<Regex> =
@@ -65,6 +71,7 @@ pub mod types;
 enum CommandKind {
     Hangup,
     Refer,
+    Message,
     Sentence,
     Play,
     Goto,
@@ -238,6 +245,7 @@ impl LlmHandler {
                             "Tool usage instructions:\n\
                             - To hang up the call, output: <hangup/>\n\
                             - To transfer the call, output: <refer to=\"sip:xxxx\"/>\n\
+                            - To send metadata body to the SIP peer, output: <message body=\"...\"/>\n\
                             - To play an audio file, output: <play file=\"path/to/file.wav\"/>\n\
                             - To switch to another scene, output: <goto scene=\"scene_id\"/>\n\
                             - To call an external HTTP API, output JSON:\n\
@@ -923,6 +931,7 @@ impl LlmHandler {
         loop {
             let hangup_pos = RE_HANGUP.find(buffer);
             let refer_pos = RE_REFER.captures(buffer);
+            let message_pos = RE_MESSAGE.captures(buffer);
             let play_pos = RE_PLAY.captures(buffer);
             let goto_pos = RE_GOTO.captures(buffer);
             let set_var_pos = RE_SET_VAR.captures(buffer);
@@ -937,6 +946,9 @@ impl LlmHandler {
             }
             if let Some(caps) = &refer_pos {
                 positions.push((caps.get(0).unwrap().start(), CommandKind::Refer));
+            }
+            if let Some(caps) = &message_pos {
+                positions.push((caps.get(0).unwrap().start(), CommandKind::Message));
             }
             if let Some(caps) = &play_pos {
                 positions.push((caps.get(0).unwrap().start(), CommandKind::Play));
@@ -1078,6 +1090,29 @@ impl LlmHandler {
                             caller: String::new(),
                             callee,
                             options: None,
+                        });
+                        buffer.drain(..mat.end());
+                    }
+                    CommandKind::Message => {
+                        let caps = RE_MESSAGE.captures(buffer).unwrap();
+                        let mat = caps.get(0).unwrap();
+                        let body = caps.get(1).unwrap().as_str().to_string();
+                        let content_type = caps.get(2).map(|m| m.as_str().to_string());
+                        let refer = caps.get(3).map(|m| m.as_str() == "true");
+
+                        let prefix = buffer[..pos].to_string();
+                        if !prefix.trim().is_empty() {
+                            commands.push(self.create_tts_command_with_id(
+                                prefix,
+                                play_id.to_string(),
+                                None,
+                            ));
+                        }
+                        commands.push(Command::Message {
+                            body,
+                            content_type,
+                            headers: None,
+                            refer,
                         });
                         buffer.drain(..mat.end());
                     }
