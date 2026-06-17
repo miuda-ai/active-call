@@ -31,7 +31,7 @@ arc-swap = "1.9.1"
 async-trait = "0.1.88"
 async-stream = "0.3.6"
 axum = { version = "0.8.9", features = ["ws", "tokio", "multipart"] }
-tower-http = { version = "0.6.10", features = ["fs", "trace"] }
+tower-http = { version = "0.7.0", features = ["fs", "trace"] }
 bytes = "1"
 futures = "0.3.32"
 rustls = "0.23.40"
