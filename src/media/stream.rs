@@ -223,7 +223,7 @@ impl MediaStream {
     pub async fn update_track(&self, mut track: Box<dyn Track>, play_id: Option<String>) {
         self.remove_track(track.id(), false).await;
         if self.recorder_option.lock().await.is_some() {
-            track.insert_processor(Box::new(RecorderProcessor::new(
+            track.append_processor(Box::new(RecorderProcessor::new(
                 self.recorder_sender.clone(),
             )));
         }

@@ -35,6 +35,7 @@ impl Default for AudioFrame {
             sample_rate: 16000,
             channels: 1,
             src_packet: None,
+            speech_probability: None,
         }
     }
 }

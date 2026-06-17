@@ -6,7 +6,10 @@ use std::collections::HashMap;
 
 use crate::{
     media::{
-        ambiance::AmbianceOption, recorder::RecorderOption, track::media_pass::MediaPassOption,
+        agc::AGCOption,
+        ambiance::AmbianceOption,
+        recorder::RecorderOption,
+        track::media_pass::MediaPassOption,
         vad::VADOption,
     },
     synthesis::SynthesisOption,
@@ -50,6 +53,7 @@ pub struct SipOption {
 #[serde(rename_all = "camelCase")]
 pub struct CallOption {
     pub denoise: Option<bool>,
+    pub agc: Option<AGCOption>,
     pub offer: Option<String>,
     pub callee: Option<String>,
     pub caller: Option<String>,
@@ -77,6 +81,7 @@ impl Default for CallOption {
     fn default() -> Self {
         Self {
             denoise: None,
+            agc: None,
             offer: None,
             callee: None,
             caller: None,
@@ -172,6 +177,7 @@ impl CallOption {
 #[serde(rename_all = "camelCase")]
 pub struct ReferOption {
     pub denoise: Option<bool>,
+    pub agc: Option<AGCOption>,
     pub timeout: Option<u32>,
     pub moh: Option<String>,
     pub vad: Option<VADOption>,

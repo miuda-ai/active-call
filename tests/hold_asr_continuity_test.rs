@@ -24,6 +24,7 @@ async fn test_hold_processor_continues_frame_flow() -> Result<()> {
         sample_rate: 16000,
         channels: 1,
         src_packet: None,
+        ..Default::default()
     };
 
     // Process the frame (in hold state)
@@ -75,6 +76,7 @@ async fn test_hold_processor_continues_frame_flow() -> Result<()> {
         sample_rate: 16000,
         channels: 1,
         src_packet: None,
+        ..Default::default()
     };
 
     processor.process_frame(&mut frame2)?;
@@ -117,6 +119,7 @@ async fn test_hold_with_empty_frame() -> Result<()> {
         sample_rate: 16000,
         channels: 1,
         src_packet: None,
+        ..Default::default()
     };
 
     // Should not panic with empty samples
@@ -149,6 +152,7 @@ async fn test_hold_with_non_pcm_samples() -> Result<()> {
         sample_rate: 16000,
         channels: 1,
         src_packet: None,
+        ..Default::default()
     };
 
     processor.process_frame(&mut frame)?;
