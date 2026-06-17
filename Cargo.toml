@@ -9,7 +9,7 @@ repository = "https://github.com/miuda-ai/active-call"
 readme = "README.md"
 keywords = ["sip", "voip", "telephony", "voice-agent", "webrtc"]
 categories = ["network-programming", "multimedia"]
-exclude = ["fixtures/**", "examples/**"]
+exclude = ["fixtures/**", "examples/**", "src/media/tests/**"]
 
 [features]
 default = ["offline"]
