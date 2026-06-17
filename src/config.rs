@@ -101,20 +101,19 @@ fn default_config_useragent() -> Option<String> {
     ))
 }
 
+fn default_enable_options_response() -> Option<bool> {
+    Some(true)
+}
+
 fn default_codecs() -> Option<Vec<String>> {
-    let mut codecs = vec![
+    let codecs = vec![
         "pcmu".to_string(),
         "pcma".to_string(),
         "g722".to_string(),
         "g729".to_string(),
+        "opus".to_string(),
         "telephone_event".to_string(),
     ];
-
-    #[cfg(feature = "opus")]
-    {
-        codecs.push("opus".to_string());
-    }
-
     Some(codecs)
 }
 
@@ -216,6 +215,8 @@ pub struct Config {
     #[serde(default)]
     pub recording: Option<RecordingPolicy>,
     pub rewrites: Option<Vec<RewriteRule>>,
+    #[serde(default = "default_enable_options_response")]
+    pub enable_options_response: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Clone, Serialize)]
@@ -323,6 +324,7 @@ impl Default for Config {
             enable_srtp: None,
             recording: None,
             rewrites: None,
+            enable_options_response: default_enable_options_response(),
         }
     }
 }

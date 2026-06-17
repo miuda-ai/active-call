@@ -26,6 +26,7 @@ use chrono::{DateTime, Local};
 use futures::FutureExt;
 use humantime::parse_duration;
 use rsipstack::rsip::prelude::HeadersExt;
+use rsipstack::rsip::{typed, Accept, Method};
 use rsipstack::transaction::{
     Endpoint, TransactionReceiver,
     endpoint::{TargetLocator, TransportEventInspector},
@@ -485,7 +486,28 @@ impl AppStateInner {
                     });
                 }
                 rsipstack::rsip::Method::Options => {
-                    info!(?key, "ignoring out-of-dialog OPTIONS request");
+                    if self.config.enable_options_response.unwrap_or(true) {
+                        info!(?key, "responding to out-of-dialog OPTIONS request");
+                        let allow_header: rsipstack::rsip::Header =
+                            typed::Allow::from(Method::all()).into();
+                        let accept_header =
+                            rsipstack::rsip::Header::Accept(Accept::new("application/sdp"));
+                        match tx
+                            .reply_with(
+                                rsipstack::rsip::StatusCode::OK,
+                                vec![allow_header, accept_header],
+                                None,
+                            )
+                            .await
+                        {
+                            Ok(_) => (),
+                            Err(e) => {
+                                info!("error replying to OPTIONS: {:?}", e);
+                            }
+                        }
+                    } else {
+                        info!(?key, "ignoring out-of-dialog OPTIONS request");
+                    }
                     continue;
                 }
                 rsipstack::rsip::Method::Refer => {

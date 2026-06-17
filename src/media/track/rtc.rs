@@ -179,7 +179,6 @@ impl RtcTrack {
                     CodecType::G722 => AudioCapability::g722(),
                     CodecType::G729 => AudioCapability::g729(),
                     CodecType::TelephoneEvent => AudioCapability::telephone_event(),
-                    #[cfg(feature = "opus")]
                     CodecType::Opus => AudioCapability::opus(),
                 };
                 caps.audio.push(cap);
@@ -882,7 +881,6 @@ impl RtcTrack {
             match self.rtc_config.preferred_codec.unwrap_or(CodecType::G722) {
                 CodecType::PCMU => 0,
                 CodecType::PCMA => 8,
-                #[cfg(feature = "opus")]
                 CodecType::Opus => 111,
                 CodecType::G722 => 9,
                 CodecType::G729 => 18,

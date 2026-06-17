@@ -8,13 +8,14 @@ use reqwest::Client;
 use std::fs::File;
 use std::io::{BufReader, Seek, SeekFrom, Write};
 use std::time::Instant;
-use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::DecoderOptions;
+use symphonia::core::codecs::audio::AudioDecoderOptions;
+use symphonia::core::codecs::CodecParameters;
 use symphonia::core::errors::Error as SymphoniaError;
+use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::FormatOptions;
+use symphonia::core::formats::TrackType;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
 use symphonia::default::{get_codecs, get_probe};
 use tracing::{info, warn};
 use url::Url;
@@ -269,57 +270,61 @@ pub fn decode_audio(
         hint.mime_type(mime);
     }
 
-    let probed = get_probe().format(
+    let mut format = get_probe().probe(
         &hint,
         mss,
-        &FormatOptions::default(),
-        &MetadataOptions::default(),
+        FormatOptions::default(),
+        MetadataOptions::default(),
     )?;
-
-    let mut format = probed.format;
-    let (track_id, codec_params) = {
+    let (track_id, audio_params) = {
         let track = format
-            .default_track()
+            .default_track(TrackType::Audio)
             .ok_or_else(|| anyhow!("loader: no default audio track found"))?;
-        (track.id, track.codec_params.clone())
+        let codec_params = track.codec_params
+            .as_ref()
+            .ok_or_else(|| anyhow!("loader: no codec parameters"))?;
+        let params = match codec_params {
+            CodecParameters::Audio(params) => params.clone(),
+            _ => return Err(anyhow!("loader: expected audio codec")),
+        };
+        (track.id, params)
     };
 
-    let mut decoder = get_codecs().make(&codec_params, &DecoderOptions::default())?;
+    let mut decoder = get_codecs().make_audio_decoder(&audio_params, &AudioDecoderOptions::default())?;
     let mut all_samples = Vec::new();
-    let mut sample_rate = codec_params.sample_rate.unwrap_or(0);
+    let mut sample_rate = audio_params.sample_rate.unwrap_or(0);
 
     loop {
         let packet = match format.next_packet() {
-            Ok(packet) => packet,
+            Ok(Some(packet)) => packet,
+            Ok(None) => break,
             Err(SymphoniaError::IoError(_)) => break,
             Err(SymphoniaError::ResetRequired) => continue,
             Err(e) => return Err(anyhow!("loader: failed reading audio packet: {e}")),
         };
 
-        if packet.track_id() != track_id {
+        if packet.track_id != track_id {
             continue;
         }
 
         match decoder.decode(&packet) {
             Ok(decoded) => {
                 if sample_rate == 0 {
-                    sample_rate = decoded.spec().rate;
+                    sample_rate = decoded.spec().rate();
                     info!(
                         "loader: detected {:?} with sample rate: {} Hz, channels: {}",
-                        codec_params.codec,
+                        audio_params.codec,
                         sample_rate,
-                        decoded.spec().channels.count()
+                        decoded.spec().channels().count()
                     );
                 }
-                let spec = *decoded.spec();
-                let channels = spec.channels.count();
+                let channels = decoded.spec().channels().count();
 
-                let mut sample_buffer = SampleBuffer::<i16>::new(decoded.capacity() as u64, spec);
-                sample_buffer.copy_interleaved_ref(decoded);
-                let interleaved = sample_buffer.samples();
+                let mut interleaved = Vec::new();
+                decoded.copy_to_vec_interleaved(&mut interleaved);
 
                 if channels <= 1 {
-                    all_samples.extend_from_slice(interleaved);
+                    all_samples.extend_from_slice(&interleaved);
                 } else {
                     for frame in interleaved.chunks(channels) {
                         if frame.is_empty() {

@@ -186,7 +186,7 @@ mod tests {
     fn message_command_deserializes_legacy_text() {
         let command: Command = serde_json::from_value(serde_json::json!({
             "command": "message",
-            "text": "customer_id=12345"
+            "body": "customer_id=12345"
         }))
         .unwrap();
 

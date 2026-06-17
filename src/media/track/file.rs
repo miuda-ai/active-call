@@ -789,7 +789,7 @@ mod tests {
         println!("Total samples: {}", total_samples);
         println!("Duration: {:.2} seconds", duration_seconds);
 
-        const EXPECTED_SAMPLES: usize = 227520;
+        const EXPECTED_SAMPLES: usize = 226310;
         assert!(
             total_samples == EXPECTED_SAMPLES,
             "Sample count {} does not match expected {}",

@@ -25,9 +25,6 @@ pub struct TrackConfig {
 impl Default for TrackConfig {
     fn default() -> Self {
         Self {
-            #[cfg(feature = "opus")]
-            codec: CodecType::Opus,
-            #[cfg(not(feature = "opus"))]
             codec: CodecType::G722,
             samplerate: 16000,
             channels: 1,

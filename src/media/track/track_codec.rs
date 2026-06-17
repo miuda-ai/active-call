@@ -1,16 +1,15 @@
 use crate::{media::AudioFrame, media::PcmBuf, media::Samples};
 use audio_codec::{
-    CodecType, Decoder, Encoder, Resampler, bytes_to_samples,
+    bytes_to_samples,
     g722::{G722Decoder, G722Encoder},
     pcma::{PcmaDecoder, PcmaEncoder},
     pcmu::{PcmuDecoder, PcmuEncoder},
-    samples_to_bytes,
+    samples_to_bytes, CodecType, Decoder, Encoder, Resampler,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use audio_codec::g729::{G729Decoder, G729Encoder};
-#[cfg(feature = "opus")]
 use audio_codec::opus::{OpusDecoder, OpusEncoder};
 
 pub struct TrackCodec {
@@ -25,9 +24,7 @@ pub struct TrackCodec {
     g729_encoder: Option<Box<G729Encoder>>,
     g729_decoder: Option<Box<G729Decoder>>,
 
-    #[cfg(feature = "opus")]
     opus_encoder: Option<OpusEncoder>,
-    #[cfg(feature = "opus")]
     opus_decoder: Option<OpusDecoder>,
 
     resampler: Option<Resampler>,
@@ -53,7 +50,6 @@ impl TrackCodec {
         map.insert(9, CodecType::G722);
         map.insert(18, CodecType::G729);
         map.insert(101, CodecType::TelephoneEvent);
-        #[cfg(feature = "opus")]
         map.insert(111, CodecType::Opus);
         let payload_type_map = Arc::new(RwLock::new(map));
 
@@ -66,9 +62,7 @@ impl TrackCodec {
             g722_decoder: None,
             g729_encoder: None,
             g729_decoder: None,
-            #[cfg(feature = "opus")]
             opus_encoder: None,
-            #[cfg(feature = "opus")]
             opus_decoder: None,
             resampler: None,
             resampler_in_rate: 0,
@@ -118,7 +112,6 @@ impl TrackCodec {
                 8 => CodecType::PCMA,
                 9 => CodecType::G722,
                 18 => CodecType::G729,
-                #[cfg(feature = "opus")]
                 111 => CodecType::Opus,
                 _ => CodecType::PCMU,
             });
@@ -134,7 +127,6 @@ impl TrackCodec {
                 .g729_decoder
                 .get_or_insert_with(|| Box::new(G729Decoder::new()))
                 .decode(payload),
-            #[cfg(feature = "opus")]
             CodecType::Opus => self
                 .opus_decoder
                 .get_or_insert_with(OpusDecoder::new_default)
@@ -147,7 +139,6 @@ impl TrackCodec {
             CodecType::PCMA => (8000, 1),
             CodecType::G722 => (16000, 1),
             CodecType::G729 => (8000, 1),
-            #[cfg(feature = "opus")]
             CodecType::Opus => {
                 if pcm.len() >= 1920 {
                     (48000, 2)
@@ -219,7 +210,6 @@ impl TrackCodec {
                         .g729_encoder
                         .get_or_insert_with(|| Box::new(G729Encoder::new()))
                         .encode(&pcm),
-                    #[cfg(feature = "opus")]
                     Some(CodecType::Opus) => self
                         .opus_encoder
                         .get_or_insert_with(OpusEncoder::new_default)
@@ -242,7 +232,6 @@ impl TrackCodec {
 mod tests {
     use super::*;
 
-    #[cfg(feature = "opus")]
     #[test]
     fn test_encode_dynamic_opus_payload_type_uses_opus_encoder() {
         let mut codec = TrackCodec::new();
