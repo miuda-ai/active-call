@@ -354,6 +354,69 @@ pub fn decode_audio(
     Ok(all_samples)
 }
 
+/// Load audio from a path/URL, decode it to PCM at `target_sample_rate`, and
+/// cache the *decoded* PCM (not the original encoded file) so subsequent loads
+/// skip downloading and decoding entirely.
+pub async fn load_audio_as_pcm_cached(
+    path: &str,
+    target_sample_rate: u32,
+    use_cache: bool,
+) -> Result<Vec<i16>> {
+    let cache_key = cache::generate_cache_key(path, target_sample_rate, None, None);
+
+    if use_cache && cache::is_cached(&cache_key).await? {
+        match cache::retrieve_pcm_from_cache(&cache_key).await {
+            Ok(samples) => {
+                info!(
+                    "loader: loaded {} decoded samples from pcm cache for {}",
+                    samples.len(),
+                    path
+                );
+                return Ok(samples);
+            }
+            Err(e) => warn!("loader: failed to read pcm cache for {}: {}", path, e),
+        }
+    }
+
+    let is_url = path.starts_with("http://") || path.starts_with("https://");
+
+    // Download/open the original file without caching the encoded bytes; we
+    // cache the decoded PCM below instead.
+    let (file, content_type) = if is_url {
+        download_from_url(path, false).await?
+    } else {
+        (
+            File::open(path).map_err(|e| anyhow!("loader: {} {}", path, e))?,
+            None,
+        )
+    };
+
+    let extension = if is_url {
+        path.parse::<Url>()?
+            .path()
+            .split('.')
+            .last()
+            .unwrap_or("")
+            .to_string()
+    } else {
+        path.split('.').last().unwrap_or("").to_string()
+    };
+
+    // Decoding is CPU-bound and blocking; keep it off the async runtime.
+    let samples = tokio::task::spawn_blocking(move || {
+        decode_audio(file, &extension, content_type.as_deref(), target_sample_rate)
+    })
+    .await??;
+
+    if use_cache {
+        if let Err(e) = cache::store_pcm_in_cache(&cache_key, &samples).await {
+            warn!("loader: failed to store pcm cache for {}: {}", path, e);
+        }
+    }
+
+    Ok(samples)
+}
+
 pub async fn load_audio_as_pcm(
     path: &str,
     target_sample_rate: u32,

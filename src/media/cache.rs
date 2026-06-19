@@ -118,6 +118,32 @@ pub async fn store_in_cache_vectored(key: &str, data: &[impl AsRef<[u8]>]) -> Re
     Ok(())
 }
 
+/// Store decoded PCM samples (i16) in the cache as raw little-endian bytes
+pub async fn store_pcm_in_cache(key: &str, samples: &[i16]) -> Result<()> {
+    let mut bytes = Vec::with_capacity(samples.len() * 2);
+    for sample in samples {
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    store_in_cache(key, &bytes).await
+}
+
+/// Retrieve decoded PCM samples (i16) from the cache stored as raw little-endian bytes
+pub async fn retrieve_pcm_from_cache(key: &str) -> Result<Vec<i16>> {
+    let bytes = retrieve_from_cache(key).await?;
+    if bytes.len() % 2 != 0 {
+        return Err(anyhow!(
+            "cache: pcm data length {} is not aligned to i16 for key: {}",
+            bytes.len(),
+            key
+        ));
+    }
+    let samples = bytes
+        .chunks_exact(2)
+        .map(|b| i16::from_le_bytes([b[0], b[1]]))
+        .collect();
+    Ok(samples)
+}
+
 /// Retrieve data from the cache
 pub async fn retrieve_from_cache(key: &str) -> Result<Vec<u8>> {
     let path = get_cache_path(key)?;
