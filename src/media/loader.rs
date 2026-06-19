@@ -357,20 +357,27 @@ pub fn decode_audio(
 /// Load audio from a path/URL, decode it to PCM at `target_sample_rate`, and
 /// cache the *decoded* PCM (not the original encoded file) so subsequent loads
 /// skip downloading and decoding entirely.
+///
+/// `offset_ms` skips that much audio from the start of the returned PCM. The
+/// full decoded PCM is still cached (the offset is not part of the cache key);
+/// on a cache hit only the bytes after the offset are read from disk.
 pub async fn load_audio_as_pcm_cached(
     path: &str,
     target_sample_rate: u32,
     use_cache: bool,
+    offset_ms: u32,
 ) -> Result<Vec<i16>> {
     let cache_key = cache::generate_cache_key(path, target_sample_rate, None, None);
+    let offset_samples = (offset_ms as usize * target_sample_rate as usize) / 1000;
 
     if use_cache && cache::is_cached(&cache_key).await? {
-        match cache::retrieve_pcm_from_cache(&cache_key).await {
+        match cache::retrieve_pcm_from_cache_at(&cache_key, offset_samples).await {
             Ok(samples) => {
                 info!(
-                    "loader: loaded {} decoded samples from pcm cache for {}",
+                    "loader: loaded {} decoded samples from pcm cache for {} (offset {} ms)",
                     samples.len(),
-                    path
+                    path,
+                    offset_ms
                 );
                 return Ok(samples);
             }
@@ -403,16 +410,20 @@ pub async fn load_audio_as_pcm_cached(
     };
 
     // Decoding is CPU-bound and blocking; keep it off the async runtime.
-    let samples = tokio::task::spawn_blocking(move || {
+    let mut samples = tokio::task::spawn_blocking(move || {
         decode_audio(file, &extension, content_type.as_deref(), target_sample_rate)
     })
     .await??;
 
+    // Cache the full decoded PCM before applying the offset.
     if use_cache {
         if let Err(e) = cache::store_pcm_in_cache(&cache_key, &samples).await {
             warn!("loader: failed to store pcm cache for {}: {}", path, e);
         }
     }
+
+    let skip = offset_samples.min(samples.len());
+    samples.drain(..skip);
 
     Ok(samples)
 }

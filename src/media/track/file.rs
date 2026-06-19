@@ -369,6 +369,7 @@ impl Track for FileTrack {
                     &path,
                     sample_rate,
                     use_cache,
+                    offset_ms,
                 )
                 .await;
                 let samples = match load_result {
@@ -397,14 +398,13 @@ impl Track for FileTrack {
                     }
                 };
 
-                // Stream the decoded PCM
+                // Stream the decoded PCM (offset already applied during load)
                 let stream_result = stream_pcm_samples(
                     processor_chain,
                     samples,
                     sample_rate,
                     &id,
                     packet_duration_ms,
-                    offset_ms,
                     token,
                     paused,
                     packet_sender,
@@ -464,23 +464,18 @@ async fn stream_pcm_samples(
     target_sample_rate: u32,
     track_id: &str,
     packet_duration_ms: u32,
-    offset_ms: u32,
     token: CancellationToken,
     paused: Arc<AtomicBool>,
     packet_sender: TrackPacketSender,
 ) -> Result<()> {
     let reader =
         DecodedAudioReader::from_samples(samples, target_sample_rate, target_sample_rate);
-    let mut audio_reader = Box::new(reader) as Box<dyn AudioReader>;
+    let audio_reader = Box::new(reader) as Box<dyn AudioReader>;
     info!(
         "filetrack: streaming {} decoded samples at {} Hz",
         audio_reader.buffer_size(),
         audio_reader.sample_rate(),
     );
-    if offset_ms > 0 {
-        let offset_samples = (offset_ms as usize * audio_reader.sample_rate() as usize) / 1000;
-        audio_reader.set_position(offset_samples.min(audio_reader.buffer_size()));
-    }
     process_audio_reader(
         processor_chain,
         audio_reader,
