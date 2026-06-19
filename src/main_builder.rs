@@ -345,6 +345,7 @@ impl MainBuilder {
     ) -> Result<()> {
         let app_state_clone = app_state.clone();
         let graceful_shutdown = self.config.graceful_shutdown.unwrap_or_default();
+        let graceful_shutdown_timeout = self.config.graceful_shutdown_timeout.unwrap_or(30);
 
         let axum_serving = axum::serve(listener, router).into_future();
         let app_state_serving = app_state_clone.serve();
@@ -397,8 +398,8 @@ impl MainBuilder {
                     }
                     if graceful_shutdown {
                         let app_state = app_state.clone();
-                        shutdown_task.set(async move { app_state.graceful_stop().await }.boxed());
-                        *cancel_timeout = tokio::time::sleep(tokio::time::Duration::from_secs(30)).boxed();
+                        shutdown_task.set(async move { app_state.graceful_stop(graceful_shutdown_timeout).await }.boxed());
+                        *cancel_timeout = tokio::time::sleep(tokio::time::Duration::from_secs(graceful_shutdown_timeout)).boxed();
                         canceled = true;
                     } else {
                         break;

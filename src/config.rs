@@ -94,6 +94,10 @@ fn default_graceful_shutdown() -> Option<bool> {
     Some(true)
 }
 
+fn default_graceful_shutdown_timeout() -> Option<u64> {
+    Some(30)
+}
+
 fn default_config_useragent() -> Option<String> {
     Some(format!(
         "active-call({} miuda.ai)",
@@ -188,6 +192,10 @@ pub struct Config {
     pub register_users: Option<Vec<RegisterOption>>,
     #[serde(default = "default_graceful_shutdown")]
     pub graceful_shutdown: Option<bool>,
+    /// Total seconds to wait during graceful shutdown before forcing exit.
+    /// SIP de-registration and active call draining run in parallel, both with this timeout.
+    #[serde(default = "default_graceful_shutdown_timeout")]
+    pub graceful_shutdown_timeout: Option<u64>,
     pub handler: Option<InviteHandlerConfig>,
     pub accept_timeout: Option<String>,
     #[serde(default = "default_codecs")]
@@ -305,6 +313,7 @@ impl Default for Config {
             useragent: None,
             register_users: None,
             graceful_shutdown: Some(true),
+            graceful_shutdown_timeout: default_graceful_shutdown_timeout(),
             handler: None,
             accept_timeout: Some("50s".to_string()),
             media_cache_path: default_config_media_cache_path(),
