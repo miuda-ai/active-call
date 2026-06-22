@@ -140,7 +140,7 @@ impl MessageInspector for LearningMessageInspector {
         }
     }
 
-    fn after_received(&self, msg: rsipstack::rsip::SipMessage, from: &SipAddr) -> rsipstack::rsip::SipMessage {
+    fn after_received(&self, msg: rsipstack::rsip::SipMessage, from: Option<&SipAddr>) -> rsipstack::rsip::SipMessage {
         if let rsipstack::rsip::SipMessage::Response(response) = &msg
             && let Ok(via) = response.via_header()
             && let Ok(via) = via.typed()
@@ -224,13 +224,13 @@ mod tests {
         let cache = inspector.shared_public_address();
         inspector.after_received(
             rsipstack::rsip::SipMessage::Response(response),
-            &SipAddr {
+            Some(&SipAddr {
                 r#type: Some(Transport::Udp),
                 addr: "10.0.0.1:5060"
                     .parse::<std::net::SocketAddr>()
                     .unwrap()
                     .into(),
-            },
+            }),
         );
         assert_eq!(cache.load_full().as_ref().to_string(), "203.0.113.10:62000");
     }
