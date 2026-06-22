@@ -234,7 +234,7 @@ impl StreamEngine {
 
     pub async fn create_processors(
         engine: Arc<StreamEngine>,
-        track: &dyn Track,
+        track_id: TrackId,
         cancel_token: CancellationToken,
         event_sender: EventSender,
         packet_sender: TrackPacketSender,
@@ -242,7 +242,7 @@ impl StreamEngine {
     ) -> Result<Vec<Box<dyn Processor>>> {
         (engine.clone().create_processors_hook)(
             engine,
-            track.id().clone(),
+            track_id,
             cancel_token,
             event_sender,
             packet_sender,
