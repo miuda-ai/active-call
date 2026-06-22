@@ -26,7 +26,7 @@ use chrono::{DateTime, Local};
 use futures::FutureExt;
 use humantime::parse_duration;
 use rsipstack::rsip::prelude::HeadersExt;
-use rsipstack::rsip::{typed, Accept, Method};
+use rsipstack::rsip::{Accept, Method, typed};
 use rsipstack::transaction::{
     Endpoint, TransactionReceiver,
     endpoint::{TargetLocator, TransportEventInspector},
@@ -193,12 +193,11 @@ impl AppStateInner {
             },
         }
 
-        // Wait for registration to stop, if not stopped within 50 seconds,
-        // force stop it.
+        let total_secs = self.config.graceful_shutdown_timeout.unwrap_or(30);
         let timeout = self
             .config
             .graceful_shutdown
-            .map(|_| Duration::from_secs(10));
+            .map(|_| Duration::from_secs(total_secs));
 
         match self.stop_registration(timeout).await {
             Ok(_) => {
@@ -379,13 +378,12 @@ impl AppStateInner {
                         let _pending_guard = guard;
                         let token_ref = token.clone();
                         let accept_timeout_sleep = tokio::time::sleep(accept_timeout);
-                        let invite_handler = invitation_handler
-                            .on_invite(
-                                dialog_id_str.clone(),
-                                token.clone(),
-                                dialog.clone(),
-                                routing_state,
-                            );
+                        let invite_handler = invitation_handler.on_invite(
+                            dialog_id_str.clone(),
+                            token.clone(),
+                            dialog.clone(),
+                            routing_state,
+                        );
                         let dialog_handle = dialog_ref.handle(&mut tx);
                         tokio::pin!(accept_timeout_sleep);
                         tokio::pin!(invite_handler);
@@ -475,8 +473,7 @@ impl AppStateInner {
                                             "error rejecting invite: {:?}", e
                                         );
                                     }
-                                    invitation_for_cleanup
-                                        .get_pending_call(&dialog_id_for_cleanup);
+                                    invitation_for_cleanup.get_pending_call(&dialog_id_for_cleanup);
                                     invitation_for_cleanup
                                         .dialog_layer
                                         .remove_dialog(&dialog_id_for_cleanup);
@@ -542,20 +539,45 @@ impl AppStateInner {
         self.token.cancel();
     }
 
-    pub async fn graceful_stop(&self) -> Result<()> {
+    pub async fn graceful_stop(&self, total_timeout_secs: u64) -> Result<()> {
         if self.shutting_down.swap(true, Ordering::Relaxed) {
             return Ok(());
         }
 
         info!("graceful stopping, marking as shutting down");
-        let timeout = self
-            .config
-            .graceful_shutdown
-            .map(|_| Duration::from_secs(10));
+        let timeout = Duration::from_secs(total_timeout_secs);
 
-        self.stop_registration(timeout).await?;
+        let (reg_result, ()) = tokio::join!(
+            self.stop_registration(Some(timeout)),
+            self.wait_for_active_calls(timeout),
+        );
+        if let Err(e) = reg_result {
+            warn!("stop_registration error: {}", e);
+        }
         self.token.cancel();
         Ok(())
+    }
+
+    async fn wait_for_active_calls(&self, timeout: Duration) {
+        let active_calls = self.active_calls.clone();
+        let check_loop = async move {
+            let mut last_count = usize::MAX;
+            loop {
+                let count = active_calls.lock().unwrap().len();
+                if count == 0 {
+                    break;
+                }
+                if count != last_count {
+                    info!(active_calls = count, "waiting for active calls to finish");
+                    last_count = count;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        };
+        match tokio::time::timeout(timeout, check_loop).await {
+            Ok(()) => info!("all active calls finished"),
+            Err(_) => warn!("timed out waiting for active calls to finish, forcing shutdown"),
+        }
     }
 
     pub async fn start_registration(&self) -> Result<usize> {
@@ -619,7 +641,9 @@ impl AppStateInner {
                     rsipstack::rsip::Host::Domain(domain) => domain.to_string(),
                     rsipstack::rsip::Host::IpAddr(ip) => {
                         // Compare IP addresses
-                        if let rsipstack::rsip::Host::IpAddr(callee_ip) = &parsed_callee.host_with_port.host {
+                        if let rsipstack::rsip::Host::IpAddr(callee_ip) =
+                            &parsed_callee.host_with_port.host
+                        {
                             if ip == callee_ip {
                                 if let Some(cred) = &option.credential {
                                     info!(
@@ -666,7 +690,9 @@ impl AppStateInner {
                 }
 
                 if let Ok(parsed_server) = rsipstack::rsip::Uri::try_from(server.as_str()) {
-                    if let rsipstack::rsip::Host::IpAddr(server_ip) = &parsed_server.host_with_port.host {
+                    if let rsipstack::rsip::Host::IpAddr(server_ip) =
+                        &parsed_server.host_with_port.host
+                    {
                         if server_ip == callee_ip {
                             if let Some(cred) = &option.credential {
                                 info!(

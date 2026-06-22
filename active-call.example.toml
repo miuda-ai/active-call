@@ -39,6 +39,14 @@ media_cache_path = "./config/mediacache"
 # enable_ice_lite = false
 # rtp_bind_ip = 0.0.0.0
 
+# Graceful shutdown: on SIGTERM/Ctrl-C, stop accepting new calls and wait for
+# in-progress calls to finish before exiting.
+# graceful_shutdown = true
+#
+# Total seconds to wait during graceful shutdown before forcing exit.
+# SIP de-registration and active call draining run in parallel, both with this timeout.
+# graceful_shutdown_timeout = 30
+
 # setup your STUN/TURN servers here, for webrtc web clients
 # [[ice_servers]]
 # urls = ["stun:stun.l.google.com:19302"]
