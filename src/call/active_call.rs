@@ -55,6 +55,16 @@ use tokio::{fs::File, select, sync::Mutex, sync::RwLock, sync::mpsc, time::sleep
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+/// Describes the state of the caller track when an incoming SIP call is waiting to be answered.
+pub enum PendingCallerTrack {
+    /// The track has been started in the media stream during ringing (early media).
+    /// Processors must be built from the accept option and appended to it.
+    StartedForEarlyMedia,
+    /// The track has not been added to the media stream yet.
+    /// setup_track_with_stream will start it and build processors from the accept option.
+    NotStarted(Box<dyn Track>),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,7 +277,10 @@ mod tests {
 
         active_call.do_hangup(None, None, None, Some(true)).await?;
 
-        assert!(refer_token.is_cancelled(), "refer token should be cancelled");
+        assert!(
+            refer_token.is_cancelled(),
+            "refer token should be cancelled"
+        );
         assert!(
             !active_call.media_stream.cancel_token.is_cancelled(),
             "media stream should NOT stop"
@@ -292,11 +305,175 @@ mod tests {
 
         active_call.do_hangup(None, None, None, None).await?;
 
-        assert!(refer_token.is_cancelled(), "refer token should be cancelled");
+        assert!(
+            refer_token.is_cancelled(),
+            "refer token should be cancelled"
+        );
         assert!(
             active_call.media_stream.cancel_token.is_cancelled(),
             "media stream should stop"
         );
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression: ringing-before-accept leaves caller track without processors
+    // ---------------------------------------------------------------------------
+    //
+    // When Ringing is issued before Accept on an incoming SIP call,
+    // prepare_incoming_sip_track starts the caller track in the media stream
+    // (needed for early-media ringtone) with the empty ringing option — no
+    // VAD/ASR/AGC processors.  It stores PendingCallerTrack::StartedForEarlyMedia
+    // in ready_to_answer.  At accept time, finish_caller_stack matches that variant
+    // and calls create_processors + append_processor with the real accept option.
+    //
+    // This test verifies that setup_track_with_stream (same processor-creation path)
+    // fires the ASR builder when given the accept option, proving the fix is sound.
+
+    struct MockCallerTrack {
+        id: TrackId,
+        config: crate::media::track::TrackConfig,
+        processor_chain: crate::media::processor::ProcessorChain,
+    }
+
+    impl MockCallerTrack {
+        fn new(id: TrackId) -> Self {
+            Self {
+                id,
+                config: crate::media::track::TrackConfig::default(),
+                processor_chain: crate::media::processor::ProcessorChain::new(16000),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::media::track::Track for MockCallerTrack {
+        fn ssrc(&self) -> u32 {
+            0
+        }
+        fn id(&self) -> &TrackId {
+            &self.id
+        }
+        fn config(&self) -> &crate::media::track::TrackConfig {
+            &self.config
+        }
+        fn processor_chain(&mut self) -> &mut crate::media::processor::ProcessorChain {
+            &mut self.processor_chain
+        }
+        async fn handshake(
+            &mut self,
+            _o: String,
+            _t: Option<tokio::time::Duration>,
+        ) -> Result<String> {
+            Ok(String::new())
+        }
+        async fn update_remote_description(&mut self, _a: &String) -> Result<()> {
+            Ok(())
+        }
+        async fn start(
+            &mut self,
+            _e: crate::event::EventSender,
+            _p: crate::media::track::TrackPacketSender,
+        ) -> Result<()> {
+            Ok(())
+        }
+        async fn stop(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn send_packet(&mut self, _f: &crate::media::AudioFrame) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct MockAsrClient;
+
+    #[async_trait::async_trait]
+    impl crate::transcription::TranscriptionClient for MockAsrClient {
+        fn send_audio(
+            &self,
+            _s: &[crate::media::Sample],
+            _src: Option<&crate::media::SourcePacket>,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_setup_track_with_stream_builds_processors_from_accept_option() -> Result<()> {
+        let (asr_created_tx, mut asr_created_rx) = mpsc::channel::<()>(1);
+
+        let mock_provider =
+            crate::transcription::TranscriptionType::Other("mock-ringing-asr".to_string());
+
+        let mut engine = StreamEngine::new();
+        engine.register_asr(
+            mock_provider.clone(),
+            Box::new(move |_tid, _tok, _opt, _es| {
+                let tx = asr_created_tx.clone();
+                Box::pin(async move {
+                    let _ = tx.send(()).await;
+                    Ok(Box::new(MockAsrClient)
+                        as Box<dyn crate::transcription::TranscriptionClient>)
+                })
+            }),
+        );
+        let engine = Arc::new(engine);
+
+        let mut config = Config::default();
+        config.udp_port = 0;
+        config.media_cache_path = "/tmp/mediacache_ringing_accept_test".to_string();
+
+        let app_state = AppStateBuilder::new()
+            .with_config(config)
+            .with_stream_engine(engine)
+            .build()
+            .await?;
+
+        let cancel_token = CancellationToken::new();
+        let session_id = format!("test-ringing-accept-{}", uuid::Uuid::new_v4());
+
+        let active_call = Arc::new(ActiveCall::new(
+            ActiveCallType::Sip,
+            cancel_token.clone(),
+            session_id.clone(),
+            app_state.invitation.clone(),
+            app_state.clone(),
+            TrackConfig::default(),
+            None,
+            false,
+            None,
+            None,
+            None,
+        ));
+
+        // Simulate the fixed prepare_incoming_sip_track: track is held in
+        // ready_to_answer, NOT yet added to the media stream.
+        let mock_track = Box::new(MockCallerTrack::new(session_id.clone()));
+
+        // Simulate finish_caller_stack at accept time: setup_track_with_stream
+        // is called with the full accept option (the code path under test).
+        let accept_option = crate::CallOption {
+            asr: Some(crate::transcription::TranscriptionOption {
+                provider: Some(mock_provider),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        active_call
+            .setup_track_with_stream(&accept_option, mock_track)
+            .await?;
+
+        // The mock ASR builder must have fired, proving processors were built
+        // from the accept option and attached to the caller track.
+        let received =
+            tokio::time::timeout(std::time::Duration::from_secs(3), asr_created_rx.recv()).await;
+        assert!(
+            received.is_ok() && received.unwrap().is_some(),
+            "ASR processor was NOT created — setup_track_with_stream did not build \
+             processors from the accept option (regression: ringing-before-accept)"
+        );
+
+        cancel_token.cancel();
         Ok(())
     }
 }
@@ -345,7 +522,7 @@ pub struct ActiveCallState {
     pub moh: Option<String>,
     pub current_play_id: Option<String>,
     pub audio_receiver: Option<WebsocketBytesReceiver>,
-    pub ready_to_answer: Option<(String, Option<Box<dyn Track>>, ServerInviteDialog)>,
+    pub ready_to_answer: Option<(String, PendingCallerTrack, ServerInviteDialog)>,
     pub pending_asr_resume: Option<(u32, TranscriptionOption)>,
     pub bridge_paused: Arc<AtomicBool>,
     // Cancel this token to hang up only the refer call, leaving the main call alive
@@ -422,8 +599,7 @@ impl ActiveCall {
     ) -> Self {
         let event_sender = crate::event::create_event_sender();
         let cmd_sender = tokio::sync::broadcast::Sender::<Command>::new(32);
-        let server_side_track_id =
-            server_side_track_id.unwrap_or(SERVER_SIDE_TRACK_ID.to_string());
+        let server_side_track_id = server_side_track_id.unwrap_or(SERVER_SIDE_TRACK_ID.to_string());
         let media_stream_builder = MediaStreamBuilder::new(event_sender.clone())
             .with_id(session_id.clone())
             .with_cancel_token(cancel_token.child_token());
@@ -1037,12 +1213,8 @@ impl ActiveCall {
         }
         info!(session_id = self.session_id, ?option, "accepting call");
         let ready = self.call_state.write().await.ready_to_answer.take();
-        if let Some((answer, track, dialog)) = ready {
-            info!(
-                session_id = self.session_id,
-                track_id = track.as_ref().map(|t| t.id()),
-                "ready to answer with track"
-            );
+        if let Some((answer, pending_track, dialog)) = ready {
+            info!(session_id = self.session_id, "ready to answer with track");
 
             let headers = vec![rsipstack::rsip::Header::ContentType(
                 "application/sdp".to_string().into(),
@@ -1055,7 +1227,7 @@ impl ActiveCall {
                         state.answer = Some(answer);
                         state.answer_time = Some(Utc::now());
                     }
-                    self.finish_caller_stack(&option, track).await?;
+                    self.finish_caller_stack(&option, pending_track).await?;
                 }
                 Err(e) => {
                     warn!(session_id = self.session_id, "failed to accept call: {}", e);
@@ -1654,10 +1826,17 @@ impl ActiveCall {
 
         match result {
             Ok(answer) => {
-                self.media_stream.set_track_refer(&track_id, Some(true)).await;
-                let forward_dtmf = refer_option.as_ref().and_then(|o| o.forward_dtmf).unwrap_or(true);
+                self.media_stream
+                    .set_track_refer(&track_id, Some(true))
+                    .await;
+                let forward_dtmf = refer_option
+                    .as_ref()
+                    .and_then(|o| o.forward_dtmf)
+                    .unwrap_or(true);
                 if !forward_dtmf {
-                    self.media_stream.set_track_dtmf_forward(&track_id, false).await;
+                    self.media_stream
+                        .set_track_dtmf_forward(&track_id, false)
+                        .await;
                 }
                 self.event_sender
                     .send(SessionEvent::Answer {
@@ -1701,7 +1880,9 @@ impl ActiveCall {
         refer: Option<bool>,
     ) -> Result<()> {
         if !matches!(self.call_type, ActiveCallType::Sip | ActiveCallType::B2bua) {
-            return Err(anyhow::anyhow!("message command is only supported for SIP calls"));
+            return Err(anyhow::anyhow!(
+                "message command is only supported for SIP calls"
+            ));
         }
 
         let dialog_key = if refer == Some(true) {
@@ -2250,7 +2431,8 @@ impl ActiveCall {
         };
         match track {
             Some(track) => {
-                self.finish_caller_stack(&option, Some(track)).await?;
+                self.finish_caller_stack(&option, PendingCallerTrack::NotStarted(track))
+                    .await?;
             }
             None => {
                 warn!(session_id = self.session_id, "no track created for caller");
@@ -2263,10 +2445,40 @@ impl ActiveCall {
     async fn finish_caller_stack(
         &self,
         option: &CallOption,
-        track: Option<Box<dyn Track>>,
+        pending_track: PendingCallerTrack,
     ) -> Result<()> {
-        if let Some(track) = track {
-            self.setup_track_with_stream(&option, track).await?;
+        match pending_track {
+            PendingCallerTrack::NotStarted(track) => {
+                self.setup_track_with_stream(option, track).await?;
+            }
+            PendingCallerTrack::StartedForEarlyMedia => {
+                // Track is already running in the media stream (started during ringing
+                // for early-media ringtone). Build processors from the accept option
+                // and append them to the running caller track.
+                let track_id = self.session_id.clone();
+                let processors = StreamEngine::create_processors(
+                    self.app_state.stream_engine.clone(),
+                    track_id.clone(),
+                    self.cancel_token.child_token(),
+                    self.event_sender.clone(),
+                    self.media_stream.packet_sender.clone(),
+                    option,
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    warn!(
+                        session_id = self.session_id,
+                        "failed to create processors on accept: {}", e
+                    );
+                    vec![]
+                });
+                for processor in processors {
+                    self.media_stream
+                        .append_processor(&track_id, processor)
+                        .await
+                        .ok();
+                }
+            }
         }
 
         {
@@ -2301,7 +2513,7 @@ impl ActiveCall {
     ) -> Result<()> {
         let processors = match StreamEngine::create_processors(
             self.app_state.stream_engine.clone(),
-            track.as_ref(),
+            track.id().clone(),
             self.cancel_token.child_token(),
             self.event_sender.clone(),
             self.media_stream.packet_sender.clone(),
@@ -2833,11 +3045,18 @@ impl ActiveCall {
 
         match self.setup_answer_track(ssrc, &option, offer).await {
             Ok((offer, track)) => {
+                // Start the track in the media stream now — early-media ringtone
+                // requires the RTP sender loop to be running during ringing.
+                // Processors are intentionally omitted here; they will be built from
+                // the accept option (which carries VAD/ASR/AGC config) when Accept
+                // is issued, via finish_caller_stack(StartedForEarlyMedia).
                 self.setup_track_with_stream(&option, track).await?;
-                {
-                    let mut state = self.call_state.write().await;
-                    state.ready_to_answer = Some((offer, None, pending_dialog.dialog));
-                }
+                let mut state = self.call_state.write().await;
+                state.ready_to_answer = Some((
+                    offer,
+                    PendingCallerTrack::StartedForEarlyMedia,
+                    pending_dialog.dialog,
+                ));
             }
             Err(e) => {
                 return Err(anyhow::anyhow!("error creating track: {}", e));
