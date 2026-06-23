@@ -1,10 +1,7 @@
 use crate::event::{EventSender, SessionEvent};
 use crate::media::processor::ProcessorChain;
 use crate::media::{AudioFrame, PcmBuf, Samples, TrackId};
-use crate::media::{
-    cache,
-    track::{Track, TrackConfig, TrackPacketSender},
-};
+use crate::media::track::{Track, TrackConfig, TrackPacketSender};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use audio_codec::Resampler;
@@ -21,7 +18,6 @@ use tokio::select;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
-use url::Url;
 
 trait AudioReader: Send {
     fn fill_buffer(&mut self) -> Result<usize>;
@@ -85,6 +81,7 @@ struct DecodedAudioReader {
 }
 
 impl DecodedAudioReader {
+    #[cfg(test)]
     fn from_file(
         file: File,
         extension: &str,
@@ -100,6 +97,19 @@ impl DecodedAudioReader {
             target_sample_rate,
             resampler: None,
         })
+    }
+
+    /// Build a reader from already-decoded PCM samples. The samples are assumed
+    /// to already be at `sample_rate`, so no further resampling happens when it
+    /// matches `target_sample_rate`.
+    fn from_samples(buffer: Vec<i16>, sample_rate: u32, target_sample_rate: u32) -> Self {
+        Self {
+            buffer,
+            sample_rate,
+            position: 0,
+            target_sample_rate,
+            resampler: None,
+        }
     }
 }
 
@@ -353,37 +363,19 @@ impl Track for FileTrack {
         let play_id = self.play_id.clone();
         crate::spawn(async move {
             let res = async move {
-                let is_url = path.starts_with("http://") || path.starts_with("https://");
-
-                let extension = if is_url {
-                    path.parse::<Url>()?.path().split('.').last().unwrap_or("").to_string()
-                } else {
-                    path.split('.').last().unwrap_or("").to_string()
-                };
-
-                let cache_key = if is_url {
-                    Some(cache::generate_cache_key(&path, 0, None, None))
-                } else {
-                    None
-                };
-
-                // Open file or download from URL
-                let open_result = if is_url {
-                    crate::media::loader::download_from_url(&path, use_cache).await
-                } else {
-                    File::open(&path)
-                        .map(|f| (f, None))
-                        .map_err(|e| anyhow::anyhow!("filetrack: {}", e))
-                };
-                let (file, content_type) = match open_result {
-                    Ok(result) => result,
+                // Load (and cache) the decoded PCM so we don't re-download or
+                // re-decode the original file on every play.
+                let load_result = crate::media::loader::load_audio_as_pcm_cached(
+                    &path,
+                    sample_rate,
+                    use_cache,
+                    offset_ms,
+                )
+                .await;
+                let samples = match load_result {
+                    Ok(samples) => samples,
                     Err(e) => {
-                        warn!("filetrack: Error opening file: {}", e);
-                        if let Some(key) = cache_key {
-                            if use_cache {
-                                let _ = cache::delete_from_cache(&key).await;
-                            }
-                        }
+                        warn!("filetrack: Error loading audio: {} {}", path, e);
                         event_sender
                             .send(SessionEvent::Error {
                                 track_id: id.clone(),
@@ -406,16 +398,13 @@ impl Track for FileTrack {
                     }
                 };
 
-                // Stream the audio file
-                let stream_result = stream_audio_file(
+                // Stream the decoded PCM (offset already applied during load)
+                let stream_result = stream_pcm_samples(
                     processor_chain,
-                    extension.as_str(),
-                    content_type.as_deref(),
-                    file,
-                    &id,
+                    samples,
                     sample_rate,
+                    &id,
                     packet_duration_ms,
-                    offset_ms,
                     token,
                     paused,
                     packet_sender,
@@ -425,11 +414,6 @@ impl Track for FileTrack {
                 // Handle any streaming errors
                 if let Err(e) = stream_result {
                     warn!("filetrack: Error streaming audio: {}, {}", path, e);
-                    if let Some(key) = cache_key {
-                        if use_cache {
-                            let _ = cache::delete_from_cache(&key).await;
-                        }
-                    }
                     event_sender
                         .send(SessionEvent::Error {
                             track_id: id.clone(),
@@ -473,44 +457,25 @@ impl Track for FileTrack {
     }
 }
 
-// Helper function to stream a WAV or MP3 file
-async fn stream_audio_file(
+// Helper function to stream already-decoded PCM samples
+async fn stream_pcm_samples(
     processor_chain: ProcessorChain,
-    extension: &str,
-    content_type: Option<&str>,
-    file: File,
-    track_id: &str,
+    samples: Vec<i16>,
     target_sample_rate: u32,
+    track_id: &str,
     packet_duration_ms: u32,
-    offset_ms: u32,
     token: CancellationToken,
     paused: Arc<AtomicBool>,
     packet_sender: TrackPacketSender,
 ) -> Result<()> {
-    let start_time = Instant::now();
-    let extension_owned = extension.to_string();
-    let content_type_owned = content_type.map(|s| s.to_string());
-    let reader = tokio::task::spawn_blocking(move || {
-        DecodedAudioReader::from_file(
-            file,
-            &extension_owned,
-            content_type_owned.as_deref(),
-            target_sample_rate,
-        )
-    })
-    .await??;
-    let mut audio_reader = Box::new(reader) as Box<dyn AudioReader>;
+    let reader =
+        DecodedAudioReader::from_samples(samples, target_sample_rate, target_sample_rate);
+    let audio_reader = Box::new(reader) as Box<dyn AudioReader>;
     info!(
-        "filetrack: Load file duration: {:.2} seconds, sample rate: {} Hz, extension: {}",
-        start_time.elapsed().as_secs_f64(),
+        "filetrack: streaming {} decoded samples at {} Hz",
+        audio_reader.buffer_size(),
         audio_reader.sample_rate(),
-        extension
     );
-    if offset_ms > 0 {
-        let offset_samples =
-            (offset_ms as usize * audio_reader.sample_rate() as usize) / 1000;
-        audio_reader.set_position(offset_samples.min(audio_reader.buffer_size()));
-    }
     process_audio_reader(
         processor_chain,
         audio_reader,
@@ -576,6 +541,7 @@ pub fn read_wav_file(path: &str) -> Result<(PcmBuf, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::media::cache;
     use crate::media::cache::ensure_cache_dir;
     use std::io::Write;
     use tokio::sync::{broadcast, mpsc};
@@ -722,15 +688,9 @@ mod tests {
         // Add a delay to ensure the cache file is written
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
-        // Get the cache key and verify it exists
+        // The cache key is derived from the path and the target sample rate; the
+        // cached payload should be the decoded PCM, not the original WAV bytes.
         let cache_key = cache::generate_cache_key(&file_path, 16000, None, None);
-        let wav_data = tokio::fs::read(&file_path).await?;
-
-        // Manually store the file in cache if it's not already there, to make the test more reliable
-        if !cache::is_cached(&cache_key).await? {
-            info!("Cache file not found, manually storing it");
-            cache::store_in_cache(&cache_key, &wav_data).await?;
-        }
 
         // Verify cache exists
         assert!(
@@ -738,6 +698,17 @@ mod tests {
             "Cache file should exist for key: {}",
             cache_key
         );
+
+        // The cached PCM should match the freshly decoded PCM and differ from the
+        // original encoded file.
+        let cached_pcm = cache::retrieve_pcm_from_cache(&cache_key).await?;
+        let decoded_pcm =
+            crate::media::loader::load_audio_as_pcm(&file_path, 16000, false).await?;
+        assert_eq!(
+            cached_pcm, decoded_pcm,
+            "cached PCM should match freshly decoded PCM"
+        );
+        assert!(!cached_pcm.is_empty(), "cached PCM should not be empty");
 
         // Allow the test to pass if packets weren't received
         if !received_packet {

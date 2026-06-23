@@ -3,8 +3,11 @@ use bytes::BytesMut;
 use once_cell::sync::Lazy;
 use sha2::{Digest, Sha256};
 use std::sync::RwLock;
-use std::{io::IoSlice, path::PathBuf};
-use tokio::io::AsyncReadExt;
+use std::{
+    io::{IoSlice, SeekFrom},
+    path::PathBuf,
+};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::{fs::create_dir_all, io::AsyncWriteExt};
 use tracing::{debug, info};
 
@@ -118,6 +121,49 @@ pub async fn store_in_cache_vectored(key: &str, data: &[impl AsRef<[u8]>]) -> Re
     Ok(())
 }
 
+/// Store decoded PCM samples (i16) in the cache as raw little-endian bytes
+pub async fn store_pcm_in_cache(key: &str, samples: &[i16]) -> Result<()> {
+    let mut bytes = Vec::with_capacity(samples.len() * 2);
+    for sample in samples {
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    store_in_cache(key, &bytes).await
+}
+
+/// Retrieve decoded PCM samples (i16) from the cache stored as raw little-endian bytes
+pub async fn retrieve_pcm_from_cache(key: &str) -> Result<Vec<i16>> {
+    retrieve_pcm_from_cache_at(key, 0).await
+}
+
+/// Retrieve decoded PCM samples (i16) from the cache starting at `sample_offset`
+/// samples in, seeking past the skipped bytes instead of reading them.
+pub async fn retrieve_pcm_from_cache_at(key: &str, sample_offset: usize) -> Result<Vec<i16>> {
+    let path = get_cache_path(key)?;
+    let mut file = tokio::fs::File::open(&path).await?;
+    let file_size = file.metadata().await?.len();
+    let byte_offset = ((sample_offset as u64) * 2).min(file_size);
+    if byte_offset > 0 {
+        file.seek(SeekFrom::Start(byte_offset)).await?;
+    }
+
+    let remaining = (file_size - byte_offset) as usize;
+    let mut bytes = Vec::with_capacity(remaining);
+    file.read_to_end(&mut bytes).await?;
+
+    if bytes.len() % 2 != 0 {
+        return Err(anyhow!(
+            "cache: pcm data length {} is not aligned to i16 for key: {}",
+            bytes.len(),
+            key
+        ));
+    }
+    let samples = bytes
+        .chunks_exact(2)
+        .map(|b| i16::from_le_bytes([b[0], b[1]]))
+        .collect();
+    Ok(samples)
+}
+
 /// Retrieve data from the cache
 pub async fn retrieve_from_cache(key: &str) -> Result<Vec<u8>> {
     let path = get_cache_path(key)?;
@@ -183,6 +229,31 @@ mod tests {
         // Test clean cache
         let key2 = generate_cache_key("test_data2", 16000, None, None);
         store_in_cache(&key2, &test_data).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pcm_cache_roundtrip_and_offset() -> Result<()> {
+        let key = generate_cache_key("test_pcm_offset", 16000, None, None);
+        delete_from_cache(&key).await.ok();
+
+        let samples: Vec<i16> = (0..1000i16).collect();
+        store_pcm_in_cache(&key, &samples).await?;
+
+        // Full retrieval matches what we stored.
+        let full = retrieve_pcm_from_cache(&key).await?;
+        assert_eq!(full, samples);
+
+        // Offset retrieval matches slicing the full buffer.
+        let offset = 250;
+        let tail = retrieve_pcm_from_cache_at(&key, offset).await?;
+        assert_eq!(tail, samples[offset..]);
+
+        // Offset past the end yields an empty buffer rather than erroring.
+        let empty = retrieve_pcm_from_cache_at(&key, samples.len() + 100).await?;
+        assert!(empty.is_empty());
+
+        delete_from_cache(&key).await?;
         Ok(())
     }
 
