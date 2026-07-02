@@ -1,3 +1,5 @@
+use crate::media::cache;
+use crate::synthesis::{SynthesisEvent, SynthesisOption};
 use crate::{
     app::AppState,
     call::{
@@ -42,7 +44,8 @@ pub fn call_router() -> Router<AppState> {
         .route("/list", get(list_active_calls))
         .route("/kill/{id}", get(kill_active_call))
         .route("/events/{id}", get(stream_events))
-        .route("/command/{id}", post(send_command));
+        .route("/command/{id}", post(send_command))
+        .route("/precache", post(precache));
     r
 }
 
@@ -528,6 +531,112 @@ pub(crate) async fn send_command(
         Json(serde_json::json!({ "status": "not_found", "id": id })),
     )
         .into_response()
+}
+
+/// Pre-generate and cache TTS audio without an active call.
+///
+/// Accepts a `Tts` command (same shape as `/command/{id}`): it synthesizes the
+/// text and stores the audio under the exact cache key the real `do_tts` would
+/// use. A later `Tts` with the same parameters then hits the cache instead of
+/// regenerating.
+///
+/// NOTE: the cache key is derived from the command parameters. For a cache hit
+/// the real command must use the same effective `option` (provider, samplerate,
+/// speaker, speed) — or pass an explicit `cacheKey`.
+pub(crate) async fn precache(
+    State(state): State<AppState>,
+    Json(command): Json<Command>,
+) -> Response {
+    let result = match command {
+        Command::Tts {
+            text,
+            speaker,
+            option,
+            cache_key,
+            ..
+        } => precache_tts(&state, text, speaker, option, cache_key).await,
+        _ => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({ "status": "error", "error": "precache only accepts tts commands" })),
+            )
+                .into_response();
+        }
+    };
+
+    match result {
+        Ok((cache_key, bytes, existed)) => Json(json!({
+            "status": if existed { "exists" } else { "cached" },
+            "cacheKey": cache_key,
+            "bytes": bytes,
+        }))
+        .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "status": "error", "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// Synthesize `text` and store the audio under the same cache key `do_tts` uses.
+/// Returns (cache_key, bytes_stored, already_existed).
+async fn precache_tts(
+    state: &AppState,
+    text: String,
+    speaker: Option<String>,
+    option: Option<SynthesisOption>,
+    cache_key: Option<String>,
+) -> anyhow::Result<(String, usize, bool)> {
+    let mut opt = option.ok_or_else(|| anyhow::anyhow!("tts precache requires an option"))?;
+    // Fold the top-level speaker into the option (same precedence as do_tts)
+    opt.speaker = speaker.or(opt.speaker);
+    opt.check_default();
+
+    let mut client = state.stream_engine.create_tts_client(false, &opt).await?;
+    // Cache key must match tts.rs::handle_cache exactly.
+    let sample_rate = opt.samplerate.unwrap_or(16000) as u32;
+    let cache_key = cache_key.unwrap_or_else(|| {
+        cache::generate_cache_key(
+            &format!("tts:{}{}", client.provider(), text),
+            sample_rate,
+            opt.speaker.as_ref(),
+            opt.speed,
+        )
+    });
+    if cache::is_cached(&cache_key).await.unwrap_or(false) {
+        return Ok((cache_key, 0, true));
+    }
+
+    let mut stream = client.start().await?;
+    client.synthesize(&text, Some(0), Some(opt.clone())).await?;
+    client.stop().await?;
+
+    let mut chunks: Vec<Bytes> = Vec::new();
+    let mut first_chunk = true;
+    while let Some((_seq, res)) = stream.next().await {
+        match res? {
+            SynthesisEvent::AudioChunk(mut chunk) => {
+                // Strip the 44-byte WAV header off the first chunk (same as tts.rs).
+                if first_chunk {
+                    if chunk.len() > 44 && chunk[..4] == [0x52, 0x49, 0x46, 0x46] {
+                        let _ = chunk.split_to(44);
+                    }
+                    first_chunk = false;
+                }
+                chunks.push(chunk);
+            }
+            SynthesisEvent::Finished => break,
+            _ => {}
+        }
+    }
+    if chunks.is_empty() {
+        return Err(anyhow::anyhow!("tts produced no audio"));
+    }
+    let bytes: usize = chunks.iter().map(|c| c.len()).sum();
+    cache::store_in_cache_vectored(&cache_key, &chunks).await?;
+    info!(cache_key = %cache_key, bytes, "precache: stored tts audio");
+    Ok((cache_key, bytes, false))
 }
 
 trait IntoWsMessage {
