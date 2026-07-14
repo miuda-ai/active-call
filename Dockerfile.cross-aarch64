@@ -17,3 +17,6 @@ ENV CXX=clang++
 ENV PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig
 ENV PKG_CONFIG_SYSROOT_DIR=/usr/aarch64-linux-gnu
 ENV PKG_CONFIG_ALLOW_CROSS=1
+
+# Increase rustc stack size to prevent stack overflow during compilation of complex crates (linux-raw-sys, bindgen output)
+ENV RUST_MIN_STACK=16777216

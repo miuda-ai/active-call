@@ -5,3 +5,6 @@ RUN apt-get update && apt-get install -y \
     cmake \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
+
+# Increase rustc stack size to prevent stack overflow during compilation of complex crates (linux-raw-sys, bindgen output)
+ENV RUST_MIN_STACK=16777216

@@ -263,7 +263,7 @@ async fn test_webrtc_call_workflow() -> Result<()> {
                 clock_rate: 48000,
                 ..Default::default()
             };
-            if let Err(e) = source.send_audio(frame).await {
+            if let Err(e) = source.send_audio(frame) {
                 tracing::error!("Failed to send audio frame {}: {:?}", i, e);
             }
         }

@@ -144,7 +144,7 @@ async fn test_webrtc_vad_link() -> Result<()> {
                 ..Default::default()
             };
 
-            if let Err(e) = source_clone.send_audio(frame).await {
+            if let Err(e) = source_clone.send_audio(frame) {
                 tracing::error!("Failed to send audio frame: {:?}", e);
                 break;
             }

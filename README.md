@@ -145,6 +145,19 @@ enable_srtp   = true
 - [Twilio Elastic SIP Trunking Guide](./docs/twilio_integration.md)
 - [Telnyx SIP Trunking Guide](./docs/telnyx_integration.md)
 
+## Building from Source
+
+```bash
+# rustc may require extra stack when compiling certain crates
+export RUST_MIN_STACK=16777216
+cargo build --release
+```
+
+Or add to your shell profile:
+```bash
+echo 'export RUST_MIN_STACK=16777216' >> ~/.bashrc
+```
+
 ## Environment Variables
 
 ```bash
