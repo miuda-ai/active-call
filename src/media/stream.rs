@@ -282,6 +282,20 @@ impl MediaStream {
         }
     }
 
+    /// Trickle ICE: feed a remote candidate into all ICE-backed tracks.
+    /// Non-ICE tracks no-op via the Track trait default.
+    pub async fn add_ice_candidate(
+        &self,
+        candidate: &str,
+        sdp_mid: Option<&str>,
+        sdp_mline_index: Option<u32>,
+    ) -> Result<()> {
+        for (track, _) in self.tracks.lock().await.values() {
+            track.add_ice_candidate(candidate, sdp_mid, sdp_mline_index)?;
+        }
+        Ok(())
+    }
+
     pub async fn pause_playback(&self, id: TrackId) -> Result<()> {
         self.set_playback_paused(id, true).await
     }

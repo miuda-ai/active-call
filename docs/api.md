@@ -683,6 +683,33 @@ The bridge is a media-only operation. It creates separate internal bridge tracks
 }
 ```
 
+### ICE Commands
+
+#### Add Ice Candidate Command
+**Purpose:** Trickle ICE - feeds a remote ICE candidate into an already-established WebRTC session, instead of waiting for the caller to gather all candidates before sending the offer.
+
+Client -> server only. The server always answers with a fully-gathered candidate set (server-side gathering is fast), so there's no matching server -> client event; this command exists purely so a WebRTC caller can send its offer immediately and stream candidates in as they're found.
+
+**Fields:**
+- `command` (string): Always "addIceCandidate"
+- `candidate` (string): ICE candidate string (as produced by `RTCIceCandidate.candidate` in the browser)
+- `sdpMid` (string, optional): Media stream identification
+- `sdpMLineIndex` (number, optional): Index of the media description this candidate is associated with
+
+```json
+{
+  "command": "addIceCandidate",
+  "candidate": "candidate:842163049 1 udp 1677729535 10.0.0.1 54321 typ host",
+  "sdpMid": "0",
+  "sdpMLineIndex": 0
+}
+```
+
+**Notes:**
+- Only meaningful once the initial offer/answer has already been exchanged (i.e. after `invite`/`accept`).
+- Applies to whichever track on the session is WebRTC-backed; a no-op on other track types.
+- A candidate sent before the PeerConnection exists is rejected with an error.
+
 ### CallOption Object Structure
 
 The `CallOption` object is used in `invite` and `accept` commands and contains the following fields:

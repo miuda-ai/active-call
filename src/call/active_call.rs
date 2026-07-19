@@ -1055,6 +1055,15 @@ impl ActiveCall {
             } => self.do_interrupt(passage.unwrap_or_default()).await,
             Command::History { speaker, text } => self.do_history(speaker, text).await,
             Command::Custom { sender, data } => self.do_custom(sender, data),
+            Command::AddIceCandidate {
+                candidate,
+                sdp_mid,
+                sdp_mline_index,
+            } => {
+                self.media_stream
+                    .add_ice_candidate(&candidate, sdp_mid.as_deref(), sdp_mline_index)
+                    .await
+            }
         }
     }
 

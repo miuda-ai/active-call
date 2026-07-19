@@ -121,6 +121,12 @@ pub enum Command {
         sender: Option<String>,
         data: serde_json::Value,
     },
+    /// Trickle ICE: feed a remote candidate into an already-established session.
+    AddIceCandidate {
+        candidate: String,
+        sdp_mid: Option<String>,
+        sdp_mline_index: Option<u32>,
+    },
 }
 
 /// Routing state for managing stateful load balancing

@@ -13,7 +13,7 @@ use audio_codec::CodecType;
 use bytes::Bytes;
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use rustrtc::{
-    AudioCapability, IceServer, MediaKind, PeerConnection, PeerConnectionEvent,
+    AudioCapability, IceCandidate, IceServer, MediaKind, PeerConnection, PeerConnectionEvent,
     PeerConnectionState, RtcConfiguration, RtpCodecParameters, SdpType, TransportMode,
     config::MediaCapabilities,
     media::{
@@ -867,6 +867,20 @@ impl Track for RtcTrack {
                 _ => {}
             }
         }
+        Ok(())
+    }
+
+    fn add_ice_candidate(
+        &self,
+        candidate: &str,
+        // single audio m-line per track, so unused here
+        _sdp_mid: Option<&str>,
+        _sdp_mline_index: Option<u32>,
+    ) -> Result<()> {
+        let pc = self.peer_connection.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("No PeerConnection available for track {}", self.track_id)
+        })?;
+        pc.add_ice_candidate(IceCandidate::from_sdp(candidate)?)?;
         Ok(())
     }
 }
