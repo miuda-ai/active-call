@@ -25,6 +25,9 @@ pub struct MediaStream {
     pub cancel_token: CancellationToken,
     recorder_option: Mutex<Option<RecorderOption>>,
     tracks: Mutex<HashMap<TrackId, (Box<dyn Track>, DtmfDetector)>>,
+    /// Trickle ICE candidates that arrived before any track existed to feed
+    /// them to. Drained into the next track started.
+    pending_ice_candidates: Mutex<Vec<(String, Option<String>, Option<u32>)>>,
     suppressed_sources: Mutex<HashSet<TrackId>>,
     event_sender: EventSender,
     pub packet_sender: TrackPacketSender,
@@ -81,6 +84,7 @@ impl MediaStreamBuilder {
             cancel_token,
             recorder_option: Mutex::new(self.recorder_config),
             tracks,
+            pending_ice_candidates: Mutex::new(Vec::new()),
             suppressed_sources: Mutex::new(HashSet::new()),
             event_sender: self.event_sender,
             packet_sender: track_packet_sender,
@@ -234,6 +238,21 @@ impl MediaStream {
             Ok(_) => {
                 info!(session_id = self.id, track_id = track.id(), "track started");
                 let track_id = track.id().clone();
+                if track_id.as_str() == self.id.as_str() {
+                    let pending = std::mem::take(&mut *self.pending_ice_candidates.lock().await);
+                    for (candidate, sdp_mid, sdp_mline_index) in pending {
+                        if let Err(e) =
+                            track.add_ice_candidate(&candidate, sdp_mid.as_deref(), sdp_mline_index)
+                        {
+                            warn!(
+                                session_id = self.id,
+                                track_id = track.id(),
+                                "failed to apply buffered ICE candidate: {}",
+                                e
+                            );
+                        }
+                    }
+                }
                 self.tracks
                     .lock()
                     .await
@@ -280,6 +299,29 @@ impl MediaStream {
                 MuteProcessor::unmute_track(track.as_mut());
             }
         }
+    }
+
+    /// Trickle ICE: feed a remote candidate into the ICE-backed (WebRTC)
+    /// track, if it's up yet, or buffer it for `update_track` to replay
+    /// otherwise.
+    pub async fn add_ice_candidate(
+        &self,
+        candidate: &str,
+        sdp_mid: Option<&str>,
+        sdp_mline_index: Option<u32>,
+    ) -> Result<()> {
+        let tracks = self.tracks.lock().await;
+        if let Some((track, _)) = tracks.get(self.id.as_str()) {
+            track.add_ice_candidate(candidate, sdp_mid, sdp_mline_index)?;
+            return Ok(());
+        }
+        drop(tracks);
+        self.pending_ice_candidates.lock().await.push((
+            candidate.to_string(),
+            sdp_mid.map(|s| s.to_string()),
+            sdp_mline_index,
+        ));
+        Ok(())
     }
 
     pub async fn pause_playback(&self, id: TrackId) -> Result<()> {
@@ -370,7 +412,6 @@ impl MediaStream {
             Err(anyhow::anyhow!("Track {} not found", track_id))
         }
     }
-
 }
 
 #[derive(Clone)]
@@ -484,7 +525,12 @@ impl MediaStream {
 
             for (track, dtmf_detector) in tracks.values_mut() {
                 if track.id() == &packet.track_id {
-                    if let Samples::RTP { payload_type, payload, .. } = &packet.samples {
+                    if let Samples::RTP {
+                        payload_type,
+                        payload,
+                        ..
+                    } = &packet.samples
+                    {
                         if let Some(digit) = dtmf_detector.detect_rtp(*payload_type, payload) {
                             debug!(track_id = track.id(), digit, "DTMF detected");
                             event_sender

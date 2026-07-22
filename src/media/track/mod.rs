@@ -91,4 +91,14 @@ pub trait Track: Send + Sync {
         self.stop().await
     }
     async fn send_packet(&mut self, packet: &AudioFrame) -> Result<()>;
+    /// Feed a remotely-gathered ICE candidate into this track's PeerConnection.
+    /// Default no-op for track types that aren't backed by ICE (file/tts/websocket tracks).
+    fn add_ice_candidate(
+        &self,
+        _candidate: &str,
+        _sdp_mid: Option<&str>,
+        _sdp_mline_index: Option<u32>,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
