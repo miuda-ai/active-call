@@ -549,6 +549,11 @@ pub struct ActiveCall {
     /// Answer prepared during ringing (SDP + running track + dialog); taken
     /// by accept/reject. Shared so post-serve `cleanup` can still reject.
     pub ready_to_answer: ArcSwapOption<ReadyAnswer>,
+    /// Answer prepared for the underlying SIP dialog of non-SIP call types
+    /// (WebSocket/Webrtc); taken by accept, rejected on reject/cleanup.
+    /// Same slot family as `ready_to_answer`: lock-free set/take on the
+    /// actor path, with ownership recoverable from `cleanup`.
+    pub pending_sip_answer: ArcSwapOption<PendingSipAnswer>,
     /// Cancel this token to hang up only the refer call, leaving the main call alive.
     pub refer_call_token: ArcSwapOption<CancellationToken>,
     /// Pending wait-input timeout set by the last Tts/Play command.
@@ -616,6 +621,15 @@ impl ActiveCall {
         self.ready_to_answer.load().is_some()
     }
 
+    /// Prepared 200 OK for the underlying SIP dialog of non-SIP call types.
+    pub fn set_pending_sip_answer(&self, pending: PendingSipAnswer) {
+        self.pending_sip_answer.store(Some(Arc::new(pending)));
+    }
+
+    pub fn take_pending_sip_answer(&self) -> Option<Arc<PendingSipAnswer>> {
+        self.pending_sip_answer.swap(None)
+    }
+
     /// Cancel token that hangs up only the refer leg, leaving the main call
     /// alive; set by `do_refer`, taken by hangup.
     pub fn take_refer_call_token(&self) -> Option<CancellationToken> {
@@ -674,6 +688,15 @@ pub struct ReadyAnswer {
     pub answer: String,
     pub track: PendingCallerTrack,
     pub dialog: InviteDialog,
+}
+
+/// Answer prepared for the underlying inbound SIP dialog of a non-SIP call
+/// type (WebSocket/Webrtc): the 200 OK SDP, the dialog to accept, and the RTP
+/// track that bridges the SIP leg into the media stream.
+pub struct PendingSipAnswer {
+    pub answer: String,
+    pub dialog: InviteDialog,
+    pub track: Box<dyn Track>,
 }
 
 pub struct ActiveCallGuard {
@@ -798,6 +821,7 @@ impl ActiveCall {
             tts_handle: ArcSwapOption::new(None),
             refer_leg: ArcSwapOption::new(None),
             ready_to_answer: ArcSwapOption::new(None),
+            pending_sip_answer: ArcSwapOption::new(None),
             refer_call_token: ArcSwapOption::new(None),
             wait_input_timeout: ArcSwapOption::new(None),
             pending_asr_resume: ArcSwapOption::new(None),
@@ -1430,7 +1454,48 @@ impl ActiveCall {
                 }
             }
         }
-        return Ok(());
+
+        // Non-SIP call types (WebSocket/Webrtc) created by an inbound SIP
+        // INVITE never go through `ready_to_answer`; the underlying dialog is
+        // answered here. Without this the carrier leg stays in `Trying` until
+        // the far end times out and CANCELs (production: VOS3000 20s timeout).
+        if let Some(pending) = self.take_pending_sip_answer() {
+            let Ok(pending) = Arc::try_unwrap(pending) else {
+                warn!(
+                    session_id = self.session_id,
+                    "pending sip answer held elsewhere; skipping sip accept"
+                );
+                return Ok(());
+            };
+            let headers = vec![rsipstack::rsip::Header::ContentType(
+                "application/sdp".to_string().into(),
+            )];
+            match pending
+                .dialog
+                .accept(Some(headers), Some(pending.answer.as_bytes().to_vec()))
+            {
+                Ok(_) => {
+                    info!(
+                        session_id = self.session_id,
+                        "answered underlying sip dialog"
+                    );
+                    self.leg().update_progress(|p| {
+                        p.answer = Some(pending.answer.clone());
+                        p.answer_time.get_or_insert_with(Utc::now);
+                    });
+                    // Register the SIP leg so customer audio is bridged with
+                    // the caller track (and later the refer leg).
+                    self.media_stream.update_track(pending.track, None).await;
+                }
+                Err(e) => {
+                    warn!(
+                        session_id = self.session_id,
+                        "failed to accept underlying sip dialog: {}", e
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn do_reject(
@@ -1438,6 +1503,18 @@ impl ActiveCall {
         code: Option<rsipstack::rsip::StatusCode>,
         reason: Option<String>,
     ) -> Result<()> {
+        if let Some(pending) = self.take_pending_sip_answer() {
+            info!(
+                session_id = self.session_id,
+                ?reason,
+                ?code,
+                "rejecting underlying sip dialog"
+            );
+            if let Ok(pending) = Arc::try_unwrap(pending) {
+                pending.dialog.reject(code.clone(), reason.clone()).ok();
+                self.invitation.dialog_layer.remove_dialog(&pending.dialog.id());
+            }
+        }
         match self
             .invitation
             .find_dialog_id_by_session_id(&self.session_id)
@@ -2268,6 +2345,22 @@ impl ActiveCall {
                 Some("handler disconnected".to_string()),
             )
             .await;
+        }
+        // A prepared-but-unaccepted SIP answer (non-SIP call types) must not
+        // leave the carrier leg ringing forever.
+        if let Some(pending) = self.take_pending_sip_answer() {
+            if let Ok(pending) = Arc::try_unwrap(pending) {
+                pending
+                    .dialog
+                    .reject(
+                        Some(rsipstack::rsip::StatusCode::Decline),
+                        Some("handler disconnected".to_string()),
+                    )
+                    .ok();
+                self.invitation
+                    .dialog_layer
+                    .remove_dialog(&pending.dialog.id());
+            }
         }
         self.tts_handle.store(None);
         self.media_stream.cleanup().await.ok();

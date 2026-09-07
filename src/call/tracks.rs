@@ -27,9 +27,45 @@ use rsipstack::dialog::invitation::InviteOption;
 use rsipstack::rsip::prelude::HeadersExt;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
+use super::active_call::PendingSipAnswer;
 use super::sip::{DialogStateReceiverGuard, InviteDialogStates};
+
+/// Track id of the SIP leg of a non-SIP call type (WebSocket/Webrtc) that was
+/// created by an inbound SIP INVITE. Must stay distinct from the caller track
+/// (`session_id`) and the refer leg (`server_side_track_id`) so the three
+/// legs coexist in the media stream's full-mesh forwarding.
+const SIP_LEG_TRACK_ID: &str = "sip-leg-track";
+
+/// Restrict a track's codec capabilities to codecs the remote offer actually
+/// advertises. rustrtc's `create_answer` otherwise emits its default
+/// capability set (e.g. opus-only), which intersects to an *empty* codec list
+/// against a plain PCMU/PCMA SIP offer (`intersect_answer` then produces an
+/// unparseable `m=` line). Configured codecs win when they overlap the offer;
+/// the offer wins when they don't.
+fn restrict_codecs_to_offer(rtc_config: &mut RtcTrackConfig, offer: &str) {
+    let offer_codecs: Vec<CodecType> = offer
+        .lines()
+        .filter_map(|line| {
+            let value = line.trim().strip_prefix("a=rtpmap:")?;
+            crate::media::negotiate::parse_rtpmap(value)
+                .ok()
+                .map(|(_, codec, ..)| codec)
+        })
+        .collect();
+    if offer_codecs.is_empty() {
+        return;
+    }
+    if rtc_config.codecs.is_empty() {
+        rtc_config.codecs = offer_codecs;
+    } else {
+        rtc_config.codecs.retain(|c| offer_codecs.contains(c));
+        if rtc_config.codecs.is_empty() {
+            rtc_config.codecs = offer_codecs;
+        }
+    }
+}
 
 /// Everything needed to place one outgoing INVITE (main leg or refer leg).
 pub(super) struct OutgoingLeg {
@@ -141,6 +177,127 @@ impl ActiveCall {
         )
     }
 
+    /// For non-SIP call types (WebSocket/Webrtc) whose session was created by
+    /// an inbound SIP INVITE, build the SIP leg's answering track and remember
+    /// the prepared 200 OK. `do_accept` sends the answer and registers the
+    /// track, so the carrier leg is actually established instead of sitting in
+    /// `Trying` until the far end times out (production: VOS3000 CANCELs the
+    /// unanswered INVITE after 20s). No-op when there is no pending dialog or
+    /// the INVITE carries no offer.
+    pub(super) async fn try_prepare_pending_sip_answer(
+        &self,
+        option: &CallOption,
+    ) -> Result<()> {
+        let Some(dialog_id) = self
+            .invitation
+            .find_dialog_id_by_session_id(&self.session_id)
+        else {
+            return Ok(());
+        };
+        let Some(pending_dialog) = self.invitation.get_pending_call(&dialog_id) else {
+            return Ok(());
+        };
+
+        let initial_request = pending_dialog.dialog.initial_request();
+        let offer = String::from_utf8_lossy(initial_request.body()).to_string();
+        debug!(
+            session_id = self.session_id,
+            offer = %offer,
+            "preparing sip leg answer"
+        );
+        if offer.trim().is_empty() {
+            warn!(
+                session_id = self.session_id,
+                "inbound SIP dialog has no SDP offer; skipping sip leg preparation"
+            );
+            return Ok(());
+        }
+
+        // The SIP leg needs its own track id and SSRC: `session_id` is the
+        // caller (WebSocket/Webrtc) track and `server_side_track_id` belongs
+        // to the refer leg.
+        let track_id: TrackId = SIP_LEG_TRACK_ID.to_string();
+        let ssrc = rand::random::<u32>();
+
+        let mut rtc_config = RtcTrackConfig::default();
+        let use_srtp = option
+            .sip
+            .as_ref()
+            .and_then(|s| s.enable_srtp)
+            .or(self.app_state.config.enable_srtp)
+            .unwrap_or(false);
+        rtc_config.mode = if use_srtp {
+            rustrtc::TransportMode::Srtp
+        } else {
+            rustrtc::TransportMode::Rtp
+        };
+        self.rtc_apply_codecs(&mut rtc_config);
+        if rtc_config.preferred_codec.is_none() {
+            rtc_config.preferred_codec = Some(self.track_config.codec);
+        }
+        rtc_config.rtp_port_range = self
+            .app_state
+            .config
+            .rtp_start_port
+            .zip(self.app_state.config.rtp_end_port);
+        self.rtc_apply_network(&mut rtc_config);
+        self.rtc_apply_latching(&mut rtc_config);
+        restrict_codecs_to_offer(&mut rtc_config, &offer);
+
+        let mut sip_track = RtcTrack::new(
+            self.cancel_token.child_token(),
+            track_id.clone(),
+            self.track_config.clone(),
+            rtc_config,
+        )
+        .with_ssrc(ssrc);
+        sip_track.create().await?;
+
+        let timeout = option.handshake_timeout.map(|t| Duration::from_secs(t));
+        let answer = sip_track
+            .handshake(offer, timeout)
+            .await
+            .map_err(|e| anyhow::anyhow!("sip leg handshake failed: {e}"))?;
+
+        // Drive the incoming dialog's state machine: hangs the dialog up when
+        // the call ends, and ends cleanly on a far-end BYE/CANCEL.
+        let states = InviteDialogStates::new(
+            false,
+            self.session_id.clone(),
+            track_id.clone(),
+            self.event_sender.clone(),
+            self.media_stream.clone(),
+            self.leg(),
+            self.cancel_token.clone(),
+            None,
+        );
+        let hangup_headers = option
+            .sip
+            .as_ref()
+            .and_then(|s| s.hangup_headers.as_ref())
+            .map(crate::sip_util::sip_headers_from_map);
+        let mut client_dialog_handler = DialogStateReceiverGuard::new(
+            self.invitation.dialog_layer.clone(),
+            pending_dialog.state_receiver,
+            hangup_headers,
+        );
+        crate::spawn(async move {
+            client_dialog_handler.process_dialog(states).await;
+        });
+
+        info!(
+            session_id = self.session_id,
+            track_id, "prepared sip leg answer for non-sip call type"
+        );
+
+        self.set_pending_sip_answer(PendingSipAnswer {
+            answer,
+            dialog: pending_dialog.dialog,
+            track: Box::new(sip_track),
+        });
+        Ok(())
+    }
+
     /// Per-call ambiance option merged over the global config.
     fn merged_ambiance(
         &self,
@@ -158,6 +315,7 @@ impl ActiveCall {
         track_id: TrackId,
         ssrc: u32,
         enable_srtp: Option<bool>,
+        offer: Option<&str>,
     ) -> Result<RtcTrack> {
         let mut rtc_config = RtcTrackConfig::default();
         // Per-call flag takes precedence over global config.
@@ -171,6 +329,9 @@ impl ActiveCall {
         };
 
         self.rtc_apply_codecs(&mut rtc_config);
+        if let Some(offer) = offer {
+            restrict_codecs_to_offer(&mut rtc_config, offer);
+        }
 
         if rtc_config.preferred_codec.is_none() {
             rtc_config.preferred_codec = Some(self.track_config.codec.clone());
@@ -298,11 +459,23 @@ impl ActiveCall {
         );
 
         let track = match self.call_type {
-            ActiveCallType::Webrtc => Some(self.create_webrtc_track().await?),
+            ActiveCallType::Webrtc => {
+                let track = self.create_webrtc_track().await?;
+                // The session may be backed by a ringing inbound SIP dialog;
+                // prepare its answer so do_accept establishes the carrier leg.
+                self.try_prepare_pending_sip_answer(option).await?;
+                Some(track)
+            }
             ActiveCallType::WebSocket => {
                 let audio_receiver = self.audio_receiver.lock().unwrap().take();
                 if let Some(receiver) = audio_receiver {
-                    Some(self.create_websocket_track(receiver).await?)
+                    let track = self.create_websocket_track(receiver).await?;
+                    // The session may be backed by a ringing inbound SIP
+                    // dialog; prepare its answer so do_accept establishes the
+                    // carrier leg (otherwise it stays in Trying until the far
+                    // end CANCELs).
+                    self.try_prepare_pending_sip_answer(option).await?;
+                    Some(track)
                 } else {
                     None
                 }
@@ -568,7 +741,7 @@ impl ActiveCall {
         let ssrc = out.leg.ssrc;
         let per_call_srtp = out.call_option.sip.as_ref().and_then(|s| s.enable_srtp);
         let rtp_track = self
-            .create_rtp_track(track_id.clone(), ssrc, per_call_srtp)
+            .create_rtp_track(track_id.clone(), ssrc, per_call_srtp, None)
             .await
             .map_err(|e| rsipstack::Error::Error(e.to_string()))?;
 
@@ -798,6 +971,7 @@ impl ActiveCall {
             rtc_config.ice_servers = self.app_state.config.ice_servers.clone();
             self.rtc_apply_network(&mut rtc_config);
             self.rtc_apply_latching(&mut rtc_config);
+            restrict_codecs_to_offer(&mut rtc_config, &offer);
 
             let webrtc_track = RtcTrack::new(
                 self.cancel_token.child_token(),
@@ -811,7 +985,12 @@ impl ActiveCall {
         } else {
             let per_call_srtp = option.sip.as_ref().and_then(|s| s.enable_srtp);
             let rtp_track = self
-                .create_rtp_track(self.session_id.clone(), self.ssrc, per_call_srtp)
+                .create_rtp_track(
+                    self.session_id.clone(),
+                    self.ssrc,
+                    per_call_srtp,
+                    Some(&offer),
+                )
                 .await?;
             Box::new(rtp_track) as Box<dyn Track>
         };
