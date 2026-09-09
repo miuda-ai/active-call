@@ -357,11 +357,7 @@ impl MediaStream {
 
     pub async fn update_track(&self, mut track: Box<dyn Track>, play_id: Option<String>) {
         self.remove_track(track.id(), false).await;
-        if self.recorder_option.lock().await.is_some() {
-            track.append_processor(Box::new(RecorderProcessor::new(
-                self.recorder_sender.clone(),
-            )));
-        }
+        self.attach_recorder_tap(&mut track).await;
         match track
             .start(self.event_sender.clone(), self.packet_sender.clone())
             .await
@@ -587,10 +583,12 @@ impl MediaStream {
             info!(
                 session_id = session_id_clone,
                 sample_rate = recorder_option.samplerate,
+                native_samplerate = recorder_option.native_samplerate.unwrap_or(false),
                 ptime = recorder_option.ptime,
                 "start recorder",
             );
 
+            let native = recorder_option.native_samplerate.unwrap_or(false);
             let recorder_handle = crate::spawn(async move {
                 let recorder_file = recorder_option.recorder_file.clone();
                 let recorder =
@@ -611,14 +609,37 @@ impl MediaStream {
             *self.recorder_handle.lock().await = Some(recorder_handle);
             self.recording_active.store(true, Ordering::SeqCst);
 
-            // Inject RecorderProcessor into tracks that were added before the recorder started
+            // Inject the recorder tap into tracks that were added before the
+            // recorder started. `set_raw_tap` replaces any previous tap, so
+            // this stays idempotent.
             for (track, _) in self.tracks.lock().await.values_mut() {
-                track.insert_processor(Box::new(RecorderProcessor::new(
-                    self.recorder_sender.clone(),
-                )));
+                if native {
+                    track.set_raw_tap(Some(self.recorder_sender.clone()));
+                } else if !track.processor_chain().has_processor::<RecorderProcessor>() {
+                    track.insert_processor(Box::new(RecorderProcessor::new(
+                        self.recorder_sender.clone(),
+                    )));
+                }
             }
         }
         Ok(())
+    }
+
+    /// Attach the recorder tap to a track according to the recorder mode:
+    /// native-samplerate mode mirrors pre-resample frames via the chain's
+    /// raw tap, otherwise a post-pipeline RecorderProcessor is appended.
+    /// No-op when no recorder is configured.
+    async fn attach_recorder_tap(&self, track: &mut Box<dyn Track>) {
+        let Some(option) = self.recorder_option.lock().await.clone() else {
+            return;
+        };
+        if option.native_samplerate.unwrap_or(false) {
+            track.set_raw_tap(Some(self.recorder_sender.clone()));
+        } else {
+            track.append_processor(Box::new(RecorderProcessor::new(
+                self.recorder_sender.clone(),
+            )));
+        }
     }
 
     pub async fn set_track_refer(&self, track_id: &TrackId, refer: Option<bool>) {

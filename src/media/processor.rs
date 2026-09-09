@@ -5,6 +5,7 @@ use crate::media::{AudioFrame, Samples, SourcePacket};
 use anyhow::Result;
 use std::any::Any;
 use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
 
 pub trait Processor: Send + Sync + Any {
     fn process_frame(&mut self, frame: &mut AudioFrame) -> Result<()>;
@@ -56,6 +57,11 @@ pub struct ProcessorChain {
     pub codec: TrackCodec,
     sample_rate: u32,
     pub force_decode: bool,
+    /// Optional raw tap: when set, frames are mirrored to this channel at
+    /// their native (pre-resample) sample rate right after decoding, before
+    /// the pipeline normalizes them to `INTERNAL_SAMPLERATE`. Used by the
+    /// native-samplerate recorder.
+    pub raw_tap: Option<mpsc::UnboundedSender<AudioFrame>>,
 }
 
 impl ProcessorChain {
@@ -65,6 +71,7 @@ impl ProcessorChain {
             codec: TrackCodec::new(),
             sample_rate: INTERNAL_SAMPLERATE,
             force_decode: true,
+            raw_tap: None,
         }
     }
     pub fn insert_processor(&mut self, processor: Box<dyn Processor>) {
@@ -88,7 +95,7 @@ impl ProcessorChain {
 
     pub fn process_frame(&mut self, frame: &mut AudioFrame) -> Result<()> {
         let mut processors = self.processors.lock().unwrap();
-        if !self.force_decode && processors.is_empty() {
+        if !self.force_decode && processors.is_empty() && self.raw_tap.is_none() {
             return Ok(());
         }
         match &mut frame.samples {
@@ -99,7 +106,7 @@ impl ProcessorChain {
             } => {
                 if TrackCodec::is_audio(*payload_type) {
                     let (decoded_sample_rate, channels, samples) =
-                        self.codec.decode(*payload_type, &payload, self.sample_rate);
+                        self.codec.decode(*payload_type, &payload);
                     let src_packet = SourcePacket {
                         sequence_number: *sequence_number,
                         payload_type: *payload_type,
@@ -112,6 +119,26 @@ impl ProcessorChain {
                 }
             }
             _ => {}
+        }
+
+        // Mirror the frame to the raw tap at its native sample rate, before
+        // the pipeline resamples it to INTERNAL_SAMPLERATE.
+        if let Some(tap) = &self.raw_tap
+            && let Samples::PCM { samples } = &frame.samples
+            && !samples.is_empty()
+            && frame.sample_rate > 0
+        {
+            let mut raw = frame.clone();
+            raw.src_packet = None;
+            let mono = match &mut raw.samples {
+                Samples::PCM { samples } => samples,
+                _ => unreachable!("checked PCM above"),
+            };
+            if raw.channels == 2 {
+                convert_to_mono(mono, 2);
+                raw.channels = 1;
+            }
+            let _ = tap.send(raw);
         }
 
         if let Samples::PCM { samples } = &mut frame.samples {

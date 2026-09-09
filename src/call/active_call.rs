@@ -1293,6 +1293,10 @@ impl ActiveCall {
                 samplerate: recorder_samplerate,
                 ptime: recorder_ptime,
                 format: Some(format),
+                native_samplerate: Some(
+                    recorder_option.native_samplerate.unwrap_or(false)
+                        || self.app_state.config.recorder_native_samplerate(),
+                ),
             };
             recorder_config.ensure_path_extension(format);
             Some(recorder_config)

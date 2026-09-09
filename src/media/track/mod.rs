@@ -75,6 +75,12 @@ pub trait Track: Send + Sync {
     fn append_processor(&mut self, processor: Box<dyn Processor>) {
         self.processor_chain().append_processor(processor);
     }
+    /// Attach a raw-tap receiver that mirrors inbound frames at their native
+    /// (pre-resample) sample rate, used by the native-samplerate recorder.
+    /// Setting `None` detaches an existing tap.
+    fn set_raw_tap(&mut self, tap: Option<mpsc::UnboundedSender<AudioFrame>>) {
+        self.processor_chain().raw_tap = tap;
+    }
     async fn handshake(&mut self, offer: String, timeout: Option<Duration>) -> Result<String>;
     async fn update_remote_description(&mut self, answer: &String) -> Result<()>;
     async fn update_remote_description_force(&mut self, answer: &String) -> Result<()> {

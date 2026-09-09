@@ -1231,3 +1231,106 @@ async fn perf_forward_fanout_ambiance_on_vs_off() -> Result<()> {
 
     Ok(())
 }
+
+// End-to-end native-samplerate recording: tracks wired through the chain raw
+// tap must produce a stereo WAV whose header records the detected native rate
+// (8 kHz) while the 16 kHz callee leg gets resampled into the same file.
+#[tokio::test]
+async fn test_stream_recorder_native_samplerate() -> Result<()> {
+    use crate::media::AudioFrame;
+
+    let event_sender = crate::event::create_event_sender();
+    let temp_dir = tempdir()?;
+    let file_path = temp_dir.path().join("native_recording.wav");
+    let stream = Arc::new(
+        MediaStreamBuilder::new(event_sender)
+            .with_id("caller-track".to_string())
+            .with_recorder_config(RecorderOption {
+                recorder_file: file_path.to_string_lossy().to_string(),
+                native_samplerate: Some(true),
+                ..Default::default()
+            })
+            .build(),
+    );
+
+    // The track whose id equals the stream id is the caller leg (channel 0).
+    stream
+        .update_track(Box::new(TestTrack::new("caller-track".to_string())), None)
+        .await;
+    stream
+        .update_track(Box::new(TestTrack::new("callee-track".to_string())), None)
+        .await;
+
+    let stream_clone = stream.clone();
+    let handle = tokio::spawn(async move {
+        stream_clone.serve().await.ok();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let packet_sender = stream.packet_sender.clone();
+
+    // Caller leg: 8 kHz PCM (e.g. decoded from PCMU).
+    for i in 0..5 {
+        let samples: Vec<i16> = (0..80) // 10ms @ 8kHz
+            .map(|j| {
+                let t = (i * 80 + j) as f32 / 8000.0;
+                ((t * 440.0 * 2.0 * std::f32::consts::PI).sin() * 16384.0) as i16
+            })
+            .collect();
+        packet_sender
+            .send(AudioFrame {
+                track_id: "caller-track".to_string(),
+                timestamp: (i * 10) as u64,
+                samples: Samples::PCM { samples },
+                sample_rate: 8000,
+                channels: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Callee leg: 16 kHz PCM (e.g. G722/TTS), must be resampled to 8 kHz.
+    for i in 0..5 {
+        let samples: Vec<i16> = (0..160) // 10ms @ 16kHz
+            .map(|j| {
+                let t = (i * 160 + j) as f32 / 16000.0;
+                ((t * 880.0 * 2.0 * std::f32::consts::PI).sin() * 16384.0) as i16
+            })
+            .collect();
+        packet_sender
+            .send(AudioFrame {
+                track_id: "callee-track".to_string(),
+                timestamp: (i * 10) as u64,
+                samples: Samples::PCM { samples },
+                sample_rate: 16000,
+                channels: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    stream.cleanup().await?;
+    handle.abort();
+
+    assert!(file_path.exists(), "recording file was not created");
+    let reader = hound::WavReader::open(&file_path)?;
+    let spec = reader.spec();
+    assert_eq!(
+        spec.sample_rate, 8000,
+        "WAV header must record the native rate"
+    );
+    assert_eq!(spec.channels, 2);
+    assert_eq!(spec.bits_per_sample, 16);
+    let frames = reader.len();
+    assert!(frames > 0, "recording has no samples");
+    println!(
+        "stream native recording: {} frames ({:.0}ms @ 8kHz)",
+        frames,
+        frames as f64 * 1000.0 / 8000.0
+    );
+
+    Ok(())
+}

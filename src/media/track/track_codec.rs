@@ -95,12 +95,10 @@ impl TrackCodec {
         }
     }
 
-    pub fn decode(
-        &mut self,
-        payload_type: u8,
-        payload: &[u8],
-        target_sample_rate: u32,
-    ) -> (u32, u16, PcmBuf) {
+    /// Decode an RTP payload into PCM at the codec's native sample rate.
+    /// Returns `(native_sample_rate, channels, samples)`; resampling to the
+    /// pipeline rate is the caller's responsibility (see ProcessorChain).
+    pub fn decode(&mut self, payload_type: u8, payload: &[u8]) -> (u32, u16, PcmBuf) {
         let codec = self
             .payload_type_map
             .read()
@@ -149,11 +147,7 @@ impl TrackCodec {
             _ => (8000, 1),
         };
 
-        (
-            target_sample_rate,
-            channels,
-            self.resample(pcm, in_rate, target_sample_rate),
-        )
+        (in_rate, channels, pcm)
     }
 
     pub fn resample(&mut self, pcm: PcmBuf, in_rate: u32, out_rate: u32) -> PcmBuf {

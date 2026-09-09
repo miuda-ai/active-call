@@ -140,6 +140,10 @@ pub struct RecordingPolicy {
     pub path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<RecorderFormat>,
+    /// Record at the source's native sample rate instead of resampling to
+    /// 16 kHz. The actual rate is detected from the caller leg's codec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_samplerate: Option<bool>,
 }
 
 impl RecordingPolicy {
@@ -536,6 +540,13 @@ impl Config {
             .as_ref()
             .map(|policy| policy.recorder_format())
             .unwrap_or_default()
+    }
+
+    pub fn recorder_native_samplerate(&self) -> bool {
+        self.recording
+            .as_ref()
+            .and_then(|policy| policy.native_samplerate)
+            .unwrap_or(false)
     }
 
     pub fn ensure_recording_defaults(&mut self) -> bool {

@@ -8,6 +8,18 @@ use tempfile::tempdir;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+fn verify_wav_file_with_rate(path: &Path, expected_rate: u32) -> Result<u32> {
+    let reader = hound::WavReader::open(path)?;
+    let spec = reader.spec();
+    assert_eq!(spec.channels, 2, "expected stereo recording");
+    assert_eq!(spec.sample_rate, expected_rate, "unexpected sample rate");
+    assert_eq!(spec.bits_per_sample, 16);
+    assert_eq!(spec.sample_format, hound::SampleFormat::Int);
+    let len = reader.len();
+    assert!(len > 0, "WAV file has no samples");
+    Ok(len)
+}
+
 #[tokio::test]
 async fn test_recorder() -> Result<()> {
     // Setup
@@ -404,5 +416,337 @@ async fn test_recorder_200ms_timing() -> Result<()> {
     verify_wav_file(&file_path)?;
 
     println!("200ms timing test completed successfully");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_recorder_native_samplerate_8k() -> Result<()> {
+    // Native-samplerate mode: both legs decoded from PCMU (8 kHz). The WAV
+    // header must record 8 kHz instead of the 16 kHz pipeline rate.
+    let temp_dir = tempdir()?;
+    let file_path = temp_dir.path().join("test_native_8k.wav");
+    let file_path_clone = file_path.clone();
+    let cancel_token = CancellationToken::new();
+    let config = RecorderOption {
+        native_samplerate: Some(true),
+        ..Default::default()
+    };
+
+    let recorder = Arc::new(Recorder::new(
+        cancel_token.clone(),
+        "caller".to_string(),
+        config,
+    ));
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    let recorder_clone = recorder.clone();
+    let recorder_handle =
+        tokio::spawn(async move { recorder_clone.process_recording(&file_path_clone, rx).await });
+
+    for i in 0..6 {
+        let caller_samples: PcmBuf = (0..80) // 10ms @ 8kHz
+            .map(|j| {
+                let t = (i * 80 + j) as f32 / 8000.0;
+                ((t * 440.0 * 2.0 * std::f32::consts::PI).sin() * 16384.0) as Sample
+            })
+            .collect();
+        let callee_samples: PcmBuf = (0..80)
+            .map(|j| {
+                let t = (i * 80 + j) as f32 / 8000.0;
+                ((t * 880.0 * 2.0 * std::f32::consts::PI).sin() * 16384.0) as Sample
+            })
+            .collect();
+
+        tx.send(AudioFrame {
+            track_id: "caller".to_string(),
+            samples: Samples::PCM {
+                samples: caller_samples,
+            },
+            timestamp: (i * 10) as u64,
+            sample_rate: 8000,
+            channels: 1,
+            ..Default::default()
+        })?;
+        tx.send(AudioFrame {
+            track_id: "callee".to_string(),
+            samples: Samples::PCM {
+                samples: callee_samples,
+            },
+            timestamp: (i * 10) as u64,
+            sample_rate: 8000,
+            channels: 1,
+            ..Default::default()
+        })?;
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+
+    recorder.stop_recording()?;
+    recorder_handle.await??;
+
+    assert!(file_path.exists());
+    let frames = verify_wav_file_with_rate(&file_path, 8000)?;
+    let duration_ms = frames as f64 * 1000.0 / 8000.0;
+    assert!(
+        (40.0..=3000.0).contains(&duration_ms),
+        "unexpected recording duration: {}ms",
+        duration_ms
+    );
+    println!(
+        "native 8k recording: {} frames ({:.0}ms)",
+        frames, duration_ms
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_recorder_native_samplerate_mixed_rates() -> Result<()> {
+    // Mixed rates: callee leg at 16 kHz (e.g. G722/TTS) while the caller leg
+    // is 8 kHz (PCMU). Callee frames arriving before the first caller frame
+    // must be buffered, then resampled to the detected 8 kHz target.
+    let temp_dir = tempdir()?;
+    let file_path = temp_dir.path().join("test_native_mixed.wav");
+    let file_path_clone = file_path.clone();
+    let cancel_token = CancellationToken::new();
+    let config = RecorderOption {
+        native_samplerate: Some(true),
+        ..Default::default()
+    };
+
+    let recorder = Arc::new(Recorder::new(
+        cancel_token.clone(),
+        "caller".to_string(),
+        config,
+    ));
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    let recorder_clone = recorder.clone();
+    let recorder_handle =
+        tokio::spawn(async move { recorder_clone.process_recording(&file_path_clone, rx).await });
+
+    // Callee frames (16 kHz) arrive first: they go to the pending buffer.
+    for i in 0..3 {
+        let callee_samples: PcmBuf = (0..160) // 10ms @ 16kHz
+            .map(|j| {
+                let t = (i * 160 + j) as f32 / 16000.0;
+                ((t * 880.0 * 2.0 * std::f32::consts::PI).sin() * 16384.0) as Sample
+            })
+            .collect();
+        tx.send(AudioFrame {
+            track_id: "callee".to_string(),
+            samples: Samples::PCM {
+                samples: callee_samples,
+            },
+            timestamp: (i * 10) as u64,
+            sample_rate: 16000,
+            channels: 1,
+            ..Default::default()
+        })?;
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
+
+    // First caller frame (8 kHz) latches the native target rate and flushes
+    // the pending callee frames through the resampler.
+    for i in 0..4 {
+        let caller_samples: PcmBuf = (0..160) // 20ms @ 8kHz
+            .map(|j| {
+                let t = (i * 160 + j) as f32 / 8000.0;
+                ((t * 440.0 * 2.0 * std::f32::consts::PI).sin() * 16384.0) as Sample
+            })
+            .collect();
+        tx.send(AudioFrame {
+            track_id: "caller".to_string(),
+            samples: Samples::PCM {
+                samples: caller_samples,
+            },
+            timestamp: (i * 20) as u64,
+            sample_rate: 8000,
+            channels: 1,
+            ..Default::default()
+        })?;
+        tokio::time::sleep(tokio::time::Duration::from_millis(60)).await;
+    }
+
+    recorder.stop_recording()?;
+    recorder_handle.await??;
+
+    assert!(file_path.exists());
+    let frames = verify_wav_file_with_rate(&file_path, 8000)?;
+    println!("native mixed-rate recording: {} frames", frames);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_processor_chain_raw_tap_keeps_native_rate() -> Result<()> {
+    // The raw tap must mirror the frame at its native rate (8 kHz for PCMU)
+    // while the pipeline output is still normalized to 16 kHz.
+    use crate::media::processor::ProcessorChain;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut chain = ProcessorChain::new(16000);
+    chain.raw_tap = Some(tx);
+
+    let mut frame = AudioFrame {
+        track_id: "caller".to_string(),
+        samples: Samples::RTP {
+            sequence_number: 1,
+            payload_type: 0,            // PCMU
+            payload: vec![0xFFu8; 160], // 20ms of silence at 8 kHz
+        },
+        timestamp: 0,
+        sample_rate: 8000,
+        channels: 1,
+        ..Default::default()
+    };
+
+    chain.process_frame(&mut frame)?;
+
+    let tapped = rx.recv().await.unwrap();
+    assert_eq!(tapped.sample_rate, 8000, "tap must keep the native rate");
+    assert!(
+        tapped.src_packet.is_none(),
+        "tap should not carry RTP payload"
+    );
+    match tapped.samples {
+        Samples::PCM { samples } => assert_eq!(samples.len(), 160),
+        _ => panic!("tapped frame should contain PCM"),
+    }
+
+    // The pipeline frame itself must still be normalized to 16 kHz mono.
+    assert_eq!(frame.sample_rate, 16000);
+    assert_eq!(frame.channels, 1);
+    match frame.samples {
+        Samples::PCM { samples } => assert!(
+            (300..=340).contains(&samples.len()),
+            "unexpected resampled length: {}",
+            samples.len()
+        ),
+        _ => panic!("pipeline frame should contain PCM"),
+    }
+    Ok(())
+}
+
+/// Byte-level WAV header validation: record exactly 1s of 8 kHz audio per leg
+/// in native mode and verify the RIFF/fmt/data chunks describe
+/// "PCM, 8000 Hz, 2 channels, 16-bit" with consistent sizes.
+#[tokio::test]
+async fn test_recorder_native_wav_header_bytes() -> Result<()> {
+    let temp_dir = tempdir()?;
+    let file_path = temp_dir.path().join("test_native_header.wav");
+    let file_path_clone = file_path.clone();
+    let cancel_token = CancellationToken::new();
+    let config = RecorderOption {
+        native_samplerate: Some(true),
+        ptime: 200,
+        ..Default::default()
+    };
+
+    let recorder = Arc::new(Recorder::new(
+        cancel_token.clone(),
+        "caller".to_string(),
+        config,
+    ));
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    let recorder_clone = recorder.clone();
+    let recorder_handle =
+        tokio::spawn(async move { recorder_clone.process_recording(&file_path_clone, rx).await });
+
+    // 50 frames x 160 samples (20ms @ 8kHz) = exactly 1s per leg.
+    for i in 0..50 {
+        let caller_samples: PcmBuf = (0..160)
+            .map(|j| {
+                let t = (i * 160 + j) as f32 / 8000.0;
+                ((t * 440.0 * 2.0 * std::f32::consts::PI).sin() * 8000.0) as Sample
+            })
+            .collect();
+        let callee_samples: PcmBuf = (0..160)
+            .map(|j| {
+                let t = (i * 160 + j) as f32 / 8000.0;
+                ((t * 880.0 * 2.0 * std::f32::consts::PI).sin() * 8000.0) as Sample
+            })
+            .collect();
+        tx.send(AudioFrame {
+            track_id: "caller".to_string(),
+            samples: Samples::PCM {
+                samples: caller_samples,
+            },
+            timestamp: (i * 20) as u64,
+            sample_rate: 8000,
+            channels: 1,
+            ..Default::default()
+        })?;
+        tx.send(AudioFrame {
+            track_id: "callee".to_string(),
+            samples: Samples::PCM {
+                samples: callee_samples,
+            },
+            timestamp: (i * 20) as u64,
+            sample_rate: 8000,
+            channels: 1,
+            ..Default::default()
+        })?;
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
+
+    // Let the final interval tick drain, then stop (flush + header rewrite).
+    tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+    recorder.stop_recording()?;
+    recorder_handle.await??;
+
+    let bytes = std::fs::read(&file_path)?;
+    assert!(bytes.len() >= 44, "file too short for a WAV header");
+
+    let dump: String = bytes[..44].iter().map(|b| format!("{:02x}", b)).collect();
+    println!("wav header (44 bytes): {}", dump);
+
+    let u16_at = |off: usize| u16::from_le_bytes(bytes[off..off + 2].try_into().unwrap());
+    let u32_at = |off: usize| u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+
+    // RIFF chunk descriptor
+    assert_eq!(&bytes[0..4], b"RIFF");
+    let riff_size = u32_at(4);
+    assert_eq!(&bytes[8..12], b"WAVE");
+
+    // fmt chunk: PCM, 2ch, 8kHz, 16-bit
+    assert_eq!(&bytes[12..16], b"fmt ");
+    assert_eq!(u32_at(16), 16, "fmt chunk size");
+    let format_tag = u16_at(20);
+    let channels = u16_at(22);
+    let sample_rate = u32_at(24);
+    let byte_rate = u32_at(28);
+    let block_align = u16_at(32);
+    let bits_per_sample = u16_at(34);
+    assert_eq!(format_tag, 0x0001, "must be uncompressed PCM");
+    assert_eq!(channels, 2, "caller+callee interleaved stereo");
+    assert_eq!(sample_rate, 8000, "native rate from the caller leg");
+    assert_eq!(byte_rate, 8000 * 2 * 2, "sample_rate * block_align");
+    assert_eq!(block_align, 4, "channels * bits/8");
+    assert_eq!(bits_per_sample, 16);
+
+    // data chunk + size consistency
+    assert_eq!(&bytes[36..40], b"data");
+    let data_size = u32_at(40) as usize;
+    assert_eq!(
+        riff_size as usize,
+        data_size + 36,
+        "RIFF size must match data size"
+    );
+    assert_eq!(
+        bytes.len(),
+        data_size + 44,
+        "file length must match RIFF header sizes"
+    );
+    // ~1s of stereo 16-bit @8kHz = 32000 bytes; tolerate scheduler padding.
+    assert!(
+        (32000..=64000).contains(&data_size),
+        "unexpected data size: {}",
+        data_size
+    );
+    assert_eq!(
+        data_size % 4,
+        0,
+        "data must be frame-aligned (2ch x 16-bit)"
+    );
+
     Ok(())
 }

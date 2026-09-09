@@ -98,6 +98,12 @@ media_cache_path = "./config/mediacache"
 [recording]
 enabled = true
 auto_start = true
+# Record at the source's native sample rate (e.g. 8kHz for PCMU) instead of
+# resampling to 16kHz. The rate is detected from the caller leg's codec.
+# native_samplerate = true
+# samplerate = 16000              # fallback rate when native detection is off
+# ptime = 200                     # ms of audio per write
+# format = "wav"                  # wav | pcm | pcmu | pcma | g722
 
 [callrecord]
 type = "local"
