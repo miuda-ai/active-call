@@ -1,0 +1,409 @@
+use crate::CallOption;
+use crate::call::{ActiveCallRef, ActiveCallType, Command};
+use crate::event::EventReceiver;
+use anyhow::{Result, anyhow};
+use serde_json::json;
+use std::time::Duration;
+use tracing::{error, info, warn};
+
+use super::{Playbook, PlaybookConfig, dialogue::DialogueHandler, handler::LlmHandler};
+
+pub struct PlaybookRunner {
+    handler: Box<dyn DialogueHandler>,
+    call: ActiveCallRef,
+    config: PlaybookConfig,
+    event_receiver: EventReceiver,
+}
+
+impl PlaybookRunner {
+    pub fn with_handler(
+        handler: Box<dyn DialogueHandler>,
+        call: ActiveCallRef,
+        config: PlaybookConfig,
+    ) -> Self {
+        let event_receiver = call.event_sender.subscribe();
+        Self {
+            handler,
+            call,
+            config,
+            event_receiver,
+        }
+    }
+
+    pub fn new(playbook: Playbook, call: ActiveCallRef) -> Result<Self> {
+        let event_receiver = call.event_sender.subscribe();
+        // Runs before `serve` starts, so this plain rcu cannot race the actor.
+        call.progress.rcu(|p| {
+            let mut p = crate::call::state::CallProgress::clone(p);
+            // Ensure option exists before applying config
+            let option = p.option.get_or_insert_with(CallOption::default);
+            apply_playbook_config(option, &playbook.config);
+            p
+        });
+
+        let handler: Box<dyn DialogueHandler> = if let Some(llm_config) = &playbook.config.llm {
+            let mut llm_config = llm_config.clone();
+            if let Some(greeting) = playbook.config.greeting.clone() {
+                llm_config.greeting = Some(greeting);
+            }
+            let interruption_config = playbook.config.interruption.clone().unwrap_or_default();
+            let dtmf_config = playbook.config.dtmf.clone();
+            let dtmf_collectors = playbook.config.dtmf_collectors.clone();
+
+            let mut llm_handler = LlmHandler::new(
+                llm_config,
+                interruption_config,
+                playbook.config.follow_up,
+                playbook.scenes.clone(),
+                dtmf_config,
+                dtmf_collectors,
+                playbook.initial_scene_id.clone(),
+                playbook.config.sip.clone(),
+            );
+            // Set event sender for debugging
+            llm_handler.set_event_sender(call.event_sender.clone());
+            llm_handler.set_call(call.clone());
+            Box::new(llm_handler)
+        } else {
+            return Err(anyhow!(
+                "No valid dialogue handler configuration found (e.g. missing 'llm')"
+            ));
+        };
+
+        Ok(Self {
+            handler,
+            call,
+            config: playbook.config,
+            event_receiver,
+        })
+    }
+
+    pub async fn run(mut self) {
+        info!(
+            "PlaybookRunner started for session {}",
+            self.call.session_id
+        );
+
+        let mut answered = self.call.progress.load_full().answer_time.is_some();
+        let wait_for_media_ready = matches!(
+            self.call.call_type,
+            ActiveCallType::Sip | ActiveCallType::B2bua
+        );
+        let mut media_ready = !wait_for_media_ready;
+
+        if let Ok(commands) = self.handler.on_start().await {
+            for cmd in commands {
+                let is_media = matches!(cmd, Command::Tts { .. } | Command::Play { .. });
+
+                if is_media && (!answered || !media_ready) {
+                    info!(
+                        wait_for_media_ready,
+                        "Waiting for call media readiness before executing media command..."
+                    );
+                    while let Ok(event) = self.event_receiver.recv().await {
+                        match &event {
+                            crate::event::SessionEvent::Answer { .. } => {
+                                info!("Call established");
+                                answered = true;
+                            }
+                            crate::event::SessionEvent::MediaReady { .. } => {
+                                info!("Call media ready");
+                                media_ready = true;
+                            }
+                            crate::event::SessionEvent::Hangup { .. } => {
+                                info!("Call hung up before media command, stopping");
+                                return;
+                            }
+                            _ => {}
+                        }
+                        if answered && media_ready {
+                            info!("Proceeding to execute media command");
+                            break;
+                        }
+                    }
+                }
+
+                if let Err(e) = self.call.enqueue_command(cmd).await {
+                    error!("Failed to enqueue start command: {}", e);
+                }
+            }
+        }
+
+        if !answered {
+            info!("Waiting for call establishment...");
+            while let Ok(event) = self.event_receiver.recv().await {
+                match &event {
+                    crate::event::SessionEvent::Answer { .. } => {
+                        info!("Call established, proceeding to playbook handles");
+                        break;
+                    }
+                    crate::event::SessionEvent::Hangup { .. } => {
+                        info!("Call hung up before established, stopping");
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        while let Ok(event) = self.event_receiver.recv().await {
+            if let Ok(commands) = self.handler.on_event(&event).await {
+                for cmd in commands {
+                    if let Err(e) = self.call.enqueue_command(cmd).await {
+                        error!("Failed to enqueue command: {}", e);
+                    }
+                }
+            }
+            match &event {
+                crate::event::SessionEvent::Hangup { .. } => {
+                    info!("Call hung up, stopping playbook");
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        // Post-hook logic
+        if let Some(posthook) = self.config.posthook.clone() {
+            let mut handler = self.handler;
+            let session_id = self.call.session_id.clone();
+            // Drop the ActiveCallRef before spawning to avoid keeping the entire call alive
+            drop(self.call);
+            crate::spawn(async move {
+                info!("Executing posthook for session {}", session_id);
+
+                let posthook_timeout = Duration::from_secs(posthook.timeout.unwrap_or(30) as u64);
+
+                let posthook_task = async {
+                    let summary = if let Some(summary_type) = &posthook.summary {
+                        match handler.summarize(summary_type.prompt()).await {
+                            Ok(s) => Some(s),
+                            Err(e) => {
+                                error!("Failed to generate summary: {}", e);
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                    let history = if posthook.include_history.unwrap_or(true) {
+                        Some(handler.get_history().await)
+                    } else {
+                        None
+                    };
+
+                    let payload = json!({
+                        "sessionId": session_id,
+                        "summary": summary,
+                        "history": history,
+                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                    });
+
+                    let client = reqwest::Client::new();
+                    let method = posthook
+                        .method
+                        .as_deref()
+                        .unwrap_or("POST")
+                        .parse::<reqwest::Method>()
+                        .unwrap_or(reqwest::Method::POST);
+
+                    let mut request = client.request(method, &posthook.url).json(&payload);
+
+                    if let Some(headers) = posthook.headers {
+                        for (k, v) in headers {
+                            request = request.header(k, v);
+                        }
+                    }
+
+                    match request.send().await {
+                        Ok(resp) => {
+                            if resp.status().is_success() {
+                                info!("Posthook sent successfully");
+                            } else {
+                                warn!("Posthook failed with status: {}", resp.status());
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to send posthook: {}", e);
+                        }
+                    }
+                };
+
+                if tokio::time::timeout(posthook_timeout, posthook_task)
+                    .await
+                    .is_err()
+                {
+                    error!("Posthook timed out for session {}", session_id);
+                }
+            });
+        }
+    }
+}
+
+pub fn apply_playbook_config(option: &mut CallOption, config: &PlaybookConfig) {
+    let api_key = config.llm.as_ref().and_then(|llm| llm.api_key.clone());
+
+    if let Some(mut asr) = config.asr.clone() {
+        if asr.secret_key.is_none() {
+            asr.secret_key = api_key.clone();
+        }
+        option.asr = Some(asr);
+    }
+    if let Some(mut tts) = config.tts.clone() {
+        if tts.secret_key.is_none() {
+            tts.secret_key = api_key.clone();
+        }
+        option.tts = Some(tts);
+    }
+    if let Some(vad) = config.vad.clone() {
+        option.vad = Some(vad);
+    }
+    if let Some(denoise) = config.denoise {
+        option.denoise = Some(denoise);
+    }
+    if let Some(agc) = config.agc.clone() {
+        option.agc = Some(agc);
+    }
+    if let Some(ambiance) = config.ambiance.clone() {
+        option.ambiance = Some(ambiance);
+    }
+    if let Some(recorder) = config.recorder.clone() {
+        option.recorder = Some(recorder);
+    }
+    if let Some(extra) = config.extra.clone() {
+        option.extra = Some(extra);
+    }
+    if let Some(mut realtime) = config.realtime.clone() {
+        if realtime.secret_key.is_none() {
+            realtime.secret_key = api_key.clone();
+        }
+        option.realtime = Some(realtime);
+    }
+    if let Some(mut eou) = config.eou.clone() {
+        if eou.secret_key.is_none() {
+            eou.secret_key = api_key;
+        }
+        option.eou = Some(eou);
+    }
+    if let Some(sip) = config.sip.clone() {
+        option.sip = Some(sip);
+    }
+    if let Some(ringback) = config.ringback_detection.clone() {
+        option.ringback_detection = Some(ringback);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        EouOption, media::recorder::RecorderOption, media::vad::VADOption,
+        synthesis::SynthesisOption, transcription::TranscriptionOption,
+    };
+    use std::collections::HashMap;
+
+    #[test]
+    fn apply_playbook_config_sets_fields() {
+        let mut option = CallOption::default();
+        let mut extra = HashMap::new();
+        extra.insert("k".to_string(), "v".to_string());
+
+        let config = PlaybookConfig {
+            asr: Some(TranscriptionOption::default()),
+            tts: Some(SynthesisOption::default()),
+            vad: Some(VADOption::default()),
+            denoise: Some(true),
+            recorder: Some(RecorderOption::default()),
+            extra: Some(extra.clone()),
+            eou: Some(EouOption {
+                r#type: Some("test".to_string()),
+                endpoint: None,
+                secret_key: Some("key".to_string()),
+                secret_id: Some("id".to_string()),
+                timeout: Some(123),
+                extra: None,
+            }),
+            ..Default::default()
+        };
+
+        apply_playbook_config(&mut option, &config);
+
+        assert!(option.asr.is_some());
+        assert!(option.tts.is_some());
+        assert!(option.vad.is_some());
+        assert_eq!(option.denoise, Some(true));
+        assert!(option.recorder.is_some());
+        assert_eq!(option.extra, Some(extra));
+        assert!(option.eou.is_some());
+    }
+
+    #[test]
+    fn apply_playbook_config_propagates_api_key() {
+        let mut option = CallOption::default();
+        let config = PlaybookConfig {
+            llm: Some(super::super::LlmConfig {
+                api_key: Some("test-key".to_string()),
+                ..Default::default()
+            }),
+            asr: Some(TranscriptionOption::default()),
+            tts: Some(SynthesisOption::default()),
+            eou: Some(EouOption::default()),
+            ..Default::default()
+        };
+
+        apply_playbook_config(&mut option, &config);
+
+        assert_eq!(
+            option.asr.as_ref().unwrap().secret_key,
+            Some("test-key".to_string())
+        );
+        assert_eq!(
+            option.tts.as_ref().unwrap().secret_key,
+            Some("test-key".to_string())
+        );
+        assert_eq!(
+            option.eou.as_ref().unwrap().secret_key,
+            Some("test-key".to_string())
+        );
+    }
+
+    #[test]
+    fn posthook_config_timeout_default() {
+        use crate::playbook::PostHookConfig;
+
+        // Test default timeout (None -> should use 30 in code)
+        let config = PostHookConfig {
+            url: "http://example.com".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(config.timeout, None);
+        // Code uses unwrap_or(30), verify the logic
+        assert_eq!(config.timeout.unwrap_or(30), 30);
+
+        // Test custom timeout
+        let config = PostHookConfig {
+            url: "http://example.com".to_string(),
+            timeout: Some(60),
+            ..Default::default()
+        };
+        assert_eq!(config.timeout, Some(60));
+        assert_eq!(config.timeout.unwrap_or(30), 60);
+    }
+
+    #[test]
+    fn posthook_config_serde_with_timeout() {
+        use crate::playbook::PostHookConfig;
+
+        // Test that timeout field is correctly serialized/deserialized
+        let json = r#"{"url": "http://example.com", "timeout": 45}"#;
+        let config: PostHookConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.timeout, Some(45));
+        assert_eq!(config.url, "http://example.com");
+
+        // Without timeout
+        let json = r#"{"url": "http://example.com"}"#;
+        let config: PostHookConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.timeout, None);
+    }
+}

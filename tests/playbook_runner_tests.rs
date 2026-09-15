@@ -1,0 +1,563 @@
+use active_call::app::AppStateBuilder;
+use active_call::call::active_call::CallSpec;
+use active_call::call::{ActiveCall, ActiveCallType, Command};
+use active_call::config::Config;
+use active_call::event::SessionEvent;
+use active_call::media::engine::StreamEngine;
+use active_call::media::track::TrackConfig;
+use active_call::playbook::{
+    ChatMessage, LlmConfig, PlaybookConfig, PlaybookRunner,
+    handler::{LlmHandler, LlmProvider, LlmStreamEvent, RagRetriever},
+};
+use anyhow::Result;
+use async_trait::async_trait;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
+
+struct MockLlmProvider {
+    response: String,
+}
+
+#[async_trait]
+impl LlmProvider for MockLlmProvider {
+    async fn call(&self, _config: &LlmConfig, _history: &[ChatMessage]) -> Result<String> {
+        Ok(self.response.clone())
+    }
+
+    async fn call_stream(
+        &self,
+        _config: &LlmConfig,
+        _history: &[ChatMessage],
+    ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<LlmStreamEvent>> + Send>>> {
+        let response = self.response.clone();
+        let s = async_stream::stream! {
+            yield Ok(LlmStreamEvent::Content(response));
+        };
+        Ok(Box::pin(s))
+    }
+}
+
+struct NoopRag;
+#[async_trait]
+impl RagRetriever for NoopRag {
+    async fn retrieve(&self, _query: &str) -> Result<String> {
+        Ok("".to_string())
+    }
+}
+
+#[tokio::test]
+async fn test_playbook_run_flow() -> Result<()> {
+    // 1. Setup AppState
+    let mut config = Config::default();
+    config.udp_port = 0; // Use random port to avoid collision
+    let stream_engine = Arc::new(StreamEngine::new());
+
+    let app_state = AppStateBuilder::new()
+        .with_config(config)
+        .with_stream_engine(stream_engine)
+        .build()
+        .await?;
+
+    // 2. Create ActiveCall
+    let cancel_token = CancellationToken::new();
+    let session_id = "test-session".to_string();
+    let track_config = TrackConfig::default();
+
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: cancel_token.clone(),
+        session_id: session_id.clone(),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config,
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
+
+    // Get command receiver
+    let receiver = active_call.new_receiver();
+    let mut cmd_rx = receiver.cmd_receiver;
+
+    // 3. Setup Handler with Mock Provider
+    let llm_config = LlmConfig {
+        provider: "mock".to_string(),
+        prompt: Some("You are a bot".to_string()),
+        greeting: Some("Hello world".to_string()),
+        ..Default::default()
+    };
+
+    let response_json = r#"{
+        "text": "How can I help you?",
+        "waitInputTimeout": 5000
+    }"#;
+
+    let provider = Arc::new(MockLlmProvider {
+        response: response_json.to_string(),
+    });
+    // Arc<NoopRag> is needed (LlmHandler takes Arc)
+    let llm_handler = LlmHandler::with_provider(
+        llm_config.clone(),
+        provider,
+        Arc::new(NoopRag),
+        active_call::playbook::InterruptionConfig::default(),
+        None,
+        HashMap::new(),
+        None,
+        None,
+        None,
+        None,
+    );
+
+    // 4. Create Runner
+    let runner = PlaybookRunner::with_handler(
+        Box::new(llm_handler),
+        active_call.clone(),
+        PlaybookConfig::default(),
+    );
+
+    // 5. Run Runner in background
+    let join_handle = tokio::spawn(async move {
+        runner.run().await;
+    });
+
+    // Simulate Answer event. SIP media commands should still wait for MediaReady.
+    active_call.event_sender.send(SessionEvent::Answer {
+        track_id: "track1".to_string(),
+        timestamp: 0,
+        sdp: "".to_string(),
+        refer: None,
+    })?;
+
+    let greeting_before_media =
+        tokio::time::timeout(std::time::Duration::from_millis(200), cmd_rx.recv()).await;
+    assert!(
+        greeting_before_media.is_err(),
+        "SIP greeting should wait for MediaReady"
+    );
+
+    active_call.event_sender.send(SessionEvent::MediaReady {
+        track_id: "track1".to_string(),
+        timestamp: 1,
+    })?;
+
+    // 6. Assert Greeting (on_start)
+    // Expect Command::Tts from greeting
+    if let Ok(cmd) = cmd_rx.recv().await {
+        match cmd {
+            Command::Tts { text, .. } => assert_eq!(text, "Hello world"),
+            _ => panic!("Expected TTS greeting, got {:?}", cmd),
+        }
+    } else {
+        panic!("Did not receive greeting command");
+    }
+
+    // 7. Simulate User Input
+    let event = SessionEvent::AsrFinal {
+        track_id: "track1".to_string(),
+        timestamp: 100,
+        index: 1,
+        start_time: None,
+        end_time: None,
+        text: "I need help".to_string(),
+        is_filler: None,
+        confidence: None,
+        task_id: None,
+        refer: None,
+    };
+
+    // Send event
+    active_call.event_sender.send(event)?;
+
+    // 8. Assert Response
+    if let Ok(cmd) = cmd_rx.recv().await {
+        match cmd {
+            Command::Tts { text, .. } => assert_eq!(text, "How can I help you?"),
+            _ => panic!("Expected TTS response, got {:?}", cmd),
+        }
+    } else {
+        panic!("Did not receive response command");
+    }
+
+    // Hangup to stop runner loop
+    active_call.event_sender.send(SessionEvent::Hangup {
+        track_id: "track1".to_string(),
+        timestamp: 200,
+        reason: None,
+        initiator: None,
+        start_time: "".to_string(),
+        hangup_time: "".to_string(),
+        answer_time: None,
+        ringing_time: None,
+        from: None,
+        to: None,
+        extra: None,
+        refer: None,
+    })?;
+
+    join_handle.await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_playbook_hangup_flow() -> Result<()> {
+    let mut config = Config::default();
+    config.udp_port = 0;
+    let stream_engine = Arc::new(StreamEngine::new());
+    let app_state = AppStateBuilder::new()
+        .with_config(config)
+        .with_stream_engine(stream_engine)
+        .build()
+        .await?;
+
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: CancellationToken::new(),
+        session_id: "test-hangup".to_string(),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: TrackConfig::default(),
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
+
+    let receiver = active_call.new_receiver();
+    let mut cmd_rx = receiver.cmd_receiver;
+
+    let response_json = r#"{
+        "text": "Goodbye",
+        "tools": [{"name": "hangup", "reason": "user_requested"}]
+    }"#;
+
+    let provider = Arc::new(MockLlmProvider {
+        response: response_json.to_string(),
+    });
+    let llm_handler = LlmHandler::with_provider(
+        LlmConfig::default(),
+        provider,
+        Arc::new(NoopRag),
+        active_call::playbook::InterruptionConfig::default(),
+        None,
+        HashMap::new(),
+        None,
+        None,
+        None,
+        None,
+    );
+    let runner = PlaybookRunner::with_handler(
+        Box::new(llm_handler),
+        active_call.clone(),
+        PlaybookConfig::default(),
+    );
+
+    tokio::spawn(async move {
+        runner.run().await;
+    });
+
+    // Simulate Answer and MediaReady events for SIP media commands.
+    active_call.event_sender.send(SessionEvent::Answer {
+        track_id: "test-hangup".to_string(),
+        timestamp: 0,
+        sdp: "".to_string(),
+        refer: None,
+    })?;
+    active_call.event_sender.send(SessionEvent::MediaReady {
+        track_id: "test-hangup".to_string(),
+        timestamp: 1,
+    })?;
+
+    // 1. Check TTS
+    if let Ok(cmd) = cmd_rx.recv().await {
+        if let Command::Tts {
+            text, auto_hangup, ..
+        } = cmd
+        {
+            assert_eq!(text, "Goodbye");
+            // The handler may combine Hangup into TTS auto_hangup
+            if auto_hangup == Some(true) {
+                return Ok(());
+            }
+        } else {
+            panic!("Expected TTS, got {:?}", cmd);
+        }
+    }
+
+    // 2. Check Hangup (if not combined)
+    if let Ok(cmd) = cmd_rx.recv().await {
+        if let Command::Hangup { reason, .. } = cmd {
+            assert_eq!(reason, Some("user_requested".to_string()));
+        } else {
+            panic!("Expected Hangup, got {:?}", cmd);
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_playbook_accept_flow() -> Result<()> {
+    let mut config = Config::default();
+    config.udp_port = 0;
+    let stream_engine = Arc::new(StreamEngine::new());
+    let app_state = AppStateBuilder::new()
+        .with_config(config)
+        .with_stream_engine(stream_engine)
+        .build()
+        .await?;
+
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: CancellationToken::new(),
+        session_id: "test-accept".to_string(),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: TrackConfig::default(),
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
+
+    let receiver = active_call.new_receiver();
+    let mut cmd_rx = receiver.cmd_receiver;
+
+    let response_json = r#"{
+        "tools": [{"name": "accept"}]
+    }"#;
+
+    let provider = Arc::new(MockLlmProvider {
+        response: response_json.to_string(),
+    });
+    let llm_handler = LlmHandler::with_provider(
+        LlmConfig::default(),
+        provider,
+        Arc::new(NoopRag),
+        active_call::playbook::InterruptionConfig::default(),
+        None,
+        HashMap::new(),
+        None,
+        None,
+        None,
+        None,
+    );
+    let runner = PlaybookRunner::with_handler(
+        Box::new(llm_handler),
+        active_call.clone(),
+        PlaybookConfig::default(),
+    );
+
+    tokio::spawn(async move {
+        runner.run().await;
+    });
+
+    // Check Accept command
+    if let Ok(cmd) = cmd_rx.recv().await {
+        assert!(matches!(cmd, Command::Accept { .. }));
+    } else {
+        panic!("Did not receive Accept command");
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_playbook_reject_flow() -> Result<()> {
+    let mut config = Config::default();
+    config.udp_port = 0;
+    let stream_engine = Arc::new(StreamEngine::new());
+    let app_state = AppStateBuilder::new()
+        .with_config(config)
+        .with_stream_engine(stream_engine)
+        .build()
+        .await?;
+
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: CancellationToken::new(),
+        session_id: "test-reject".to_string(),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: TrackConfig::default(),
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
+
+    let receiver = active_call.new_receiver();
+    let mut cmd_rx = receiver.cmd_receiver;
+
+    let response_json = r#"{
+        "tools": [{"name": "reject", "reason": "busy", "code": 486}]
+    }"#;
+
+    let provider = Arc::new(MockLlmProvider {
+        response: response_json.to_string(),
+    });
+    let llm_handler = LlmHandler::with_provider(
+        LlmConfig::default(),
+        provider,
+        Arc::new(NoopRag),
+        active_call::playbook::InterruptionConfig::default(),
+        None,
+        HashMap::new(),
+        None,
+        None,
+        None,
+        None,
+    );
+    let runner = PlaybookRunner::with_handler(
+        Box::new(llm_handler),
+        active_call.clone(),
+        PlaybookConfig::default(),
+    );
+
+    tokio::spawn(async move {
+        runner.run().await;
+    });
+
+    // Check Reject command
+    if let Ok(cmd) = cmd_rx.recv().await {
+        if let Command::Reject { reason, code } = cmd {
+            assert_eq!(reason, "busy");
+            assert_eq!(code, Some(486));
+        } else {
+            panic!("Expected Reject command, got {:?}", cmd);
+        }
+    } else {
+        panic!("Did not receive Reject command");
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_playbook_media_wait_flow() -> Result<()> {
+    let mut config = Config::default();
+    config.udp_port = 0;
+    let stream_engine = Arc::new(StreamEngine::new());
+    let app_state = AppStateBuilder::new()
+        .with_config(config)
+        .with_stream_engine(stream_engine)
+        .build()
+        .await?;
+
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: ActiveCallType::Sip,
+        cancel_token: CancellationToken::new(),
+        session_id: "test-wait".to_string(),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config: TrackConfig::default(),
+        audio_receiver: None,
+        dump_events: false,
+        server_side_track_id: None,
+        extras: None,
+    }));
+
+    let receiver = active_call.new_receiver();
+    let mut cmd_rx = receiver.cmd_receiver;
+
+    // Use a custom handler to return [Accept, Tts] in on_start
+    struct WaitTestHandler;
+    #[async_trait]
+    impl active_call::playbook::DialogueHandler for WaitTestHandler {
+        async fn on_start(&mut self) -> Result<Vec<Command>> {
+            Ok(vec![
+                Command::Accept {
+                    option: active_call::CallOption::default(),
+                },
+                Command::Tts {
+                    text: "Greetings after answer".to_string(),
+                    speaker: None,
+                    play_id: None,
+                    auto_hangup: None,
+                    streaming: None,
+                    end_of_stream: None,
+                    option: None,
+                    wait_input_timeout: None,
+                    base64: None,
+                    cache_key: None,
+                },
+            ])
+        }
+        async fn on_event(
+            &mut self,
+            _event: &active_call::event::SessionEvent,
+        ) -> Result<Vec<Command>> {
+            Ok(vec![])
+        }
+        async fn get_history(&self) -> Vec<active_call::playbook::ChatMessage> {
+            vec![]
+        }
+        async fn summarize(&mut self, _prompt: &str) -> Result<String> {
+            Ok("".to_string())
+        }
+    }
+
+    let runner = PlaybookRunner::with_handler(
+        Box::new(WaitTestHandler),
+        active_call.clone(),
+        PlaybookConfig::default(),
+    );
+
+    tokio::spawn(async move {
+        runner.run().await;
+    });
+
+    // 1. We should receive Accept IMMEDIATELY
+    if let Ok(Ok(cmd)) =
+        tokio::time::timeout(std::time::Duration::from_millis(500), cmd_rx.recv()).await
+    {
+        assert!(matches!(cmd, Command::Accept { .. }));
+    } else {
+        panic!("Did not receive Accept command");
+    }
+
+    // 2. We should NOT receive TTS yet (it should be waiting for Answer and MediaReady)
+    let tts_received =
+        tokio::time::timeout(std::time::Duration::from_millis(200), cmd_rx.recv()).await;
+    assert!(
+        tts_received.is_err(),
+        "TTS should have waited for Answer and MediaReady"
+    );
+
+    // 3. Send Answer event
+    active_call.event_sender.send(SessionEvent::Answer {
+        track_id: "track1".to_string(),
+        timestamp: 1000,
+        sdp: "".to_string(),
+        refer: None,
+    })?;
+
+    let tts_after_answer =
+        tokio::time::timeout(std::time::Duration::from_millis(200), cmd_rx.recv()).await;
+    assert!(
+        tts_after_answer.is_err(),
+        "SIP TTS should still wait for MediaReady after Answer"
+    );
+
+    active_call.event_sender.send(SessionEvent::MediaReady {
+        track_id: "track1".to_string(),
+        timestamp: 1001,
+    })?;
+
+    // 4. NOW we should receive TTS
+    if let Ok(Ok(cmd)) =
+        tokio::time::timeout(std::time::Duration::from_millis(500), cmd_rx.recv()).await
+    {
+        match cmd {
+            Command::Tts { text, .. } => assert_eq!(text, "Greetings after answer"),
+            _ => panic!("Expected TTS command, got {:?}", cmd),
+        }
+    } else {
+        panic!("Did not receive TTS command after Answer");
+    }
+
+    Ok(())
+}

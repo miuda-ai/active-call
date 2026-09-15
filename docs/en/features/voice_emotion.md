@@ -1,0 +1,1 @@
+You can embed emotion tags in your responses to enhance expressiveness based on context, for example: [happy]That's great![/happy] or [sad]I'm sorry to hear that.[/sad]. This helps drive more vivid synthesized speech.

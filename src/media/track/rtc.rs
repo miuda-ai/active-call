@@ -1,0 +1,1143 @@
+use super::track_codec::TrackCodec;
+use crate::{
+    event::{EventSender, SessionEvent},
+    media::AudioFrame,
+    media::{
+        processor::ProcessorChain,
+        track::{Track, TrackConfig, TrackId, TrackPacketSender},
+    },
+};
+use anyhow::Result;
+use async_trait::async_trait;
+use audio_codec::CodecType;
+use bytes::Bytes;
+use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
+use rustrtc::{
+    AudioCapability, IceCandidate, IceServer, MediaKind, PeerConnection, PeerConnectionEvent,
+    PeerConnectionState, RtcConfiguration, RtpCodecParameters, SdpType, TransportMode,
+    config::MediaCapabilities,
+    media::{
+        MediaStreamTrack, SampleStreamSource, frame::AudioFrame as RtcAudioFrame, sample_track,
+        track::SampleStreamTrack,
+    },
+};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info};
+
+#[derive(Clone)]
+pub struct RtcTrackConfig {
+    pub mode: TransportMode,
+    pub ice_servers: Option<Vec<IceServer>>,
+    pub external_ip: Option<String>,
+    pub rtp_port_range: Option<(u16, u16)>,
+    pub bind_ip: Option<String>,
+    pub preferred_codec: Option<CodecType>,
+    pub codecs: Vec<CodecType>,
+    pub payload_type: Option<u8>,
+    pub enable_latching: Option<bool>,
+    pub enable_ice_lite: Option<bool>,
+}
+
+impl Default for RtcTrackConfig {
+    fn default() -> Self {
+        Self {
+            mode: TransportMode::WebRtc, // Default WebRTC behavior
+            ice_servers: None,
+            external_ip: None,
+            rtp_port_range: None,
+            bind_ip: None,
+            preferred_codec: None,
+            codecs: Vec::new(),
+            payload_type: None,
+            enable_latching: None,
+            enable_ice_lite: None,
+        }
+    }
+}
+
+pub struct RtcTrack {
+    track_id: TrackId,
+    track_config: TrackConfig,
+    rtc_config: RtcTrackConfig,
+    processor_chain: ProcessorChain,
+    packet_sender: Arc<Mutex<Option<TrackPacketSender>>>,
+    event_sender: Arc<Mutex<Option<EventSender>>>,
+    media_ready_sent: Arc<AtomicBool>,
+    cancel_token: CancellationToken,
+    local_source: Option<Arc<SampleStreamSource>>,
+    encoder: TrackCodec,
+    ssrc: u32,
+    payload_type: Option<u8>,
+    pub peer_connection: Option<Arc<PeerConnection>>,
+    next_rtp_timestamp: u32,
+    next_rtp_sequence_number: u16,
+    last_packet_time: Option<Instant>,
+    last_remote_sdp: Option<String>,
+    need_marker: bool,
+}
+
+impl RtcTrack {
+    pub fn new(
+        cancel_token: CancellationToken,
+        id: TrackId,
+        track_config: TrackConfig,
+        rtc_config: RtcTrackConfig,
+    ) -> Self {
+        let processor_chain = ProcessorChain::new(track_config.samplerate);
+        Self {
+            track_id: id,
+            track_config,
+            rtc_config,
+            processor_chain,
+            packet_sender: Arc::new(Mutex::new(None)),
+            event_sender: Arc::new(Mutex::new(None)),
+            media_ready_sent: Arc::new(AtomicBool::new(false)),
+            cancel_token,
+            local_source: None,
+            encoder: TrackCodec::new(),
+            ssrc: 0,
+            payload_type: None,
+            peer_connection: None,
+            next_rtp_timestamp: 0,
+            next_rtp_sequence_number: 0,
+            last_packet_time: None,
+            last_remote_sdp: None,
+            need_marker: false,
+        }
+    }
+
+    pub fn with_ssrc(mut self, ssrc: u32) -> Self {
+        self.ssrc = ssrc;
+        self
+    }
+
+    pub fn create_audio_track(
+        _codec: CodecType,
+        _stream_id: Option<String>,
+    ) -> (Arc<SampleStreamSource>, Arc<SampleStreamTrack>) {
+        let (source, track, _) = sample_track(rustrtc::media::MediaKind::Audio, 100);
+        (Arc::new(source), track)
+    }
+
+    pub async fn local_description(&self) -> Result<String> {
+        let pc = self
+            .peer_connection
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No PeerConnection"))?;
+        let offer = pc.create_offer().await?;
+        pc.set_local_description(offer.clone())?;
+        Ok(offer.to_sdp_string())
+    }
+
+    pub async fn create(&mut self) -> Result<()> {
+        if self.peer_connection.is_some() {
+            return Ok(());
+        }
+
+        let mut config = RtcConfiguration::default();
+        if self.ssrc != 0 {
+            config.ssrc_start = self.ssrc;
+        }
+        config.transport_mode = self.rtc_config.mode.clone();
+
+        if let Some(ice_servers) = &self.rtc_config.ice_servers {
+            config.ice_servers = ice_servers.clone();
+        }
+
+        if let Some(external_ip) = &self.rtc_config.external_ip {
+            config.external_ip = Some(external_ip.clone());
+        }
+        if let Some(bind_ip) = &self.rtc_config.bind_ip {
+            config.bind_ip = Some(bind_ip.clone());
+        }
+        if let Some((rtp_start_port, rtp_end_port)) = self.rtc_config.rtp_port_range {
+            config.rtp_start_port = Some(rtp_start_port);
+            config.rtp_end_port = Some(rtp_end_port);
+        }
+        config.enable_ice_lite = self.rtc_config.enable_ice_lite.unwrap_or(false);
+        config.enable_latching = self
+            .rtc_config
+            .enable_latching
+            .unwrap_or_else(|| self.rtc_config.mode == TransportMode::Rtp);
+
+        if !self.rtc_config.codecs.is_empty() {
+            let mut caps = MediaCapabilities::default();
+            caps.audio.clear();
+
+            for codec in &self.rtc_config.codecs {
+                let cap = match codec {
+                    CodecType::PCMU => AudioCapability::pcmu(),
+                    CodecType::PCMA => AudioCapability::pcma(),
+                    CodecType::G722 => AudioCapability::g722(),
+                    CodecType::G729 => AudioCapability::g729(),
+                    CodecType::TelephoneEvent => AudioCapability::telephone_event(),
+                    CodecType::Opus => AudioCapability::opus(),
+                };
+                caps.audio.push(cap);
+            }
+            config.media_capabilities = Some(caps);
+        }
+
+        let peer_connection = Arc::new(PeerConnection::new(config));
+        self.peer_connection = Some(peer_connection.clone());
+
+        let default_codec = CodecType::G722;
+        let codec = self.rtc_config.preferred_codec.unwrap_or(default_codec);
+
+        let (source, track) = Self::create_audio_track(codec, Some(self.track_id.clone()));
+        self.local_source = Some(source);
+
+        let payload_type = self
+            .rtc_config
+            .payload_type
+            .unwrap_or_else(|| codec.payload_type());
+
+        self.payload_type = Some(payload_type);
+
+        let params = RtpCodecParameters {
+            clock_rate: codec.clock_rate(),
+            channels: codec.channels() as u8,
+            payload_type,
+            ..Default::default()
+        };
+
+        peer_connection.add_track_with_stream_id(track, self.track_id.clone(), params)?;
+
+        // Spawn Handler Logic
+        self.spawn_handlers(
+            peer_connection.clone(),
+            self.track_id.clone(),
+            self.processor_chain.clone(),
+            payload_type,
+            self.event_sender.clone(),
+            self.media_ready_sent.clone(),
+        );
+
+        Ok(())
+    }
+
+    fn spawn_handlers(
+        &self,
+        pc: Arc<PeerConnection>,
+        track_id: TrackId,
+        processor_chain: ProcessorChain,
+        default_payload_type: u8,
+        event_sender: Arc<Mutex<Option<EventSender>>>,
+        media_ready_sent: Arc<AtomicBool>,
+    ) {
+        let cancel_token = self.cancel_token.clone();
+        let packet_sender = self.packet_sender.clone();
+        let pc_event = pc.clone();
+        let pc_stats = pc.clone();
+        let pc_state = pc.clone();
+        let track_id_log = track_id.clone();
+        let is_rtp_media = matches!(
+            self.rtc_config.mode,
+            TransportMode::Rtp | TransportMode::Srtp
+        );
+        let is_webrtc = self.rtc_config.mode != TransportMode::Rtp;
+
+        crate::spawn(async move {
+            info!(track_id=%track_id_log, "RtcTrack event/stats loop started");
+
+            let mut events = futures::stream::unfold(pc_event, |pc| async move {
+                pc.recv().await.map(|ev| (ev, pc))
+            })
+            .boxed();
+
+            let mut state_rx = if is_webrtc {
+                Some(pc_state.subscribe_peer_state())
+            } else {
+                None
+            };
+
+            let mut stats_interval = tokio::time::interval(Duration::from_secs(5));
+            let mut event_count = 0;
+            let mut workers = FuturesUnordered::new();
+
+            loop {
+                tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        debug!(track_id=%track_id_log, "RtcTrack loop cancelled");
+                        break;
+                    }
+
+                    Some(event) = events.next() => {
+                        event_count += 1;
+                        let event_type = match &event {
+                            PeerConnectionEvent::Track(_) => "Track",
+                            PeerConnectionEvent::DataChannel(_) => "DataChannel",
+                        };
+                        debug!(track_id=%track_id_log, "Received PeerConnectionEvent #{}: {}", event_count, event_type);
+
+                        if let PeerConnectionEvent::Track(transceiver) = event {
+                            if let Some(receiver) = transceiver.receiver() {
+                                let track = receiver.track();
+                                if is_rtp_media {
+                                    let maybe_sender = event_sender.lock().await.clone();
+                                    if let Some(sender) = maybe_sender {
+                                        if media_ready_sent
+                                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                                            .is_ok()
+                                        {
+                                            let result = sender.send(SessionEvent::MediaReady {
+                                                track_id: track_id_log.clone(),
+                                                timestamp: crate::media::get_timestamp(),
+                                            });
+                                            if result.is_err() {
+                                                media_ready_sent.store(false, Ordering::SeqCst);
+                                            }
+                                        }
+                                    }
+                                }
+                                info!(track_id=%track_id_log, "New track received");
+
+                                let (f1, f2) = Self::create_track_workers(
+                                    track,
+                                    packet_sender.clone(),
+                                    track_id_log.clone(),
+                                    processor_chain.clone(),
+                                    default_payload_type,
+                                );
+                                workers.push(f1);
+                                workers.push(f2);
+                            }
+                        }
+                    }
+
+                    _ = workers.next(), if !workers.is_empty() => {}
+
+                    _ = stats_interval.tick() => {
+                        match pc_stats.get_stats().await {
+                            Ok(stats) => {
+                                info!(track_id=%track_id_log, %stats, "RTCP Stats");
+                            }
+                            Err(e) => {
+                                debug!(track_id=%track_id_log, "Failed to get stats: {:?}", e);
+                            }
+                        }
+                    }
+
+                    // Handle state changes for transports that expose them.
+                    res = async {
+                        if let Some(rx) = state_rx.as_mut() {
+                            rx.changed().await
+                        } else {
+                            std::future::pending().await
+                        }
+                    } => {
+                        if res.is_ok() {
+                            if let Some(rx) = state_rx.as_ref() {
+                                let s = *rx.borrow();
+                                debug!(track_id=%track_id_log, "peer connection state changed: {:?}", s);
+                                match s {
+                                    PeerConnectionState::Disconnected
+                                    | PeerConnectionState::Closed
+                                    | PeerConnectionState::Failed => {
+                                        info!(
+                                            track_id = %track_id_log,
+                                            "peer connection is {:?}, try to close", s
+                                        );
+                                        cancel_token.cancel();
+                                        pc_state.close();
+                                        break;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            debug!(track_id=%track_id_log, "RtcTrack event/stats loop ended, total events: {}", event_count);
+        });
+    }
+
+    fn create_track_workers(
+        track: Arc<SampleStreamTrack>,
+        packet_sender_arc: Arc<Mutex<Option<TrackPacketSender>>>,
+        track_id: TrackId,
+        processor_chain: ProcessorChain,
+        default_payload_type: u8,
+    ) -> (
+        std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+        std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<rustrtc::media::frame::AudioFrame>();
+
+        // Processing Worker
+        let track_id_proc = track_id.clone();
+        let packet_sender_proc = packet_sender_arc.clone();
+        let processor_chain_proc = processor_chain.clone();
+        let proc_fut = Self::run_processing_worker(
+            rx,
+            track_id_proc,
+            packet_sender_proc,
+            processor_chain_proc,
+            default_payload_type,
+        );
+
+        // Receiving Worker
+        let track_id_recv = track_id.clone();
+        let recv_fut = Self::run_receiving_worker(track, tx, track_id_recv);
+
+        (proc_fut.boxed(), recv_fut.boxed())
+    }
+
+    async fn run_processing_worker(
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<rustrtc::media::frame::AudioFrame>,
+        track_id: TrackId,
+        packet_sender: Arc<Mutex<Option<TrackPacketSender>>>,
+        mut processor_chain: ProcessorChain,
+        default_payload_type: u8,
+    ) {
+        info!(track_id=%track_id, "RtcTrack processing worker started");
+        while let Some(frame) = rx.recv().await {
+            let res = std::panic::AssertUnwindSafe(Self::process_audio_frame(
+                frame,
+                &track_id,
+                &packet_sender,
+                &mut processor_chain,
+                default_payload_type,
+            ))
+            .catch_unwind()
+            .await;
+
+            if let Err(cause) = res {
+                let msg = if let Some(s) = cause.downcast_ref::<&str>() {
+                    *s
+                } else if let Some(s) = cause.downcast_ref::<String>() {
+                    &s[..]
+                } else {
+                    "Unknown panic"
+                };
+                tracing::error!(track_id=%track_id, "RtcTrack processing worker PANIC: {}", msg);
+                break;
+            }
+        }
+        info!(track_id=%track_id, "RtcTrack processing worker stopped");
+    }
+
+    async fn run_receiving_worker(
+        track: Arc<SampleStreamTrack>,
+        tx: tokio::sync::mpsc::UnboundedSender<rustrtc::media::frame::AudioFrame>,
+        track_id: TrackId,
+    ) {
+        let mut samples =
+            futures::stream::unfold(
+                track,
+                |t| async move { t.recv().await.ok().map(|s| (s, t)) },
+            )
+            .boxed();
+
+        while let Some(sample) = samples.next().await {
+            if let rustrtc::media::frame::MediaSample::Audio(frame) = sample {
+                if let Err(_) = tx.send(frame) {
+                    break;
+                }
+            } else {
+                debug!(track_id=%track_id, "Received non-audio sample");
+            }
+        }
+        info!(track_id=%track_id, "RtcTrack receiving worker stopped");
+    }
+
+    async fn process_audio_frame(
+        frame: rustrtc::media::frame::AudioFrame,
+        track_id: &TrackId,
+        packet_sender: &Arc<Mutex<Option<TrackPacketSender>>>,
+        processor_chain: &mut ProcessorChain,
+        default_payload_type: u8,
+    ) {
+        let packet_sender = packet_sender.lock().await;
+        if let Some(sender) = packet_sender.as_ref() {
+            let payload_type = frame.payload_type.unwrap_or(default_payload_type);
+            let src_codec = match processor_chain.codec.get_codec_for_pt(payload_type) {
+                Some(c) => c,
+                None => {
+                    debug!(track_id=%track_id, "Unknown payload type {}, skipping frame", payload_type);
+                    return;
+                }
+            };
+
+            let mut af = AudioFrame {
+                track_id: track_id.clone(),
+                samples: crate::media::Samples::RTP {
+                    payload_type,
+                    payload: frame.data.to_vec(),
+                    sequence_number: frame.sequence_number.unwrap_or(0),
+                },
+                timestamp: crate::media::get_timestamp(),
+                sample_rate: src_codec.samplerate(),
+                channels: src_codec.channels(),
+                ..Default::default()
+            };
+            if let Err(e) = processor_chain.process_frame(&mut af) {
+                debug!(track_id=%track_id, "processor_chain process_frame error: {:?}", e);
+            }
+
+            sender.send(af).ok();
+        }
+    }
+
+    pub fn parse_sdp_payload_types(&mut self, sdp_type: SdpType, sdp_str: &str) -> Result<()> {
+        use crate::media::negotiate::parse_rtpmap;
+        let sdp = rustrtc::SessionDescription::parse(sdp_type, sdp_str)?;
+
+        if let Some(media) = sdp
+            .media_sections
+            .iter()
+            .find(|m| m.kind == MediaKind::Audio)
+        {
+            for attr in &media.attributes {
+                if attr.key == "rtpmap" {
+                    if let Some(value) = &attr.value {
+                        if let Ok((pt, codec, _, _)) = parse_rtpmap(value) {
+                            self.encoder.set_payload_type(pt, codec.clone());
+                            self.processor_chain.codec.set_payload_type(pt, codec);
+                        }
+                    }
+                }
+            }
+
+            // Negotiate primary audio codec
+            let mut negotiated = None;
+
+            // When parsing an answer, prefer our configured codec order among accepted codecs.
+            // Offer parsing is provisional; the final outgoing PT is set from the answer.
+            if sdp_type == rustrtc::sdp::SdpType::Answer && !self.rtc_config.codecs.is_empty() {
+                for preferred_codec in &self.rtc_config.codecs {
+                    if *preferred_codec == CodecType::TelephoneEvent {
+                        continue;
+                    }
+                    for fmt in &media.formats {
+                        if let Ok(pt) = fmt.parse::<u8>() {
+                            let codec = self.encoder.get_codec_for_pt(pt);
+                            if let Some(c) = codec {
+                                if c == *preferred_codec {
+                                    negotiated = Some((pt, c));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if negotiated.is_some() {
+                        break;
+                    }
+                }
+            }
+
+            // Fallback: use the first codec in the SDP (matches offerer's preference if we are answerer)
+            if negotiated.is_none() {
+                for fmt in &media.formats {
+                    if let Ok(pt) = fmt.parse::<u8>() {
+                        let codec = self.encoder.get_codec_for_pt(pt);
+                        if let Some(codec) = codec {
+                            if codec != CodecType::TelephoneEvent {
+                                negotiated = Some((pt, codec));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some((pt, codec)) = negotiated {
+                info!(track_id=%self.track_id, "Negotiated primary audio PT {} ({:?})", pt, codec);
+                self.payload_type = Some(pt);
+            }
+        }
+        Ok(())
+    }
+
+    fn normalize_sdp(sdp: &str) -> String {
+        sdp.lines()
+            .map(|line| {
+                if line.starts_with("o=") {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 3 {
+                        return format!("o= {} {}", parts[1], parts[2]);
+                    }
+                }
+                line.to_string()
+            })
+            .filter(|line| {
+                !line.starts_with("t=") &&  // timing line can vary
+                !line.starts_with("a=ssrc:") &&  // SSRC attributes (but SSRC change shows in o= version)
+                !line.starts_with("a=msid:") &&  // media stream ID
+                !line.trim().is_empty()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    async fn update_remote_description_internal(
+        &mut self,
+        answer: &String,
+        force_update: bool,
+        sdp_type: rustrtc::SdpType,
+    ) -> Result<()> {
+        info!(
+            track_id=%self.track_id,
+            "update_remote_description_internal called. force={}, last_sdp_is_some={}, mode={:?}, sdp_type={:?}",
+            force_update,
+            self.last_remote_sdp.is_some(),
+            self.rtc_config.mode,
+            sdp_type
+        );
+
+        if let Some(pc) = &self.peer_connection {
+            if !force_update {
+                if let Some(ref last_sdp) = self.last_remote_sdp {
+                    if Self::normalize_sdp(last_sdp) == Self::normalize_sdp(answer) {
+                        debug!(track_id=%self.track_id, "SDP unchanged, skipping update_remote_description");
+                        return Ok(());
+                    }
+                }
+            } else {
+                debug!(track_id=%self.track_id, "Force update requested, skipping SDP comparison");
+            }
+
+            let _is_first_remote_sdp = self.last_remote_sdp.is_none();
+
+            let sdp_obj = rustrtc::SessionDescription::parse(sdp_type, answer)?;
+            match pc.set_remote_description(sdp_obj.clone()).await {
+                Ok(_) => {
+                    debug!(track_id=%self.track_id, "set_remote_description succeeded");
+                    self.last_remote_sdp = Some(answer.clone());
+                }
+                Err(e) => {
+                    if self.rtc_config.mode == TransportMode::Rtp {
+                        info!(track_id=%self.track_id, "set_remote_description failed ({}), attempting to re-sync state for SIP update", e);
+
+                        if let Some(current_local) = pc.local_description() {
+                            let sdp = current_local.to_sdp_string();
+                            for line in sdp.lines() {
+                                if line.starts_with("a=ssrc:") {
+                                    info!(track_id=%self.track_id, "SSRC before re-sync: {}", line);
+                                }
+                            }
+                        }
+
+                        let offer = pc.create_offer().await?;
+
+                        let sdp = offer.to_sdp_string();
+                        for line in sdp.lines() {
+                            if line.starts_with("a=ssrc:") {
+                                info!(track_id=%self.track_id, "SSRC in new offer (re-sync): {}", line);
+                            }
+                        }
+
+                        pc.set_local_description(offer)?;
+                        pc.set_remote_description(sdp_obj).await?;
+                        self.last_remote_sdp = Some(answer.clone());
+                        info!(track_id=%self.track_id, "successfully re-synced WebRTC state for SIP update");
+                    } else {
+                        return Err(e.into());
+                    }
+                }
+            }
+
+            // Track events will be handled by the event loop after SSRC latching
+
+            // Extract negotiated payload types from SDP string
+            self.parse_sdp_payload_types(sdp_type, answer)?;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Track for RtcTrack {
+    fn ssrc(&self) -> u32 {
+        self.ssrc
+    }
+    fn id(&self) -> &TrackId {
+        &self.track_id
+    }
+    fn config(&self) -> &TrackConfig {
+        &self.track_config
+    }
+    fn processor_chain(&mut self) -> &mut ProcessorChain {
+        &mut self.processor_chain
+    }
+
+    async fn handshake(&mut self, offer: String, _: Option<Duration>) -> Result<String> {
+        info!(track_id=%self.track_id, "rtc handshake start");
+        self.create().await?;
+
+        let pc = self.peer_connection.clone().ok_or_else(|| {
+            anyhow::anyhow!("No PeerConnection available for track {}", self.track_id)
+        })?;
+
+        debug!(track_id=%self.track_id, "Before set_remote_description: transceivers count = {}", pc.get_transceivers().len());
+        for (i, t) in pc.get_transceivers().iter().enumerate() {
+            debug!(track_id=%self.track_id, "  Transceiver #{}: kind={:?}, mid={:?}, direction={:?}",
+                i, t.kind(), t.mid(), t.direction());
+        }
+
+        let sdp = rustrtc::SessionDescription::parse(rustrtc::SdpType::Offer, &offer)?;
+        pc.set_remote_description(sdp.clone()).await?;
+
+        debug!(track_id=%self.track_id, "After set_remote_description: transceivers count = {}", pc.get_transceivers().len());
+        for (i, t) in pc.get_transceivers().iter().enumerate() {
+            debug!(track_id=%self.track_id, "  Transceiver #{}: kind={:?}, mid={:?}, direction={:?}, has_receiver={}",
+                i, t.kind(), t.mid(), t.direction(), t.receiver().is_some());
+        }
+
+        // For RTP mode: Wait for PeerConnectionEvent::Track after SSRC latching completes
+        // For WebRTC mode: The event loop will handle Track events
+        info!(track_id=%self.track_id, "Waiting for Track events (SSRC latching for RTP mode)");
+
+        self.parse_sdp_payload_types(rustrtc::SdpType::Offer, &offer)?;
+
+        let mut answer = pc.create_answer().await?;
+        crate::media::negotiate::intersect_answer(&sdp, &mut answer);
+        self.parse_sdp_payload_types(rustrtc::SdpType::Answer, &answer.to_sdp_string())?;
+
+        pc.set_local_description(answer.clone())?;
+
+        if self.rtc_config.mode != TransportMode::Rtp {
+            pc.wait_for_gathering_complete().await;
+        }
+
+        let final_answer = pc
+            .local_description()
+            .ok_or(anyhow::anyhow!("No local description"))?;
+
+        Ok(final_answer.to_sdp_string())
+    }
+
+    async fn update_remote_description(&mut self, answer: &String) -> Result<()> {
+        self.update_remote_description_internal(answer, false, rustrtc::SdpType::Answer)
+            .await
+    }
+
+    async fn update_remote_description_force(&mut self, answer: &String) -> Result<()> {
+        self.update_remote_description_internal(answer, true, rustrtc::SdpType::Answer)
+            .await
+    }
+
+    async fn update_remote_description_provisional(&mut self, answer: &String) -> Result<()> {
+        // SIP 183 early media: apply as a provisional answer so signaling
+        // state stays in HaveLocalOffer, leaving room for the real 200 OK
+        // answer to complete negotiation. Tagging this as a full Answer (as
+        // the final answer does) would move state to Stable early, so the
+        // real answer would then be rejected as an invalid re-application
+        // and only recover via the SDP-mismatch re-sync fallback below —
+        // losing/disrupting the media path for the ringing window.
+        self.update_remote_description_internal(answer, false, rustrtc::SdpType::Pranswer)
+            .await
+    }
+
+    async fn start(
+        &mut self,
+        event_sender: EventSender,
+        packet_sender: TrackPacketSender,
+    ) -> Result<()> {
+        *self.packet_sender.lock().await = Some(packet_sender.clone());
+        *self.event_sender.lock().await = Some(event_sender.clone());
+        let token_clone = self.cancel_token.clone();
+        let event_sender_clone = event_sender.clone();
+        let track_id = self.track_id.clone();
+        let ssrc = self.ssrc;
+
+        if self.rtc_config.mode != TransportMode::Rtp {
+            let start_time = crate::media::get_timestamp();
+            crate::spawn(async move {
+                token_clone.cancelled().await;
+                let _ = event_sender_clone.send(SessionEvent::TrackEnd {
+                    track_id,
+                    timestamp: crate::media::get_timestamp(),
+                    duration: crate::media::get_timestamp() - start_time,
+                    ssrc,
+                    play_id: None,
+                    auto_hangup: None,
+                });
+            });
+        }
+
+        Ok(())
+    }
+
+    async fn stop(&self) -> Result<()> {
+        self.cancel_token.cancel();
+        if let Some(pc) = &self.peer_connection {
+            pc.close();
+        }
+        Ok(())
+    }
+
+    async fn send_packet(&mut self, packet: &AudioFrame) -> Result<()> {
+        let packet = packet.clone();
+
+        if let Some(source) = &self.local_source {
+            match &packet.samples {
+                crate::media::Samples::PCM { samples } => {
+                    let payload_type = self.get_payload_type();
+                    let (_, encoded) = self.encoder.encode(payload_type, packet.clone());
+                    let target_codec = self
+                        .encoder
+                        .get_codec_for_pt(payload_type)
+                        .ok_or_else(|| anyhow::anyhow!("Invalid codec type: {}", payload_type))?;
+                    if !encoded.is_empty() {
+                        let clock_rate = target_codec.clock_rate();
+
+                        let now = Instant::now();
+                        if let Some(last_time) = self.last_packet_time {
+                            let elapsed = now.duration_since(last_time);
+                            if elapsed.as_millis() > 50 {
+                                let gap_increment =
+                                    (elapsed.as_millis() as u32 * clock_rate) / 1000;
+                                self.next_rtp_timestamp += gap_increment;
+                                self.need_marker = true;
+                            }
+                        }
+
+                        self.last_packet_time = Some(now);
+
+                        let timestamp_increment = (samples.len() as u64 * clock_rate as u64
+                            / packet.sample_rate as u64
+                            / self.track_config.channels as u64)
+                            as u32;
+                        let rtp_timestamp = self.next_rtp_timestamp;
+                        self.next_rtp_timestamp += timestamp_increment;
+                        let sequence_number = self.next_rtp_sequence_number;
+                        self.next_rtp_sequence_number += 1;
+
+                        let mut marker = false;
+                        if self.need_marker {
+                            marker = true;
+                            self.need_marker = false;
+                        }
+
+                        let frame = RtcAudioFrame {
+                            data: Bytes::from(encoded),
+                            clock_rate,
+                            payload_type: Some(payload_type),
+                            sequence_number: Some(sequence_number),
+                            rtp_timestamp,
+                            marker,
+                            ..Default::default()
+                        };
+                        source.try_send_audio(frame).ok();
+                    }
+                }
+                crate::media::Samples::RTP {
+                    payload,
+                    payload_type,
+                    sequence_number,
+                } => {
+                    let target_codec = self
+                        .encoder
+                        .get_codec_for_pt(*payload_type)
+                        .ok_or_else(|| anyhow::anyhow!("Invalid codec type: {}", payload_type))?;
+                    let clock_rate = target_codec.clock_rate();
+
+                    let now = Instant::now();
+                    if let Some(last_time) = self.last_packet_time {
+                        let elapsed = now.duration_since(last_time);
+                        if elapsed.as_millis() > 50 {
+                            let gap_increment = (elapsed.as_millis() as u32 * clock_rate) / 1000;
+                            self.next_rtp_timestamp += gap_increment;
+                            self.need_marker = true;
+                        }
+                    }
+                    self.last_packet_time = Some(now);
+
+                    let increment = match *payload_type {
+                        0 | 8 | 18 => payload.len() as u32,
+                        9 => payload.len() as u32,
+                        111 => (clock_rate / 50) as u32,
+                        _ => (clock_rate / 50) as u32,
+                    };
+
+                    let rtp_timestamp = self.next_rtp_timestamp;
+                    self.next_rtp_timestamp += increment;
+                    let sequence_number = *sequence_number;
+
+                    let mut marker = false;
+                    if self.need_marker {
+                        marker = true;
+                        self.need_marker = false;
+                    }
+
+                    let frame = RtcAudioFrame {
+                        data: Bytes::from(payload.clone()),
+                        clock_rate,
+                        payload_type: Some(*payload_type),
+                        sequence_number: Some(sequence_number),
+                        rtp_timestamp,
+                        marker,
+                        ..Default::default()
+                    };
+                    source.try_send_audio(frame).ok();
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn add_ice_candidate(
+        &self,
+        candidate: &str,
+        // single audio m-line per track, so unused here
+        _sdp_mid: Option<&str>,
+        _sdp_mline_index: Option<u32>,
+    ) -> Result<()> {
+        let pc = self.peer_connection.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("No PeerConnection available for track {}", self.track_id)
+        })?;
+        pc.add_ice_candidate(IceCandidate::from_sdp(candidate)?)?;
+        Ok(())
+    }
+}
+
+impl RtcTrack {
+    fn get_payload_type(&self) -> u8 {
+        if let Some(pt) = self.payload_type {
+            return pt;
+        }
+
+        self.rtc_config.payload_type.unwrap_or_else(|| {
+            match self.rtc_config.preferred_codec.unwrap_or(CodecType::G722) {
+                CodecType::PCMU => 0,
+                CodecType::PCMA => 8,
+                CodecType::Opus => 111,
+                CodecType::G722 => 9,
+                CodecType::G729 => 18,
+                _ => 111,
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::media::track::TrackConfig;
+
+    #[test]
+    fn test_parse_sdp_payload_types() {
+        let track_id = "test-track".to_string();
+        let cancel_token = CancellationToken::new();
+        let mut track = RtcTrack::new(
+            cancel_token,
+            track_id,
+            TrackConfig::default(),
+            RtcTrackConfig::default(),
+        );
+
+        // Case 1: Multiple audio codecs, telephone-event at the end. Primary should be PCMA (8)
+        let sdp1 = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 1234 RTP/AVP 8 0 101\r\na=rtpmap:8 PCMA/8000\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\n";
+        track
+            .parse_sdp_payload_types(rustrtc::SdpType::Offer, sdp1)
+            .expect("parse offer");
+        assert_eq!(track.get_payload_type(), 8);
+
+        // Case 2: telephone-event at the beginning, should skip it and pick PCMU (0)
+        let mut rtc_config = RtcTrackConfig::default();
+        rtc_config.preferred_codec = Some(CodecType::PCMU);
+        let mut track2 = RtcTrack::new(
+            CancellationToken::new(),
+            "test-track-2".to_string(),
+            TrackConfig::default(),
+            rtc_config,
+        );
+
+        let sdp2 = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 1234 RTP/AVP 101 0 8\r\na=rtpmap:101 telephone-event/8000\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:8 PCMA/8000\r\n";
+        track2
+            .parse_sdp_payload_types(rustrtc::SdpType::Offer, sdp2)
+            .expect("parse offer");
+        assert_eq!(track2.get_payload_type(), 0);
+
+        // Case 3: Opus with dynamic payload type 111
+        let sdp3 = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 1234 RTP/AVP 111 101\r\na=rtpmap:111 opus/48000/2\r\na=rtpmap:101 telephone-event/8000\r\n";
+        track
+            .parse_sdp_payload_types(rustrtc::SdpType::Offer, sdp3)
+            .expect("parse offer");
+        assert_eq!(track.get_payload_type(), 111);
+
+        // Case 4: Linphone can offer G729 first, but the final answer decides
+        // the outgoing payload type.
+        let mut rtc_config = RtcTrackConfig::default();
+        rtc_config.preferred_codec = Some(CodecType::PCMU);
+        rtc_config.codecs = vec![CodecType::PCMU, CodecType::PCMA];
+        let mut track4 = RtcTrack::new(
+            CancellationToken::new(),
+            "test-track-4".to_string(),
+            TrackConfig::default(),
+            rtc_config,
+        );
+
+        let sdp4 = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 1234 RTP/AVP 18 0 101\r\na=fmtp:18 annexb=yes\r\na=rtpmap:101 telephone-event/8000\r\n";
+        track4
+            .parse_sdp_payload_types(rustrtc::SdpType::Offer, sdp4)
+            .expect("parse offer");
+        assert_eq!(track4.get_payload_type(), 18);
+
+        let answer4 = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 1234 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+        track4
+            .parse_sdp_payload_types(rustrtc::SdpType::Answer, answer4)
+            .expect("parse answer");
+        assert_eq!(track4.get_payload_type(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_rtp_mode_handshake_spawns_handler() {
+        use rustrtc::TransportMode;
+
+        let track_id = "test-track-sip".to_string();
+        let cancel = CancellationToken::new();
+        let track_config = TrackConfig::default();
+        let mut rtc_config = RtcTrackConfig::default();
+        rtc_config.mode = TransportMode::Rtp;
+        rtc_config.preferred_codec = Some(CodecType::PCMU);
+        rtc_config.codecs = vec![CodecType::PCMU, CodecType::TelephoneEvent];
+
+        let mut track = RtcTrack::new(cancel, track_id, track_config, rtc_config);
+
+        // Standard SIP/SDP offer
+        let offer = "v=0\r\n\
+o=- 123456 123456 IN IP4 172.0.0.1\r\n\
+s=-\r\n\
+c=IN IP4 172.0.0.1\r\n\
+t=0 0\r\n\
+m=audio 10000 RTP/AVP 0 101\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=rtpmap:101 telephone-event/8000\r\n\
+a=sendrecv\r\n";
+
+        // This should not panic and should set up the transceiver
+        let res = track.handshake(offer.to_string(), None).await;
+        assert!(res.is_ok(), "handshake failed: {res:?}");
+
+        // We can inspect the PeerConnection to ensure it has a transceiver with a receiver
+        if let Some(pc) = &track.peer_connection {
+            let transceivers = pc.get_transceivers();
+            // With the fix, we expect the logic to have iterated these transceivers.
+            // In RTP/Receive mode, we should have 1 transceiver with a receiver.
+            assert_eq!(transceivers.len(), 1);
+            assert!(transceivers[0].receiver().is_some());
+        } else {
+            panic!("PeerConnection not initialized");
+        }
+    }
+
+    /// Build an RTP-mode RtcTrack that has already generated its local offer,
+    /// returning the track together with its peer connection.
+    async fn rtp_track_with_local_offer(id: &str) -> RtcTrack {
+        let mut rtc_config = RtcTrackConfig::default();
+        rtc_config.mode = rustrtc::TransportMode::Rtp;
+        rtc_config.preferred_codec = Some(CodecType::PCMU);
+        rtc_config.codecs = vec![CodecType::PCMU, CodecType::PCMA];
+
+        let mut track = RtcTrack::new(
+            CancellationToken::new(),
+            id.to_string(),
+            TrackConfig {
+                codec: CodecType::PCMU,
+                samplerate: 8000,
+                ..Default::default()
+            },
+            rtc_config,
+        );
+        track.create().await.expect("create peer connection");
+        track.local_description().await.expect("local offer");
+        track
+    }
+
+    const PCMU_SDP_1: &str = "v=0\r\n\
+        o=- 0 0 IN IP4 127.0.0.1\r\n\
+        s=-\r\n\
+        c=IN IP4 127.0.0.1\r\n\
+        t=0 0\r\n\
+        m=audio 10000 RTP/AVP 0\r\n\
+        a=rtpmap:0 PCMU/8000\r\n";
+
+    const PCMU_SDP_2: &str = "v=0\r\n\
+        o=- 0 1 IN IP4 127.0.0.1\r\n\
+        s=-\r\n\
+        c=IN IP4 127.0.0.1\r\n\
+        t=0 0\r\n\
+        m=audio 20000 RTP/AVP 0\r\n\
+        a=rtpmap:0 PCMU/8000\r\n";
+
+    /// SIP 183 early media must be applied as a provisional answer (Pranswer),
+    /// keeping the signaling state in HaveLocalOffer, so the final 200 OK can
+    /// still complete the negotiation as a full Answer.
+    #[tokio::test]
+    async fn test_pranswer_keeps_local_offer_until_final_answer() {
+        use rustrtc::SignalingState;
+
+        let mut track = rtp_track_with_local_offer("test-pranswer").await;
+        let pc = track.peer_connection.clone().expect("peer connection");
+
+        assert_eq!(
+            pc.signaling_state(),
+            SignalingState::HaveLocalOffer,
+            "after local offer"
+        );
+
+        track
+            .update_remote_description_provisional(&PCMU_SDP_1.to_string())
+            .await
+            .expect("apply 183 as provisional answer");
+
+        assert_eq!(
+            pc.signaling_state(),
+            SignalingState::HaveLocalOffer,
+            "183 (Pranswer) must not finalize negotiation"
+        );
+
+        track
+            .update_remote_description_force(&PCMU_SDP_2.to_string())
+            .await
+            .expect("apply 200 OK as final answer");
+
+        assert_eq!(
+            pc.signaling_state(),
+            SignalingState::Stable,
+            "final 200 OK answer must stabilize signaling"
+        );
+    }
+
+    /// When the 200 OK carries no body after early media, the early SDP is
+    /// re-applied as a final Answer. Even though it is byte-for-byte the same
+    /// SDP as the provisional answer, the forced update must still transition
+    /// the signaling state from HaveLocalOffer to Stable.
+    #[tokio::test]
+    async fn test_pranswer_finalized_with_force_even_when_sdp_unchanged() {
+        use rustrtc::SignalingState;
+
+        let mut track = rtp_track_with_local_offer("test-pranswer-force").await;
+        let pc = track.peer_connection.clone().expect("peer connection");
+
+        track
+            .update_remote_description_provisional(&PCMU_SDP_1.to_string())
+            .await
+            .expect("apply 183 as provisional answer");
+        assert_eq!(pc.signaling_state(), SignalingState::HaveLocalOffer);
+
+        // Final answer resolves to the same SDP (empty 200 OK body fallback).
+        track
+            .update_remote_description_force(&PCMU_SDP_1.to_string())
+            .await
+            .expect("re-apply early SDP as final answer");
+
+        assert_eq!(
+            pc.signaling_state(),
+            SignalingState::Stable,
+            "forced final answer must stabilize even with unchanged SDP"
+        );
+    }
+}

@@ -1,0 +1,738 @@
+use crate::callrecord::CallRecordHangupReason;
+use crate::event::{EventSender, SessionEvent};
+use crate::media::processor::ProcessorChain;
+use crate::media::{AudioFrame, PcmBuf, Samples, TrackId};
+use crate::media::track::{Track, TrackConfig, TrackPacketSender};
+use anyhow::{Result, anyhow};
+use async_trait::async_trait;
+use audio_codec::BoxedResampler;
+use hound::WavReader;
+use std::cmp::min;
+use std::fs::File;
+use std::io::BufReader;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::Instant;
+use tokio::select;
+use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, warn};
+
+trait AudioReader: Send {
+    fn fill_buffer(&mut self) -> Result<usize>;
+
+    fn read_chunk(&mut self, packet_duration_ms: u32) -> Result<Option<(PcmBuf, u32)>> {
+        let max_chunk_size = self.sample_rate() as usize * packet_duration_ms as usize / 1000;
+
+        if self.buffer_size() == 0 || self.position() >= self.buffer_size() {
+            let samples_read = self.fill_buffer()?;
+            if samples_read == 0 {
+                return Ok(None);
+            }
+            self.set_position(0);
+        }
+
+        let remaining = self.buffer_size() - self.position();
+        if remaining == 0 {
+            return Ok(None);
+        }
+
+        let chunk_size = min(max_chunk_size, remaining);
+        let end_pos = self.position() + chunk_size;
+
+        assert!(
+            end_pos <= self.buffer_size(),
+            "Buffer overrun: pos={}, end={}, size={}",
+            self.position(),
+            end_pos,
+            self.buffer_size()
+        );
+
+        let chunk = self.extract_chunk(self.position(), end_pos);
+        self.set_position(end_pos);
+
+        let final_chunk =
+            if self.sample_rate() != self.target_sample_rate() && self.sample_rate() > 0 {
+                self.resample_chunk(&chunk)
+            } else {
+                chunk
+            };
+
+        Ok(Some((final_chunk, self.target_sample_rate())))
+    }
+
+    fn buffer_size(&self) -> usize;
+    fn position(&self) -> usize;
+    fn set_position(&mut self, pos: usize);
+    fn sample_rate(&self) -> u32;
+    fn target_sample_rate(&self) -> u32;
+    fn channels(&self) -> u16;
+    fn extract_chunk(&self, start: usize, end: usize) -> Vec<i16>;
+    fn resample_chunk(&mut self, chunk: &[i16]) -> Vec<i16>;
+}
+
+struct DecodedAudioReader {
+    buffer: Vec<i16>,
+    sample_rate: u32,
+    position: usize,
+    target_sample_rate: u32,
+    resampler: Option<BoxedResampler>,
+}
+
+impl DecodedAudioReader {
+    #[cfg(test)]
+    fn from_file(
+        file: File,
+        extension: &str,
+        mime_type: Option<&str>,
+        target_sample_rate: u32,
+    ) -> Result<Self> {
+        let all_samples =
+            crate::media::loader::decode_audio(file, extension, mime_type, target_sample_rate)?;
+        Ok(Self {
+            buffer: all_samples,
+            sample_rate: target_sample_rate,
+            position: 0,
+            target_sample_rate,
+            resampler: None,
+        })
+    }
+
+    /// Build a reader from already-decoded PCM samples. The samples are assumed
+    /// to already be at `sample_rate`, so no further resampling happens when it
+    /// matches `target_sample_rate`.
+    fn from_samples(buffer: Vec<i16>, sample_rate: u32, target_sample_rate: u32) -> Self {
+        Self {
+            buffer,
+            sample_rate,
+            position: 0,
+            target_sample_rate,
+            resampler: None,
+        }
+    }
+}
+
+impl AudioReader for DecodedAudioReader {
+    fn fill_buffer(&mut self) -> Result<usize> {
+        if self.position >= self.buffer.len() {
+            return Ok(0);
+        }
+        Ok(self.buffer.len() - self.position)
+    }
+
+    fn buffer_size(&self) -> usize {
+        self.buffer.len()
+    }
+
+    fn position(&self) -> usize {
+        self.position
+    }
+
+    fn set_position(&mut self, pos: usize) {
+        self.position = pos;
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    fn target_sample_rate(&self) -> u32 {
+        self.target_sample_rate
+    }
+
+    fn channels(&self) -> u16 {
+        1
+    }
+
+    fn extract_chunk(&self, start: usize, end: usize) -> Vec<i16> {
+        self.buffer[start..end].to_vec()
+    }
+
+    fn resample_chunk(&mut self, chunk: &[i16]) -> Vec<i16> {
+        if self.sample_rate == 0 || self.sample_rate == self.target_sample_rate {
+            return chunk.to_vec();
+        }
+
+        if let Some(resampler) = &mut self.resampler {
+            resampler.resample(chunk)
+        } else {
+            let mut new_resampler = BoxedResampler::new(
+                self.sample_rate as usize,
+                self.target_sample_rate as usize,
+            )
+            .expect("invalid sample rate");
+            let result = new_resampler.resample(chunk);
+            self.resampler = Some(new_resampler);
+            result
+        }
+    }
+}
+
+// Unified function to process any audio reader and stream audio
+async fn process_audio_reader(
+    mut processor_chain: ProcessorChain,
+    mut audio_reader: Box<dyn AudioReader>,
+    track_id: &str,
+    packet_duration_ms: u32,
+    target_sample_rate: u32,
+    token: CancellationToken,
+    paused: Arc<AtomicBool>,
+    packet_sender: TrackPacketSender,
+) -> Result<()> {
+    info!(
+        "streaming audio with target_sample_rate: {}, packet_duration: {}ms",
+        target_sample_rate, packet_duration_ms
+    );
+    let stream_loop = async move {
+        let start_time = Instant::now();
+        let mut ticker = tokio::time::interval(Duration::from_millis(packet_duration_ms as u64));
+        let channels = audio_reader.channels();
+        loop {
+            if paused.load(Ordering::Relaxed) {
+                ticker.tick().await;
+                continue;
+            }
+
+            let Some((chunk, chunk_sample_rate)) = audio_reader.read_chunk(packet_duration_ms)?
+            else {
+                break;
+            };
+
+            let mut packet = AudioFrame {
+                track_id: track_id.to_string(),
+                timestamp: crate::media::get_timestamp(),
+                samples: Samples::PCM { samples: chunk },
+                sample_rate: chunk_sample_rate,
+                channels,
+                ..Default::default()
+            };
+
+            match processor_chain.process_frame(&mut packet) {
+                Ok(_) => {}
+                Err(e) => {
+                    warn!("failed to process audio packet: {}", e);
+                }
+            }
+
+            if let Err(e) = packet_sender.send(packet) {
+                warn!("failed to send audio packet: {}", e);
+                break;
+            }
+
+            ticker.tick().await;
+        }
+
+        info!("stream loop finished in {:?}", start_time.elapsed());
+        Ok(()) as Result<()>
+    };
+
+    select! {
+        _ = token.cancelled() => {
+            info!("stream cancelled");
+            return Ok(());
+        }
+        result = stream_loop => {
+            info!("stream loop finished");
+            result
+        }
+    }
+}
+
+pub struct FileTrack {
+    track_id: TrackId,
+    play_id: Option<String>,
+    config: TrackConfig,
+    cancel_token: CancellationToken,
+    processor_chain: ProcessorChain,
+    path: Option<String>,
+    use_cache: bool,
+    ssrc: u32,
+    offset_ms: u32,
+    /// Hangup intent: hang up the call when this file finishes playing
+    /// (natural completion only, not when cancelled/interrupted).
+    hangup_reason: Option<CallRecordHangupReason>,
+    paused: Arc<AtomicBool>,
+}
+
+impl FileTrack {
+    pub fn new(id: TrackId) -> Self {
+        let config = TrackConfig::default();
+        Self {
+            track_id: id,
+            play_id: None,
+            processor_chain: ProcessorChain::new(config.samplerate),
+            config,
+            cancel_token: CancellationToken::new(),
+            path: None,
+            use_cache: true,
+            ssrc: 0,
+            offset_ms: 0,
+            hangup_reason: None,
+            paused: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn with_play_id(mut self, play_id: Option<String>) -> Self {
+        self.play_id = play_id;
+        self
+    }
+
+    pub fn with_ssrc(mut self, ssrc: u32) -> Self {
+        self.ssrc = ssrc;
+        self
+    }
+    pub fn with_config(mut self, config: TrackConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    pub fn with_cancel_token(mut self, cancel_token: CancellationToken) -> Self {
+        self.cancel_token = cancel_token;
+        self
+    }
+
+    pub fn with_path(mut self, path: String) -> Self {
+        self.path = Some(path);
+        self
+    }
+
+    pub fn with_sample_rate(mut self, sample_rate: u32) -> Self {
+        self.config = self.config.with_sample_rate(sample_rate);
+        self
+    }
+
+    pub fn with_ptime(mut self, ptime: Duration) -> Self {
+        self.config = self.config.with_ptime(ptime);
+        self
+    }
+
+    pub fn with_cache_enabled(mut self, use_cache: bool) -> Self {
+        self.use_cache = use_cache;
+        self
+    }
+
+    pub fn with_offset_ms(mut self, offset_ms: u32) -> Self {
+        self.offset_ms = offset_ms;
+        self
+    }
+
+    /// Arm the hangup intent from the play command's `auto_hangup` flag.
+    pub fn with_auto_hangup(mut self, auto_hangup: Option<bool>) -> Self {
+        self.hangup_reason = if auto_hangup == Some(true) {
+            Some(CallRecordHangupReason::BySystem)
+        } else {
+            None
+        };
+        self
+    }
+}
+
+#[async_trait]
+impl Track for FileTrack {
+    fn ssrc(&self) -> u32 {
+        self.ssrc
+    }
+    fn id(&self) -> &TrackId {
+        &self.track_id
+    }
+    fn config(&self) -> &TrackConfig {
+        &self.config
+    }
+    fn set_paused(&self, paused: bool) -> bool {
+        self.paused.store(paused, Ordering::Relaxed);
+        true
+    }
+    fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
+    }
+    fn processor_chain(&mut self) -> &mut ProcessorChain {
+        &mut self.processor_chain
+    }
+
+    async fn handshake(&mut self, _offer: String, _timeout: Option<Duration>) -> Result<String> {
+        Ok("".to_string())
+    }
+    async fn update_remote_description(&mut self, _answer: &String) -> Result<()> {
+        Ok(())
+    }
+
+    async fn start(
+        &mut self,
+        event_sender: EventSender,
+        packet_sender: TrackPacketSender,
+    ) -> Result<()> {
+        if self.path.is_none() {
+            return Err(anyhow::anyhow!("filetrack: No path provided for FileTrack"));
+        }
+        let path = self.path.clone().unwrap();
+        let id = self.track_id.clone();
+        let sample_rate = self.config.samplerate;
+        let use_cache = self.use_cache;
+        let packet_duration_ms = self.config.ptime.as_millis() as u32;
+        let processor_chain = self.processor_chain.clone();
+        let token = self.cancel_token.clone();
+        let start_time = crate::media::get_timestamp();
+        let ssrc = self.ssrc;
+        let offset_ms = self.offset_ms;
+        let paused = self.paused.clone();
+        // Spawn async task to handle file streaming
+        let play_id = self.play_id.clone();
+        let hangup_reason = self.hangup_reason.clone();
+        crate::spawn(async move {
+            let res = async move {
+                // Load (and cache) the decoded PCM so we don't re-download or
+                // re-decode the original file on every play.
+                let load_result = crate::media::loader::load_audio_as_pcm_cached(
+                    &path,
+                    sample_rate,
+                    use_cache,
+                    offset_ms,
+                )
+                .await;
+                let samples = match load_result {
+                    Ok(samples) => samples,
+                    Err(e) => {
+                        warn!("filetrack: Error loading audio: {} {}", path, e);
+                        event_sender
+                            .send(SessionEvent::Error {
+                                track_id: id.clone(),
+                                timestamp: crate::media::get_timestamp(),
+                                sender: format!("filetrack: {}", path),
+                                error: e.to_string(),
+                                code: None,
+                            })
+                            .ok();
+                        event_sender
+                            .send(SessionEvent::TrackEnd {
+                                track_id: id,
+                                timestamp: crate::media::get_timestamp(),
+                                duration: crate::media::get_timestamp() - start_time,
+                                ssrc,
+                                play_id: play_id.clone(),
+                                auto_hangup: hangup_reason.clone(),
+                            })
+                            .ok();
+                        return Err(e);
+                    }
+                };
+
+                // Stream the decoded PCM (offset already applied during load)
+                let stream_result = stream_pcm_samples(
+                    processor_chain,
+                    samples,
+                    sample_rate,
+                    &id,
+                    packet_duration_ms,
+                    token.clone(),
+                    paused,
+                    packet_sender,
+                )
+                .await;
+
+                // Handle any streaming errors
+                if let Err(e) = stream_result {
+                    warn!("filetrack: Error streaming audio: {}, {}", path, e);
+                    event_sender
+                        .send(SessionEvent::Error {
+                            track_id: id.clone(),
+                            timestamp: crate::media::get_timestamp(),
+                            sender: format!("filetrack: {}", path),
+                            error: e.to_string(),
+                            code: None,
+                        })
+                        .ok();
+                }
+
+                // Send track end event
+                event_sender
+                    .send(SessionEvent::TrackEnd {
+                        track_id: id,
+                        timestamp: crate::media::get_timestamp(),
+                        duration: crate::media::get_timestamp() - start_time,
+                        ssrc,
+                        play_id,
+                        auto_hangup: if token.is_cancelled() {
+                            None
+                        } else {
+                            hangup_reason
+                        },
+                    })
+                    .ok();
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            if let Err(e) = res {
+                debug!("filetrack: streaming task finished with error: {:?}", e);
+            }
+        });
+        Ok(())
+    }
+
+    async fn stop(&self) -> Result<()> {
+        // Cancel the file streaming task
+        self.cancel_token.cancel();
+        Ok(())
+    }
+
+    // Do nothing as we are not sending packets
+    async fn send_packet(&mut self, _packet: &AudioFrame) -> Result<()> {
+        Ok(())
+    }
+}
+
+// Helper function to stream already-decoded PCM samples
+async fn stream_pcm_samples(
+    processor_chain: ProcessorChain,
+    samples: Vec<i16>,
+    target_sample_rate: u32,
+    track_id: &str,
+    packet_duration_ms: u32,
+    token: CancellationToken,
+    paused: Arc<AtomicBool>,
+    packet_sender: TrackPacketSender,
+) -> Result<()> {
+    let reader =
+        DecodedAudioReader::from_samples(samples, target_sample_rate, target_sample_rate);
+    let audio_reader = Box::new(reader) as Box<dyn AudioReader>;
+    info!(
+        "filetrack: streaming {} decoded samples at {} Hz",
+        audio_reader.buffer_size(),
+        audio_reader.sample_rate(),
+    );
+    process_audio_reader(
+        processor_chain,
+        audio_reader,
+        track_id,
+        packet_duration_ms,
+        target_sample_rate,
+        token,
+        paused,
+        packet_sender,
+    )
+    .await
+}
+
+/// Read WAV file and return PCM samples and sample rate
+pub fn read_wav_file(path: &str) -> Result<(PcmBuf, u32)> {
+    let reader = BufReader::new(File::open(path)?);
+    let mut wav_reader = WavReader::new(reader)?;
+    let spec = wav_reader.spec();
+    let mut all_samples = Vec::new();
+
+    match spec.sample_format {
+        hound::SampleFormat::Int => match spec.bits_per_sample {
+            16 => {
+                for sample in wav_reader.samples::<i16>() {
+                    all_samples.push(sample.unwrap_or(0));
+                }
+            }
+            8 => {
+                for sample in wav_reader.samples::<i8>() {
+                    all_samples.push(sample.unwrap_or(0) as i16);
+                }
+            }
+            24 | 32 => {
+                for sample in wav_reader.samples::<i32>() {
+                    all_samples.push((sample.unwrap_or(0) >> 16) as i16);
+                }
+            }
+            _ => {
+                return Err(anyhow!(
+                    "Unsupported bits per sample: {}",
+                    spec.bits_per_sample
+                ));
+            }
+        },
+        hound::SampleFormat::Float => {
+            for sample in wav_reader.samples::<f32>() {
+                all_samples.push((sample.unwrap_or(0.0) * 32767.0) as i16);
+            }
+        }
+    }
+
+    // If stereo, convert to mono by averaging channels
+    if spec.channels == 2 {
+        let mono_samples = all_samples
+            .chunks(2)
+            .map(|chunk| ((chunk[0] as i32 + chunk[1] as i32) / 2) as i16)
+            .collect();
+        all_samples = mono_samples;
+    }
+    Ok((all_samples, spec.sample_rate))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[tokio::test]
+    async fn test_wav_reader() -> Result<()> {
+        let file_path = "fixtures/sample.wav";
+        let file = File::open(file_path)?;
+        let mut reader = DecodedAudioReader::from_file(file, "wav", None, 16000)?;
+        let mut total_samples = 0;
+        let mut total_duration_ms = 0.0;
+        let mut chunk_count = 0;
+        while let Some((chunk, chunk_sample_rate)) = reader.read_chunk(20)? {
+            total_samples += chunk.len();
+            chunk_count += 1;
+            let chunk_duration_ms = (chunk.len() as f64 / chunk_sample_rate as f64) * 1000.0;
+            total_duration_ms += chunk_duration_ms;
+        }
+
+        let duration_seconds = total_duration_ms / 1000.0;
+        println!("Total chunks: {}", chunk_count);
+        println!("Actual samples: {}", total_samples);
+        println!("Actual duration: {:.2} seconds", duration_seconds);
+        assert_eq!(format!("{:.2}", duration_seconds), "7.51");
+        Ok(())
+    }
+    #[tokio::test]
+    async fn test_wav_file_track() -> Result<()> {
+        println!("Starting WAV file track test");
+
+        let file_path = "fixtures/sample.wav";
+        let file = File::open(file_path)?;
+
+        // First get the expected duration and samples using hound directly
+        let mut reader = hound::WavReader::new(File::open(file_path)?)?;
+        let spec = reader.spec();
+        let total_expected_samples = reader.duration() as usize;
+        let expected_duration = total_expected_samples as f64 / spec.sample_rate as f64;
+        println!("WAV file spec: {:?}", spec);
+        println!("Expected samples: {}", total_expected_samples);
+        println!("Expected duration: {:.2} seconds", expected_duration);
+
+        // Verify we can read all samples
+        let mut verify_samples = Vec::new();
+        for sample in reader.samples::<i16>() {
+            verify_samples.push(sample?);
+        }
+        println!("Verified total samples: {}", verify_samples.len());
+
+        let mut reader = DecodedAudioReader::from_file(file, "wav", None, 16000)?;
+        let mut total_samples = 0;
+        let mut total_duration_ms = 0.0;
+        let mut chunk_count = 0;
+
+        while let Some((chunk, chunk_sample_rate)) = reader.read_chunk(320)? {
+            total_samples += chunk.len();
+            chunk_count += 1;
+            // Calculate duration for this chunk
+            let chunk_duration_ms = (chunk.len() as f64 / chunk_sample_rate as f64) * 1000.0;
+            total_duration_ms += chunk_duration_ms;
+        }
+
+        let duration_seconds = total_duration_ms / 1000.0;
+        println!("Total chunks: {}", chunk_count);
+        println!("Actual samples: {}", total_samples);
+        println!("Actual duration: {:.2} seconds", duration_seconds);
+
+        // Allow for 1% tolerance in duration and sample count
+        const TOLERANCE: f64 = 0.01; // 1% tolerance
+
+        // If the file is stereo, we need to adjust the expected sample count
+        let expected_samples = if spec.channels == 2 {
+            total_expected_samples / 2 // We convert stereo to mono
+        } else {
+            total_expected_samples
+        };
+
+        assert!(
+            (duration_seconds - expected_duration).abs() < expected_duration * TOLERANCE,
+            "Duration {:.2} differs from expected {:.2} by more than {}%",
+            duration_seconds,
+            expected_duration,
+            TOLERANCE * 100.0
+        );
+
+        assert!(
+            (total_samples as f64 - expected_samples as f64).abs()
+                < expected_samples as f64 * TOLERANCE,
+            "Sample count {} differs from expected {} by more than {}%",
+            total_samples,
+            expected_samples,
+            TOLERANCE * 100.0
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_mp3_decode_sample_file() -> Result<()> {
+        let file_path = "fixtures/sample.mp3".to_string();
+        match File::open(&file_path) {
+            Ok(file) => {
+                let samples = crate::media::loader::decode_audio(file, "mp3", None, 16000)?;
+                assert!(
+                    !samples.is_empty(),
+                    "Decoded sample list should not be empty"
+                );
+            }
+            Err(_) => {
+                println!("Skipping MP3 test: sample file not found at {}", file_path);
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_mp3_file_track() -> Result<()> {
+        println!("Starting MP3 file track test");
+
+        // Check if the MP3 file exists
+        let file_path = "fixtures/sample.mp3".to_string();
+        let file = File::open(&file_path)?;
+        let sample_rate = 16000;
+        let mut reader = DecodedAudioReader::from_file(file, "mp3", None, sample_rate)?;
+        let mut total_samples = 0;
+        let mut total_duration_ms = 0.0;
+        while let Some((chunk, _chunk_sample_rate)) = reader.read_chunk(320)? {
+            total_samples += chunk.len();
+            // Calculate duration for this chunk
+            let chunk_duration_ms = (chunk.len() as f64 / sample_rate as f64) * 1000.0;
+            total_duration_ms += chunk_duration_ms;
+        }
+        let duration_seconds = total_duration_ms / 1000.0;
+        println!("Total samples: {}", total_samples);
+        println!("Duration: {:.2} seconds", duration_seconds);
+
+        const EXPECTED_SAMPLES: usize = 226310;
+        assert!(
+            total_samples == EXPECTED_SAMPLES,
+            "Sample count {} does not match expected {}",
+            total_samples,
+            EXPECTED_SAMPLES
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "manual debug helper: dumps raw pcm for ffplay"]
+    async fn dump_mp3_as_16k_pcm_for_ffplay() -> Result<()> {
+        let input_path = "fixtures/sample.mp3";
+        let output_path = "target/tmp/sample_16k_mono_s16le.pcm";
+
+        let file = File::open(input_path)?;
+        let mut reader = DecodedAudioReader::from_file(file, "mp3", None, 16000)?;
+
+        let mut pcm_samples = Vec::<i16>::new();
+        while let Some((chunk, _chunk_sample_rate)) = reader.read_chunk(320)? {
+            pcm_samples.extend_from_slice(&chunk);
+        }
+
+        std::fs::create_dir_all("target/tmp")?;
+        let mut out = std::fs::File::create(output_path)?;
+        for sample in pcm_samples {
+            out.write_all(&sample.to_le_bytes())?;
+        }
+        out.flush()?;
+
+        println!("PCM dumped: {}", output_path);
+        println!("ffplay -f s16le -ar 16000 -ac 1 {}", output_path);
+        Ok(())
+    }
+}

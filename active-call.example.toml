@@ -1,0 +1,152 @@
+# Active Call Configuration
+#
+# CLI Options (override config file):
+#   --conf <path>          : Load configuration from file
+#   --http <addr:port>     : HTTP server bind address
+#   --sip <addr:port>      : SIP server bind address
+#   --handler <value>      : Quick handler setup
+#                            - URL (http://...) for webhook handler
+#                            - .md file for playbook default handler
+#   --call <SIP_URI>       : Initiate an outgoing SIP call immediately
+#   --external-ip <IP>     : Set external IP address
+#   --codecs <CODECS>      : Supported codecs (e.g., pcmu,pcma,opus)
+#
+# Examples:
+#   ./active-call --handler https://api.example.com/webhook
+#   ./active-call --handler default.md --sip 0.0.0.0:13050 --external-ip 1.2.3.4 --codecs pcmu,pcma
+#   ./active-call --call sip:1001@127.0.0.1 --handler greeting.md
+
+addr = "0.0.0.0"
+http_addr = "0.0.0.0:8080"
+udp_port = 13050
+# http_gzip = true
+log_level = "debug"
+#log_file = "/tmp/rustpbx.log"
+# Paths can include a trailing * to skip whole subtrees
+# http_access_skip_paths = ["/health", "/metrics*"]
+media_cache_path = "./config/mediacache"
+
+# Other active-call nodes in the cluster ("ip:port" of their HTTP/WS endpoint).
+# When a websocket client connects to /call with a session id that is NOT hosted
+# on this node, the node polls every peer (one hop, marked forward=true) and
+# tunnels the websocket to the first peer that hosts the call. A node that
+# receives forward=true answers locally only and never forwards again.
+# If no peer hosts it and the request is a normal (non-forwarded) client
+# connection, this node falls back to creating the call locally as usual.
+# peers = ["10.0.0.2:8080", "10.0.0.3:8080"]
+
+# external IP address for SIP signaling and media
+# if server is behind NAT, set your public IP here (without port)
+# external_ip = "1.2.3.4"
+# auto learn public SIP address from Via received/rport in responses
+# auto_learn_public_address = true
+
+# rtp_start_port = 20000
+# rtp_end_port = 30000
+#
+# enable_rtp_latching = true
+# enable_ice_lite = false
+# rtp_bind_ip = 0.0.0.0
+
+# Graceful shutdown: on SIGTERM/Ctrl-C, stop accepting new calls and wait for
+# in-progress calls to finish before exiting.
+# graceful_shutdown = true
+#
+# Total seconds to wait during graceful shutdown before forcing exit.
+# SIP de-registration and active call draining run in parallel, both with this timeout.
+# graceful_shutdown_timeout = 30
+
+# setup your STUN/TURN servers here, for webrtc web clients
+# [[ice_servers]]
+# urls = ["stun:stun.l.google.com:19302"]
+
+# [[ice_servers]]
+# urls = ["turn:restsend.com:3478"]
+# username = "user"
+# credential = "pass"
+
+# Invitation handler - handles incoming SIP invitations
+# Option 1: Webhook handler - forward invitations to HTTP endpoint
+# [handler]
+# type = "webhook"
+# url = "http://localhost:8090/webhook"
+# method = "POST"
+
+# Option 2: Playbook handler - route calls to playbooks based on caller/callee patterns
+# [handler]
+# type = "playbook"
+# default = "default.md"  # optional: default playbook when no rules match
+#
+# [[handler.rules]]
+# caller = "^\\+1\\d{10}$"        # regex pattern for caller number
+# callee = "^sip:support@.*"      # regex pattern for callee number
+# playbook = "support.md"         # playbook file to use
+#
+# [[handler.rules]]
+# caller = "^\\+86\\d+"           # pattern for Chinese numbers
+# playbook = "chinese.md"         # optional: only match caller
+#
+# [[handler.rules]]
+# callee = "^sip:sales@.*"        # optional: only match callee
+# playbook = "sales.md"
+
+# [handler]
+# type = "webhook"
+# url = "http://localhost:8090/webhook"
+# method = "POST"
+
+[recording]
+enabled = true
+auto_start = true
+# Record at the source's native sample rate (e.g. 8kHz for PCMU) instead of
+# resampling to 16kHz. The rate is detected from the caller leg's codec.
+# native_samplerate = true
+# samplerate = 16000              # fallback rate when native detection is off
+# ptime = 200                     # ms of audio per write
+# format = "wav"                  # wav | pcm | pcmu | pcma | g722
+
+[callrecord]
+type = "local"
+root = "./config/cdr"
+
+# [[register_users]]
+# server = "127.0.0.1:5060" # Your Asterisk server
+# username = "1002"        # SIP extension
+# disabled = false         # Set to true to disable this account
+
+# [register_users.credential]
+# username = "1002"
+# password = ""     # Leave empty for IP-based auth
+
+# ---------------------------------------------------------------------------
+# Trunk rules: match + rewrite the outgoing SIP INVITE/REFER.
+#
+# Rules are evaluated in declaration order; the FIRST rule whose match
+# conditions all hold (AND) is applied (first-match-wins). A rule with no
+# match conditions always matches and acts as a catch-all default.
+#
+# Available match fields (regex against the From / To / Request-URI):
+#   rule.match.from.user  - caller username (before @)
+#   rule.match.from.host  - caller host     (after @)
+#   rule.match.to.user    - callee username (To header / Request-URI user)
+#   rule.match.to.host    - callee host     (To header / Request-URI host)
+#
+# Available rewrite fields:
+#   rule.rewrite.from.user / rule.rewrite.from.host      - rewrite caller URI
+#   rule.rewrite.to.user   / rule.rewrite.to.host        - rewrite callee URI
+#   rule.rewrite.contact.user / rule.rewrite.contact.host - rewrite Contact URI
+#
+# A host rewrite value without a port preserves the original port; include a
+# port (e.g. "1.2.3.4:5060") to change it too.
+#
+# Example: pick the SIP Contact address (external_ip vs internal IP) based on
+# whether the target is on the internal network, so the called SBC/trunk can
+# reach this UA on the right interface.
+#
+# [[trunk_rules]]
+# rule.match.to.host = "^172\\.25\\."          # target on internal network
+# rule.rewrite.contact.host = "172.25.225.2"   # advertise internal IP as contact
+#
+# [[trunk_rules]]
+# rule.rewrite.contact.host = "1.2.3.4"        # catch-all: external targets use external_ip
+# ---------------------------------------------------------------------------

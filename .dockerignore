@@ -1,0 +1,36 @@
+# Git
+.git
+.gitignore
+
+# Build artifacts
+target/
+*.rs.bk
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.cursor/
+
+# Environment files (should be provided at runtime, not build time)
+.env
+.env.*
+
+# Documentation
+docs/
+*.md
+!README.md
+
+# Test data and configs
+tests/
+config/cdr/
+config/mediacache/
+config/recorders/
+
+# Other
+Dockerfile
+.dockerignore
+*.sqlite3
+*.log
+dhat-heap.json

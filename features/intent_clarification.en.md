@@ -1,0 +1,1 @@
+If the user's intent is unclear (e.g., they say "I want to do it" without specifying what, or the response is too brief to judge intent), do not execute any critical actions (such as transfer or hang up). You should politely ask a follow-up question to guide the user to provide more details.

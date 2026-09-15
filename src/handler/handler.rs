@@ -1,0 +1,795 @@
+use crate::media::cache;
+use crate::synthesis::{SynthesisEvent, SynthesisOption};
+use crate::{
+    app::AppState,
+    call::{
+        ActiveCall, ActiveCallType, Command,
+        active_call::{ActiveCallGuard, CallParams, CallSpec},
+    },
+    handler::playbook,
+    playbook::{Playbook, PlaybookRunner},
+};
+use crate::{event::SessionEvent, media::track::TrackConfig};
+use axum::{
+    Json, Router,
+    extract::{Path, Query, State, WebSocketUpgrade, ws::Message},
+    response::sse::{Event, KeepAlive, Sse},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
+use bytes::Bytes;
+use chrono::Utc;
+use futures::{SinkExt, StreamExt};
+use rustrtc::IceServer;
+use serde_json::json;
+use std::collections::HashMap;
+use std::{path::PathBuf, sync::Arc, time::Duration};
+use tokio::{join, select};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, trace, warn};
+use uuid::Uuid;
+
+fn filter_headers(
+    extras: &mut std::collections::HashMap<String, serde_json::Value>,
+    allowed_headers: &[String],
+) {
+    extras.retain(|k, _| allowed_headers.iter().any(|h| h.eq_ignore_ascii_case(k)));
+}
+
+pub fn call_router() -> Router<AppState> {
+    let r = Router::new()
+        .route("/call", get(ws_handler))
+        .route("/call/webrtc", get(webrtc_handler))
+        .route("/call/sip", get(sip_handler))
+        .route("/list", get(list_active_calls))
+        .route("/kill/{id}", get(kill_active_call))
+        .route("/events/{id}", get(stream_events))
+        .route("/command/{id}", post(send_command))
+        .route("/precache", post(precache));
+    r
+}
+
+pub fn iceservers_router() -> Router<AppState> {
+    let r = Router::new();
+    r.route("/iceservers", get(get_iceservers))
+}
+
+pub fn playbook_router() -> Router<AppState> {
+    Router::new()
+        .route("/api/playbooks", get(playbook::list_playbooks))
+        .route(
+            "/api/playbooks/{name}",
+            get(playbook::get_playbook).post(playbook::save_playbook),
+        )
+        .route(
+            "/api/playbook/run",
+            axum::routing::post(playbook::run_playbook),
+        )
+        .route("/api/records", get(playbook::list_records))
+}
+
+pub async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    Query(params): Query<CallParams>,
+) -> Response {
+    call_handler(ActiveCallType::WebSocket, ws, state, params).await
+}
+
+pub async fn sip_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    Query(params): Query<CallParams>,
+) -> Response {
+    call_handler(ActiveCallType::Sip, ws, state, params).await
+}
+
+pub async fn webrtc_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    Query(params): Query<CallParams>,
+) -> Response {
+    call_handler(ActiveCallType::Webrtc, ws, state, params).await
+}
+
+/// Core call handling logic that works with either WebSocket or mpsc channels
+///
+/// `extras` and `playbook_name` are session-scoped parameters passed directly
+/// by the caller (SIP handler, CLI, etc.) instead of through global maps.
+/// Returns the final call extras (including `_hangup_headers` if set) so the
+/// caller can use them for SIP BYE or other post-call processing.
+pub async fn call_handler_core(
+    call_type: ActiveCallType,
+    session_id: String,
+    app_state: AppState,
+    cancel_token: CancellationToken,
+    audio_receiver: tokio::sync::mpsc::UnboundedReceiver<Bytes>,
+    server_side_track: Option<String>,
+    dump_events: bool,
+    ping_interval: u64,
+    mut command_receiver: tokio::sync::mpsc::UnboundedReceiver<Command>,
+    event_sender_to_client: tokio::sync::mpsc::UnboundedSender<crate::event::SessionEvent>,
+    extras: Option<HashMap<String, serde_json::Value>>,
+    playbook_name: Option<String>,
+) -> Option<HashMap<String, serde_json::Value>> {
+    let _cancel_guard = cancel_token.clone().drop_guard();
+    let track_config = TrackConfig::default();
+
+    let active_call = Arc::new(ActiveCall::new(CallSpec {
+        call_type: call_type.clone(),
+        cancel_token: cancel_token.clone(),
+        session_id: session_id.clone(),
+        invitation: app_state.invitation.clone(),
+        app_state: app_state.clone(),
+        track_config,
+        audio_receiver: Some(audio_receiver),
+        dump_events,
+        server_side_track_id: server_side_track.clone(),
+        extras,
+    }));
+
+    // Load playbook: prefer direct parameter, fall back to pending_playbooks
+    // (pending_playbooks is used by the run_playbook HTTP endpoint)
+    {
+        let name_or_content = playbook_name.or_else(|| {
+            app_state
+                .pending_playbooks
+                .try_lock()
+                .ok()
+                .and_then(|mut pending| pending.remove(&session_id).map(|(val, _)| val))
+        });
+        if let Some(name_or_content) = name_or_content {
+            let playbook_result = if name_or_content.trim().starts_with("---") {
+                Playbook::parse(&name_or_content)
+            } else {
+                // If path already contains config/playbook, use it as-is; otherwise prepend it
+                let path = if name_or_content.starts_with("config/playbook/") {
+                    PathBuf::from(&name_or_content)
+                } else {
+                    PathBuf::from("config/playbook").join(&name_or_content)
+                };
+                Playbook::load(path).await
+            };
+
+            match playbook_result {
+                Ok(mut playbook) => {
+                    // Filter extracted headers if configured (only for SIP calls)
+                    if call_type == ActiveCallType::Sip {
+                        if let Some(sip_config) = &playbook.config.sip {
+                            if let Some(allowed_headers) = &sip_config.extract_headers {
+                                let extras = active_call.extras.rcu(|e| {
+                                    let mut e = HashMap::clone(e);
+                                    filter_headers(&mut e, allowed_headers);
+                                    e
+                                });
+                                // Store the list of SIP header keys for later template rendering
+                                let header_keys: Vec<String> = extras
+                                    .keys()
+                                    .filter(|k| !k.starts_with('_'))
+                                    .cloned()
+                                    .collect();
+                                active_call.set_extra(
+                                    "_sip_header_keys",
+                                    serde_json::to_value(&header_keys).unwrap_or_default(),
+                                );
+                                if let Ok(result) = playbook.render(&active_call.extras.load_full())
+                                {
+                                    playbook = result;
+                                }
+                            }
+                        }
+                    }
+
+                    match PlaybookRunner::new(playbook, active_call.clone()) {
+                        Ok(runner) => {
+                            crate::spawn(async move {
+                                runner.run().await;
+                            });
+                            let display_name = if name_or_content.trim().starts_with("---") {
+                                "custom content"
+                            } else {
+                                &name_or_content
+                            };
+                            info!(session_id, "Playbook runner started for {}", display_name);
+                        }
+                        Err(e) => {
+                            let display_name = if name_or_content.trim().starts_with("---") {
+                                "custom content"
+                            } else {
+                                &name_or_content
+                            };
+                            warn!(
+                                session_id,
+                                "Failed to create runner {}: {}", display_name, e
+                            )
+                        }
+                    }
+                }
+                Err(e) => {
+                    let display_name = if name_or_content.trim().starts_with("---") {
+                        "custom content"
+                    } else {
+                        &name_or_content
+                    };
+                    warn!(
+                        session_id,
+                        "Failed to load playbook {}: {}", display_name, e
+                    );
+                    let event = SessionEvent::Error {
+                        timestamp: crate::media::get_timestamp(),
+                        track_id: session_id.clone(),
+                        sender: "playbook".to_string(),
+                        error: format!("{}", e),
+                        code: None,
+                    };
+                    event_sender_to_client.send(event).ok();
+                    return None;
+                }
+            }
+        }
+    }
+
+    let recv_commands_loop = async {
+        while let Some(command) = command_receiver.recv().await {
+            if let Err(_) = active_call.enqueue_command(command).await {
+                break;
+            }
+        }
+    };
+
+    let mut event_receiver = active_call.event_sender.subscribe();
+    let send_events_loop = async {
+        loop {
+            match event_receiver.recv().await {
+                Ok(event) => {
+                    if let Err(_) = event_sender_to_client.send(event) {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+    };
+
+    let send_ping_loop = async {
+        if ping_interval == 0 {
+            active_call.cancel_token.cancelled().await;
+            return;
+        }
+        let mut ticker = tokio::time::interval(Duration::from_secs(ping_interval));
+        loop {
+            ticker.tick().await;
+            let payload = Utc::now().to_rfc3339();
+            let event = SessionEvent::Ping {
+                timestamp: crate::media::get_timestamp(),
+                payload: Some(payload),
+            };
+            if let Err(_) = active_call.event_sender.send(event) {
+                break;
+            }
+        }
+    };
+
+    let guard = ActiveCallGuard::new(active_call.clone());
+    info!(
+        session_id,
+        active_calls = guard.active_calls,
+        ?call_type,
+        "new call started"
+    );
+    let receiver = active_call.new_receiver();
+
+    let (r, _) = join! {
+        active_call.clone().serve(receiver),
+        async {
+            select!{
+                _ = send_ping_loop => {},
+                _ = cancel_token.cancelled() => {},
+                _ = send_events_loop => { },
+                _ = recv_commands_loop => {
+                    info!(session_id, "Command receiver closed");
+                },
+            }
+            cancel_token.cancel();
+        }
+    };
+    // drain events
+    while let Ok(event) = event_receiver.try_recv() {
+        if let Err(_) = event_sender_to_client.send(event) {
+            break;
+        }
+    }
+    match r {
+        Ok(_) => info!(session_id, "call ended successfully"),
+        Err(e) => warn!(session_id, "call ended with error: {}", e),
+    }
+
+    // Capture final extras (including _hangup_headers) before cleanup
+    let final_extras = Some(active_call.extras.load_full().as_ref().clone());
+
+    active_call.cleanup().await.ok();
+    debug!(session_id, "Call handler core completed");
+
+    final_extras
+}
+
+pub async fn call_handler(
+    call_type: ActiveCallType,
+    ws: WebSocketUpgrade,
+    app_state: AppState,
+    params: CallParams,
+) -> Response {
+    let has_explicit_id = params.id.is_some();
+    let session_id = params
+        .id
+        .clone()
+        .unwrap_or_else(|| format!("s.{}", Uuid::new_v4().to_string()));
+    let server_side_track = params.server_side_track.clone();
+    let dump_events = params.dump_events.unwrap_or(true);
+    let ping_interval = params.ping_interval.unwrap_or(20);
+
+    // Only an empty `forward` may hop to peers. Any present value is local-only.
+    // `forward=true` probes 404 if the call is absent so the originator can try
+    // the next peer instead of creating a new call.
+    //
+    // A ringing inbound SIP call only exists as a pending dialog (registered by
+    // the INVITE handler), not yet in `active_calls` — the ActiveCall is
+    // created by the websocket attach below. Treat pending dialogs as hosted
+    // locally so the attach neither probes peers nor 404s (same predicate the
+    // ActiveCall itself uses to resolve its SIP dialog).
+    if has_explicit_id {
+        let found_locally = {
+            let active_calls = app_state.active_calls.lock().unwrap();
+            active_calls.contains_key(&session_id)
+        } || app_state
+            .invitation
+            .find_dialog_id_by_session_id(&session_id)
+            .is_some();
+        if !found_locally {
+            if params.forward.is_none() {
+                if let Some(peer_ws) =
+                    crate::handler::peer::try_forward(&app_state, &session_id, &params).await
+                {
+                    info!(session_id, "forwarding websocket to peer hosting the call");
+                    return ws.on_upgrade(move |socket| async move {
+                        crate::handler::peer::tunnel(socket, peer_ws).await;
+                    });
+                }
+            }
+            if params.forward == Some(true) {
+                warn!(
+                    session_id,
+                    "call not found on this node, rejecting forwarded request"
+                );
+                return (
+                    axum::http::StatusCode::NOT_FOUND,
+                    "call not found on this node",
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let resp = ws.on_upgrade(move |socket| async move {
+        let (mut ws_sender, mut ws_receiver) = socket.split();
+        let (audio_sender, audio_receiver) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+        let (command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel::<Command>();
+        let (event_sender_to_client, mut event_receiver_from_core) =
+            tokio::sync::mpsc::unbounded_channel::<crate::event::SessionEvent>();
+        let cancel_token = CancellationToken::new();
+
+        // Start core handler in background
+        let session_id_clone = session_id.clone();
+        let app_state_clone = app_state.clone();
+        let cancel_token_clone = cancel_token.clone();
+        crate::spawn(async move {
+            call_handler_core(
+                call_type,
+                session_id_clone,
+                app_state_clone,
+                cancel_token_clone,
+                audio_receiver,
+                server_side_track,
+                dump_events,
+                ping_interval.into(),
+                command_receiver,
+                event_sender_to_client,
+                None, // extras — not used for WebSocket calls
+                None, // playbook_name — falls back to pending_playbooks
+            )
+            .await;
+        });
+
+        // Handle WebSocket I/O
+        let recv_from_ws_loop = async {
+            while let Some(Ok(message)) = ws_receiver.next().await {
+                match message {
+                    Message::Text(text) => {
+                        let command = match serde_json::from_str::<Command>(&text) {
+                            Ok(cmd) => cmd,
+                            Err(e) => {
+                                warn!(session_id, %text, "Failed to parse command {}", e);
+                                continue;
+                            }
+                        };
+                        if let Err(_) = command_sender.send(command) {
+                            break;
+                        }
+                    }
+                    Message::Binary(bin) => {
+                        audio_sender.send(bin.into()).ok();
+                    }
+                    Message::Close(_) => {
+                        info!(session_id, "WebSocket closed by client");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        };
+
+        let send_to_ws_loop = async {
+            while let Some(event) = event_receiver_from_core.recv().await {
+                trace!(session_id, %event, "Sending WS message");
+                let message = match event.into_ws_message() {
+                    Ok(msg) => msg,
+                    Err(e) => {
+                        warn!(session_id, error=%e, "Failed to serialize event to WS message");
+                        continue;
+                    }
+                };
+                if let Err(_) = ws_sender.send(message).await {
+                    info!(session_id, "WebSocket send failed, closing");
+                    break;
+                }
+            }
+        };
+
+        select! {
+            _ = recv_from_ws_loop => {
+                info!(session_id, "WebSocket receive loop ended");
+            },
+            _ = send_to_ws_loop => {
+                info!(session_id, "WebSocket send loop ended");
+            },
+        }
+
+        cancel_token.cancel();
+        ws_sender.flush().await.ok();
+        ws_sender.close().await.ok();
+        debug!(session_id, "WebSocket connection closed");
+    });
+    resp
+}
+
+pub(crate) async fn get_iceservers(State(state): State<AppState>) -> Response {
+    if let Some(ice_servers) = state.config.ice_servers.as_ref() {
+        return Json(ice_servers).into_response();
+    }
+    Json(vec![IceServer {
+        urls: vec!["stun:stun.l.google.com:19302".to_string()],
+        ..Default::default()
+    }])
+    .into_response()
+}
+
+pub(crate) async fn list_active_calls(State(state): State<AppState>) -> Response {
+    // Clone the call handles out of the registry lock first, then read each
+    // call's lock-free progress snapshot without holding the registry lock.
+    let calls = state
+        .active_calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, c)| c.clone())
+        .collect::<Vec<_>>();
+    let list = calls
+        .iter()
+        .map(|c| {
+            let progress = c.progress.load_full();
+            json!({
+                "id": c.session_id,
+                "callType": c.call_type,
+                "cs.option": progress.option,
+                "ringTime": progress.ring_time,
+                "startTime": progress.answer_time,
+            })
+        })
+        .collect::<Vec<_>>();
+    Json(serde_json::json!({ "active_calls": list })).into_response()
+}
+
+pub(crate) async fn kill_active_call(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    let active_calls = state.active_calls.lock().unwrap();
+    if let Some(call) = active_calls.get(&id) {
+        call.cancel_token.cancel();
+        Json(serde_json::json!({ "status": "killed", "id": id })).into_response()
+    } else {
+        (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "status": "not_found", "id": id })),
+        )
+            .into_response()
+    }
+}
+
+pub(crate) async fn stream_events(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    let mut rx_events;
+    let mut rx_commands;
+    {
+        let active_calls = state.active_calls.lock().unwrap();
+        if let Some(call) = active_calls.get(&id) {
+            rx_events = call.event_sender.subscribe();
+            rx_commands = call.cmd_sender.subscribe();
+        } else {
+            return (axum::http::StatusCode::NOT_FOUND, "track not active").into_response();
+        }
+    }
+
+    let stream = async_stream::stream! {
+        loop {
+            let result = tokio::select! {
+                r = rx_events.recv() => r.map(|e| serde_json::to_string(&e).map(|json| Event::default().event("event").data(json))),
+                r = rx_commands.recv() => r.map(|c| serde_json::to_string(&c).map(|json| Event::default().event("command").data(json))),
+            };
+            match result {
+                Ok(Ok(sse_event)) => yield Ok::<Event, serde_json::Error>(sse_event),
+                Ok(Err(e)) => yield Err(e.into()),
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            }
+        }
+    };
+
+    let mut response = Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response();
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        "text/event-stream;charset=utf-8".parse().unwrap(),
+    );
+    response
+}
+
+pub(crate) async fn send_command(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    Json(command): Json<Command>,
+) -> Response {
+    let active_calls = state.active_calls.lock().unwrap();
+    if let Some(call) = active_calls.get(&id) {
+        if let Ok(_) = call.cmd_sender.send(command) {
+            return Json(serde_json::json!({ "status": "sent", "id": id })).into_response();
+        }
+    }
+
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        Json(serde_json::json!({ "status": "not_found", "id": id })),
+    )
+        .into_response()
+}
+
+/// Pre-generate and cache TTS audio without an active call.
+///
+/// Accepts a `Tts` command (same shape as `/command/{id}`): it synthesizes the
+/// text and stores the audio under the exact cache key the real `do_tts` would
+/// use. A later `Tts` with the same parameters then hits the cache instead of
+/// regenerating.
+///
+/// NOTE: the cache key is derived from the command parameters. For a cache hit
+/// the real command must use the same effective `option` (provider, samplerate,
+/// speaker, speed) — or pass an explicit `cacheKey`.
+pub(crate) async fn precache(
+    State(state): State<AppState>,
+    Json(command): Json<Command>,
+) -> Response {
+    let result = match command {
+        Command::Tts {
+            text,
+            speaker,
+            option,
+            cache_key,
+            ..
+        } => precache_tts(&state, text, speaker, option, cache_key).await,
+        _ => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({ "status": "error", "error": "precache only accepts tts commands" })),
+            )
+                .into_response();
+        }
+    };
+
+    match result {
+        Ok((cache_key, bytes, existed)) => Json(json!({
+            "status": if existed { "exists" } else { "cached" },
+            "cacheKey": cache_key,
+            "bytes": bytes,
+        }))
+        .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "status": "error", "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// Synthesize `text` and store the audio under the same cache key `do_tts` uses.
+/// Returns (cache_key, bytes_stored, already_existed).
+async fn precache_tts(
+    state: &AppState,
+    text: String,
+    speaker: Option<String>,
+    option: Option<SynthesisOption>,
+    cache_key: Option<String>,
+) -> anyhow::Result<(String, usize, bool)> {
+    let mut opt = option.ok_or_else(|| anyhow::anyhow!("tts precache requires an option"))?;
+    // Fold the top-level speaker into the option (same precedence as do_tts)
+    opt.speaker = speaker.or(opt.speaker);
+    opt.check_default();
+
+    let mut client = state.stream_engine.create_tts_client(false, &opt).await?;
+    // Cache key must match tts.rs::handle_cache exactly.
+    let sample_rate = opt.samplerate.unwrap_or(16000) as u32;
+    let cache_key = cache_key.unwrap_or_else(|| {
+        cache::generate_cache_key(
+            &format!("tts:{}{}", client.provider(), text),
+            sample_rate,
+            opt.speaker.as_ref(),
+            opt.speed,
+        )
+    });
+    if cache::is_cached(&cache_key).await.unwrap_or(false) {
+        return Ok((cache_key, 0, true));
+    }
+
+    let mut stream = client.start().await?;
+    client.synthesize(&text, Some(0), Some(opt.clone())).await?;
+    client.stop().await?;
+
+    let mut chunks: Vec<Bytes> = Vec::new();
+    let mut first_chunk = true;
+    while let Some((_seq, res)) = stream.next().await {
+        match res? {
+            SynthesisEvent::AudioChunk(mut chunk) => {
+                // Strip the 44-byte WAV header off the first chunk (same as tts.rs).
+                if first_chunk {
+                    if chunk.len() > 44 && chunk[..4] == [0x52, 0x49, 0x46, 0x46] {
+                        let _ = chunk.split_to(44);
+                    }
+                    first_chunk = false;
+                }
+                chunks.push(chunk);
+            }
+            SynthesisEvent::Finished => break,
+            _ => {}
+        }
+    }
+    if chunks.is_empty() {
+        return Err(anyhow::anyhow!("tts produced no audio"));
+    }
+    let bytes: usize = chunks.iter().map(|c| c.len()).sum();
+    cache::store_in_cache_vectored(&cache_key, &chunks).await?;
+    info!(cache_key = %cache_key, bytes, "precache: stored tts audio");
+    Ok((cache_key, bytes, false))
+}
+
+trait IntoWsMessage {
+    fn into_ws_message(self) -> Result<Message, serde_json::Error>;
+}
+
+impl IntoWsMessage for crate::event::SessionEvent {
+    fn into_ws_message(self) -> Result<Message, serde_json::Error> {
+        match self {
+            SessionEvent::Binary { data, .. } => Ok(Message::Binary(data.into())),
+            SessionEvent::Ping { timestamp, payload } => {
+                let payload = payload.unwrap_or_else(|| timestamp.to_string());
+                Ok(Message::Ping(payload.into()))
+            }
+            event => serde_json::to_string(&event).map(|payload| Message::Text(payload.into())),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_filter_headers() {
+        let mut extras = HashMap::new();
+        extras.insert("X-Tenant-ID".to_string(), json!("123"));
+        extras.insert("X-User-ID".to_string(), json!("456"));
+        extras.insert("Custom-Header".to_string(), json!("abc"));
+        extras.insert("Irrelevant-Header".to_string(), json!("ignore"));
+
+        // Test case-insensitive matching
+        let allowed = vec!["x-tenant-id".to_string(), "Custom-Header".to_string()];
+
+        filter_headers(&mut extras, &allowed);
+
+        assert!(extras.contains_key("X-Tenant-ID"));
+        assert!(extras.contains_key("Custom-Header"));
+        assert!(!extras.contains_key("X-User-ID"));
+        assert!(!extras.contains_key("Irrelevant-Header"));
+
+        // ensure values are preserved
+        assert_eq!(extras.get("X-Tenant-ID").unwrap(), &json!("123"));
+        assert_eq!(extras.get("Custom-Header").unwrap(), &json!("abc"));
+    }
+
+    #[tokio::test]
+    async fn test_call_handler_core_extras_are_session_scoped() {
+        use crate::app::AppStateBuilder;
+        use crate::call::{ActiveCallType, Command};
+        use crate::config::Config;
+
+        let mut config = Config::default();
+        config.udp_port = 0;
+        let app_state = AppStateBuilder::new()
+            .with_config(config)
+            .build()
+            .await
+            .expect("Failed to build app state");
+
+        let session_id = "test-session-scoped".to_string();
+        let cancel_token = CancellationToken::new();
+
+        // Pass extras directly as a parameter (not via global map)
+        let mut extras = HashMap::new();
+        extras.insert("X-Custom".to_string(), json!("value"));
+
+        let (_audio_sender, audio_receiver) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+        let (command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel::<Command>();
+        let (event_sender, _event_receiver) =
+            tokio::sync::mpsc::unbounded_channel::<crate::event::SessionEvent>();
+
+        // Send a Hangup command immediately to end the call
+        command_sender
+            .send(Command::Hangup {
+                reason: None,
+                initiator: None,
+                headers: None,
+                refer: None,
+            })
+            .ok();
+        drop(command_sender);
+
+        // Run call_handler_core with extras passed directly
+        let final_extras = call_handler_core(
+            ActiveCallType::Sip,
+            session_id.clone(),
+            app_state.clone(),
+            cancel_token,
+            audio_receiver,
+            None,
+            false,
+            0,
+            command_receiver,
+            event_sender,
+            Some(extras), // extras passed directly
+            None,         // no playbook
+        )
+        .await;
+
+        // Verify that final extras are returned and contain our custom header
+        assert!(final_extras.is_some(), "final extras should be returned");
+        let extras = final_extras.unwrap();
+        assert_eq!(
+            extras.get("X-Custom"),
+            Some(&json!("value")),
+            "session-scoped extras should be preserved"
+        );
+    }
+}

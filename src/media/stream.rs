@@ -1,0 +1,784 @@
+use crate::event::{EventSender, SessionEvent};
+use crate::media::ambiance::{AmbianceOption, AmbianceProcessor};
+use crate::media::dtmf::DtmfDetector;
+use crate::media::volume_control::HoldProcessor;
+use crate::media::{AudioFrame, INTERNAL_SAMPLERATE, Samples, TrackId};
+use crate::media::{
+    processor::Processor,
+    recorder::{Recorder, RecorderOption},
+    track::{Track, TrackPacketReceiver, TrackPacketSender},
+};
+use anyhow::Result;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::sync::{
+    Arc, Mutex as StdMutex,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
+use std::time::Duration;
+use tokio::task::JoinHandle;
+use tokio::{
+    select,
+    sync::{Mutex, mpsc},
+};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, warn};
+use uuid;
+
+pub struct MediaStream {
+    id: String,
+    pub cancel_token: CancellationToken,
+    recorder_option: Mutex<Option<RecorderOption>>,
+    tracks: Mutex<HashMap<TrackId, (Box<dyn Track>, DtmfDetector)>>,
+    /// Trickle ICE candidates that arrived before any track existed to feed
+    /// them to. Drained into the next track started.
+    pending_ice_candidates: Mutex<Vec<(String, Option<String>, Option<u32>)>>,
+    suppressed_sources: Mutex<HashSet<TrackId>>,
+    event_sender: EventSender,
+    pub packet_sender: TrackPacketSender,
+    packet_receiver: Mutex<Option<TrackPacketReceiver>>,
+    recorder_sender: mpsc::UnboundedSender<AudioFrame>,
+    recorder_receiver: Mutex<Option<mpsc::UnboundedReceiver<AudioFrame>>>,
+    recorder_handle: Mutex<Option<JoinHandle<()>>>,
+    /// True once a recorder task is actually consuming `recorder_sender`.
+    /// The ambiance idle loop mirrors its frames to the recorder only when
+    /// this is set, avoiding unbounded buffering when recording starts late.
+    recording_active: Arc<AtomicBool>,
+    ambiance: Mutex<Option<Arc<StdMutex<AmbianceProcessor>>>>,
+    ambiance_source_id: StdMutex<Option<TrackId>>,
+    last_server_packet_ts: Arc<AtomicU64>,
+    ambiance_idle_started: AtomicBool,
+}
+
+const CALLEE_TRACK_ID: &str = "callee-track";
+const QUEUE_HOLD_TRACK_ID: &str = "queue-hold-track";
+pub const SERVER_SIDE_TRACK_ID: &str = "server-side-track";
+const AMBIANCE_IDLE_TRACK_ID: &str = "ambiance-track";
+const AMBIANCE_IDLE_PTIME: Duration = Duration::from_millis(20);
+// Skip idle fill if server-side audio arrived within this window (TTS ptime is 20ms).
+const AMBIANCE_IDLE_GAP_MS: u64 = 25;
+
+pub struct MediaStreamBuilder {
+    cancel_token: Option<CancellationToken>,
+    id: Option<String>,
+    event_sender: EventSender,
+    recorder_config: Option<RecorderOption>,
+}
+
+impl MediaStreamBuilder {
+    pub fn new(event_sender: EventSender) -> Self {
+        Self {
+            id: Some(format!("ms:{}", uuid::Uuid::new_v4())),
+            cancel_token: None,
+            event_sender,
+            recorder_config: None,
+        }
+    }
+    pub fn with_id(mut self, id: String) -> Self {
+        self.id = Some(id);
+        self
+    }
+
+    pub fn with_cancel_token(mut self, cancel_token: CancellationToken) -> Self {
+        self.cancel_token = Some(cancel_token);
+        self
+    }
+
+    pub fn with_recorder_config(mut self, recorder_config: RecorderOption) -> Self {
+        self.recorder_config = Some(recorder_config);
+        self
+    }
+
+    pub fn build(self) -> MediaStream {
+        let cancel_token = self
+            .cancel_token
+            .unwrap_or_else(|| CancellationToken::new());
+        let tracks = Mutex::new(HashMap::new());
+        let (track_packet_sender, track_packet_receiver) = mpsc::unbounded_channel();
+        let (recorder_sender, recorder_receiver) = mpsc::unbounded_channel();
+        MediaStream {
+            id: self.id.unwrap_or_default(),
+            cancel_token,
+            recorder_option: Mutex::new(self.recorder_config),
+            tracks,
+            pending_ice_candidates: Mutex::new(Vec::new()),
+            suppressed_sources: Mutex::new(HashSet::new()),
+            event_sender: self.event_sender,
+            packet_sender: track_packet_sender,
+            packet_receiver: Mutex::new(Some(track_packet_receiver)),
+            recorder_sender,
+            recorder_receiver: Mutex::new(Some(recorder_receiver)),
+            recorder_handle: Mutex::new(None),
+            recording_active: Arc::new(AtomicBool::new(false)),
+            ambiance: Mutex::new(None),
+            ambiance_source_id: StdMutex::new(None),
+            last_server_packet_ts: Arc::new(AtomicU64::new(0)),
+            ambiance_idle_started: AtomicBool::new(false),
+        }
+    }
+}
+
+impl MediaStream {
+    pub async fn serve(&self) -> Result<()> {
+        let packet_receiver = match self.packet_receiver.lock().await.take() {
+            Some(receiver) => receiver,
+            None => {
+                warn!(
+                    session_id = self.id,
+                    "MediaStream::serve() called multiple times, stream already serving"
+                );
+                return Ok(());
+            }
+        };
+        self.start_recorder().await.ok();
+        info!(session_id = self.id, "mediastream serving");
+        select! {
+            _ = self.cancel_token.cancelled() => {}
+            r = self.handle_forward_track(packet_receiver) => {
+                info!(session_id = self.id, "track packet receiver stopped {:?}", r);
+            }
+        }
+        Ok(())
+    }
+
+    /// Load ambiance once per call and keep mixing it while TTS/file playback is silent.
+    pub async fn ensure_ambiance(
+        &self,
+        option: AmbianceOption,
+        source_track_id: TrackId,
+    ) -> Result<Option<Arc<StdMutex<AmbianceProcessor>>>> {
+        let mut slot = self.ambiance.lock().await;
+        if let Some(existing) = slot.as_ref() {
+            return Ok(Some(existing.clone()));
+        }
+
+        if option.path.is_none() || option.enabled == Some(false) {
+            return Ok(None);
+        }
+
+        let processor = AmbianceProcessor::new(option).await?;
+        let shared = Arc::new(StdMutex::new(processor));
+        *slot = Some(shared.clone());
+        drop(slot);
+
+        *self.ambiance_source_id.lock().unwrap() = Some(source_track_id);
+        self.start_ambiance_idle_loop(shared.clone());
+        info!(session_id = self.id, "ambiance idle mixer started");
+        Ok(Some(shared))
+    }
+
+    fn start_ambiance_idle_loop(&self, processor: Arc<StdMutex<AmbianceProcessor>>) {
+        if self.ambiance_idle_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
+        let cancel_token = self.cancel_token.clone();
+        let packet_sender = self.packet_sender.clone();
+        let last_server_packet_ts = self.last_server_packet_ts.clone();
+        let session_id = self.id.clone();
+        let recorder_sender = self.recorder_sender.clone();
+        let recording_active = self.recording_active.clone();
+
+        crate::spawn(async move {
+            let mut ticker = tokio::time::interval(AMBIANCE_IDLE_PTIME);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = cancel_token.cancelled() => break,
+                    _ = ticker.tick() => {
+                        let now = crate::media::get_timestamp();
+                        let last = last_server_packet_ts.load(Ordering::Relaxed);
+                        if last != 0 && now.saturating_sub(last) < AMBIANCE_IDLE_GAP_MS {
+                            continue;
+                        }
+
+                        let mut frame = AudioFrame {
+                            track_id: AMBIANCE_IDLE_TRACK_ID.to_string(),
+                            samples: Samples::Empty,
+                            timestamp: now,
+                            sample_rate: INTERNAL_SAMPLERATE,
+                            channels: 1,
+                            ..Default::default()
+                        };
+                        {
+                            let mut ambiance = match processor.lock() {
+                                Ok(guard) => guard,
+                                Err(_) => break,
+                            };
+                            if let Err(e) = ambiance.process_frame(&mut frame) {
+                                warn!(session_id, "ambiance idle mix failed: {}", e);
+                                continue;
+                            }
+                        }
+                        if matches!(frame.samples, Samples::Empty) {
+                            continue;
+                        }
+                        // Mirror the mixed idle ambiance into the recording so the
+                        // stereo WAV's server-side channel reflects what the user
+                        // actually heard, including silent-period background audio.
+                        if recording_active.load(Ordering::SeqCst) {
+                            let mut recorded = frame.clone();
+                            recorded.track_id = SERVER_SIDE_TRACK_ID.to_string();
+                            let _ = recorder_sender.send(recorded);
+                        }
+                        if packet_sender.send(frame).is_err() {
+                            debug!(session_id, "ambiance idle sender closed");
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    pub fn stop(&self, _reason: Option<String>, _initiator: Option<String>) {
+        self.cancel_token.cancel()
+    }
+
+    pub async fn cleanup(&self) -> Result<()> {
+        self.cancel_token.cancel();
+        {
+            let mut tracks = self.tracks.lock().await;
+            for (id, (track, _)) in tracks.drain() {
+                if let Err(e) = track.stop().await {
+                    warn!(session_id = self.id, track_id = %id, "failed to stop track during cleanup: {}", e);
+                }
+            }
+        }
+        self.suppressed_sources.lock().await.clear();
+
+        if let Some(recorder_handle) = self.recorder_handle.lock().await.take() {
+            if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(30), recorder_handle).await
+            {
+                info!(session_id = self.id, "recorder stopped");
+            } else {
+                warn!(session_id = self.id, "recorder timeout");
+            }
+        }
+        Ok(())
+    }
+    pub async fn track_count(&self) -> usize {
+        self.tracks.lock().await.len()
+    }
+
+    pub async fn update_recorder_option(&self, recorder_config: RecorderOption) {
+        *self.recorder_option.lock().await = Some(recorder_config);
+        self.start_recorder().await.ok();
+    }
+
+    pub async fn remove_track(&self, id: &TrackId, graceful: bool) {
+        let track_entry = { self.tracks.lock().await.remove(id) };
+        if let Some((track, _)) = track_entry {
+            self.suppressed_sources.lock().await.remove(id);
+            let res = if !graceful {
+                track.stop().await
+            } else {
+                track.stop_graceful().await
+            };
+            match res {
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(session_id = self.id, "failed to stop track: {}", e);
+                }
+            }
+        }
+    }
+    pub async fn update_remote_description(
+        &self,
+        track_id: &TrackId,
+        answer: &String,
+    ) -> Result<()> {
+        let track_entry = { self.tracks.lock().await.remove(track_id) };
+        if let Some((mut track, dtmf)) = track_entry {
+            let res = track.update_remote_description(answer).await;
+            self.tracks
+                .lock()
+                .await
+                .insert(track_id.clone(), (track, dtmf));
+            res?;
+        }
+        Ok(())
+    }
+
+    pub async fn update_remote_description_force(
+        &self,
+        track_id: &TrackId,
+        answer: &String,
+    ) -> Result<()> {
+        let track_entry = { self.tracks.lock().await.remove(track_id) };
+        if let Some((mut track, dtmf)) = track_entry {
+            let res = track.update_remote_description_force(answer).await;
+            self.tracks
+                .lock()
+                .await
+                .insert(track_id.clone(), (track, dtmf));
+            res?;
+        }
+        Ok(())
+    }
+
+    /// Apply a provisional remote description (SIP 183 early media). See
+    /// `Track::update_remote_description_provisional`.
+    pub async fn update_remote_description_provisional(
+        &self,
+        track_id: &TrackId,
+        answer: &String,
+    ) -> Result<()> {
+        let track_entry = { self.tracks.lock().await.remove(track_id) };
+        if let Some((mut track, dtmf)) = track_entry {
+            let res = track.update_remote_description_provisional(answer).await;
+            self.tracks
+                .lock()
+                .await
+                .insert(track_id.clone(), (track, dtmf));
+            res?;
+        }
+        Ok(())
+    }
+
+    pub async fn handshake(
+        &self,
+        track_id: &TrackId,
+        offer: String,
+        timeout: Option<Duration>,
+    ) -> Result<String> {
+        let track_entry = { self.tracks.lock().await.remove(track_id) };
+        if let Some((mut track, dtmf)) = track_entry {
+            let res = track.handshake(offer, timeout).await;
+            self.tracks
+                .lock()
+                .await
+                .insert(track_id.clone(), (track, dtmf));
+            res
+        } else {
+            anyhow::bail!("track not found: {}", track_id)
+        }
+    }
+
+    pub async fn update_track(&self, mut track: Box<dyn Track>, play_id: Option<String>) {
+        self.remove_track(track.id(), false).await;
+        self.attach_recorder_tap(&mut track).await;
+        match track
+            .start(self.event_sender.clone(), self.packet_sender.clone())
+            .await
+        {
+            Ok(_) => {
+                info!(session_id = self.id, track_id = track.id(), "track started");
+                let track_id = track.id().clone();
+                if track_id.as_str() == self.id.as_str() {
+                    let pending = std::mem::take(&mut *self.pending_ice_candidates.lock().await);
+                    for (candidate, sdp_mid, sdp_mline_index) in pending {
+                        if let Err(e) =
+                            track.add_ice_candidate(&candidate, sdp_mid.as_deref(), sdp_mline_index)
+                        {
+                            warn!(
+                                session_id = self.id,
+                                track_id = track.id(),
+                                "failed to apply buffered ICE candidate: {}",
+                                e
+                            );
+                        }
+                    }
+                }
+                self.tracks
+                    .lock()
+                    .await
+                    .insert(track_id.clone(), (track, DtmfDetector::new()));
+                self.event_sender
+                    .send(SessionEvent::TrackStart {
+                        track_id,
+                        timestamp: crate::media::get_timestamp(),
+                        play_id,
+                    })
+                    .ok();
+            }
+            Err(e) => {
+                warn!(
+                    session_id = self.id,
+                    track_id = track.id(),
+                    play_id = play_id.as_deref(),
+                    "Failed to start track: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    pub async fn mute_track(&self, id: Option<TrackId>) {
+        if let Some(id) = id {
+            if let Some((track, _)) = self.tracks.lock().await.get_mut(&id) {
+                MuteProcessor::mute_track(track.as_mut());
+            }
+        } else {
+            for (track, _) in self.tracks.lock().await.values_mut() {
+                MuteProcessor::mute_track(track.as_mut());
+            }
+        }
+    }
+
+    pub async fn unmute_track(&self, id: Option<TrackId>) {
+        if let Some(id) = id {
+            if let Some((track, _)) = self.tracks.lock().await.get_mut(&id) {
+                MuteProcessor::unmute_track(track.as_mut());
+            }
+        } else {
+            for (track, _) in self.tracks.lock().await.values_mut() {
+                MuteProcessor::unmute_track(track.as_mut());
+            }
+        }
+    }
+
+    /// Trickle ICE: feed a remote candidate into the ICE-backed (WebRTC)
+    /// track, if it's up yet, or buffer it for `update_track` to replay
+    /// otherwise.
+    pub async fn add_ice_candidate(
+        &self,
+        candidate: &str,
+        sdp_mid: Option<&str>,
+        sdp_mline_index: Option<u32>,
+    ) -> Result<()> {
+        let tracks = self.tracks.lock().await;
+        if let Some((track, _)) = tracks.get(self.id.as_str()) {
+            track.add_ice_candidate(candidate, sdp_mid, sdp_mline_index)?;
+            return Ok(());
+        }
+        drop(tracks);
+        self.pending_ice_candidates.lock().await.push((
+            candidate.to_string(),
+            sdp_mid.map(|s| s.to_string()),
+            sdp_mline_index,
+        ));
+        Ok(())
+    }
+
+    pub async fn pause_playback(&self, id: TrackId) -> Result<()> {
+        self.set_playback_paused(id, true).await
+    }
+
+    pub async fn resume_playback(&self, id: TrackId) -> Result<()> {
+        self.set_playback_paused(id, false).await
+    }
+
+    async fn set_playback_paused(&self, id: TrackId, paused: bool) -> Result<()> {
+        if let Some((track, _)) = self.tracks.lock().await.get_mut(&id) {
+            if track.set_paused(paused) {
+                Ok(())
+            } else {
+                warn!(
+                    session_id = self.id,
+                    track_id = %id,
+                    paused,
+                    "pause state requested for track that does not support pausing"
+                );
+                Err(anyhow::anyhow!("track does not support pausing: {}", id))
+            }
+        } else {
+            warn!(
+                session_id = self.id,
+                track_id = %id,
+                paused,
+                "pause state requested for unknown track"
+            );
+            Err(anyhow::anyhow!("track not found: {}", id))
+        }
+    }
+
+    pub async fn hold_track(&self, id: Option<TrackId>) {
+        if let Some(id) = id {
+            if let Some((track, _)) = self.tracks.lock().await.get_mut(&id) {
+                HoldTrack::hold_track(track.as_mut());
+            }
+        } else {
+            for (track, _) in self.tracks.lock().await.values_mut() {
+                HoldTrack::hold_track(track.as_mut());
+            }
+        }
+    }
+
+    pub async fn resume_track(&self, id: Option<TrackId>) {
+        if let Some(id) = id {
+            if let Some((track, _)) = self.tracks.lock().await.get_mut(&id) {
+                HoldTrack::resume_track(track.as_mut());
+            }
+        } else {
+            for (track, _) in self.tracks.lock().await.values_mut() {
+                HoldTrack::resume_track(track.as_mut());
+            }
+        }
+    }
+
+    pub async fn suppress_forwarding(&self, track_id: &TrackId) {
+        self.suppressed_sources
+            .lock()
+            .await
+            .insert(track_id.clone());
+    }
+
+    pub async fn resume_forwarding(&self, track_id: &TrackId) {
+        self.suppressed_sources.lock().await.remove(track_id);
+    }
+
+    pub async fn remove_processor<T: 'static>(&self, track_id: &TrackId) -> Result<()> {
+        if let Some((track, _)) = self.tracks.lock().await.get_mut(track_id) {
+            track.as_mut().processor_chain().remove_processor::<T>();
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Track {} not found", track_id))
+        }
+    }
+
+    pub async fn append_processor(
+        &self,
+        track_id: &TrackId,
+        processor: Box<dyn crate::media::processor::Processor>,
+    ) -> Result<()> {
+        if let Some((track, _)) = self.tracks.lock().await.get_mut(track_id) {
+            track.as_mut().processor_chain().append_processor(processor);
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Track {} not found", track_id))
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct RecorderProcessor {
+    sender: mpsc::UnboundedSender<AudioFrame>,
+}
+
+impl RecorderProcessor {
+    pub fn new(sender: mpsc::UnboundedSender<AudioFrame>) -> Self {
+        Self { sender }
+    }
+}
+
+impl Processor for RecorderProcessor {
+    fn process_frame(&mut self, frame: &mut AudioFrame) -> Result<()> {
+        let frame_clone = frame.clone();
+        let _ = self.sender.send(frame_clone);
+        Ok(())
+    }
+}
+
+impl MediaStream {
+    pub async fn start_recorder(&self) -> Result<()> {
+        let recorder_option = self.recorder_option.lock().await.clone();
+        if let Some(recorder_option) = recorder_option {
+            if recorder_option.recorder_file.is_empty() {
+                warn!(
+                    session_id = self.id,
+                    "recorder file is empty, skipping recorder start"
+                );
+                return Ok(());
+            }
+            let recorder_receiver = match self.recorder_receiver.lock().await.take() {
+                Some(receiver) => receiver,
+                None => {
+                    return Ok(());
+                }
+            };
+            let cancel_token = self.cancel_token.child_token();
+            let session_id_clone = self.id.clone();
+
+            info!(
+                session_id = session_id_clone,
+                sample_rate = recorder_option.samplerate,
+                native_samplerate = recorder_option.native_samplerate.unwrap_or(false),
+                ptime = recorder_option.ptime,
+                "start recorder",
+            );
+
+            let native = recorder_option.native_samplerate.unwrap_or(false);
+            let recorder_handle = crate::spawn(async move {
+                let recorder_file = recorder_option.recorder_file.clone();
+                let recorder =
+                    Recorder::new(cancel_token, session_id_clone.clone(), recorder_option);
+                match recorder
+                    .process_recording(Path::new(&recorder_file), recorder_receiver)
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(
+                            session_id = session_id_clone,
+                            "Failed to process recorder: {}", e
+                        );
+                    }
+                }
+            });
+            *self.recorder_handle.lock().await = Some(recorder_handle);
+            self.recording_active.store(true, Ordering::SeqCst);
+
+            // Inject the recorder tap into tracks that were added before the
+            // recorder started. `set_raw_tap` replaces any previous tap, so
+            // this stays idempotent.
+            for (track, _) in self.tracks.lock().await.values_mut() {
+                if native {
+                    track.set_raw_tap(Some(self.recorder_sender.clone()));
+                } else if !track.processor_chain().has_processor::<RecorderProcessor>() {
+                    track.insert_processor(Box::new(RecorderProcessor::new(
+                        self.recorder_sender.clone(),
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Attach the recorder tap to a track according to the recorder mode:
+    /// native-samplerate mode mirrors pre-resample frames via the chain's
+    /// raw tap, otherwise a post-pipeline RecorderProcessor is appended.
+    /// No-op when no recorder is configured.
+    async fn attach_recorder_tap(&self, track: &mut Box<dyn Track>) {
+        let Some(option) = self.recorder_option.lock().await.clone() else {
+            return;
+        };
+        if option.native_samplerate.unwrap_or(false) {
+            track.set_raw_tap(Some(self.recorder_sender.clone()));
+        } else {
+            track.append_processor(Box::new(RecorderProcessor::new(
+                self.recorder_sender.clone(),
+            )));
+        }
+    }
+
+    pub async fn set_track_refer(&self, track_id: &TrackId, refer: Option<bool>) {
+        if let Some((_, dtmf)) = self.tracks.lock().await.get_mut(track_id) {
+            dtmf.refer = refer;
+        }
+    }
+
+    pub async fn set_track_dtmf_forward(&self, track_id: &TrackId, forward: bool) {
+        if let Some((_, dtmf)) = self.tracks.lock().await.get_mut(track_id) {
+            dtmf.suppress_dtmf_forward = !forward;
+        }
+    }
+
+    async fn handle_forward_track(&self, mut packet_receiver: TrackPacketReceiver) {
+        let event_sender = self.event_sender.clone();
+        while let Some(packet) = packet_receiver.recv().await {
+            if self
+                .ambiance_source_id
+                .lock()
+                .ok()
+                .and_then(|id| id.clone())
+                .as_ref()
+                == Some(&packet.track_id)
+            {
+                self.last_server_packet_ts
+                    .store(crate::media::get_timestamp(), Ordering::Relaxed);
+            }
+
+            let suppressed = {
+                self.suppressed_sources
+                    .lock()
+                    .await
+                    .contains(&packet.track_id)
+            };
+
+            let is_dtmf = matches!(&packet.samples,
+                Samples::RTP { payload_type, .. } if *payload_type >= 96 && *payload_type <= 127);
+
+            let mut tracks = self.tracks.lock().await;
+
+            // Check once whether the source track suppresses DTMF forwarding.
+            let source_suppresses_dtmf = is_dtmf
+                && tracks
+                    .get(&packet.track_id)
+                    .map(|(_, d)| d.suppress_dtmf_forward)
+                    .unwrap_or(false);
+
+            for (track, dtmf_detector) in tracks.values_mut() {
+                if track.id() == &packet.track_id {
+                    if let Samples::RTP {
+                        payload_type,
+                        payload,
+                        ..
+                    } = &packet.samples
+                    {
+                        if let Some(digit) = dtmf_detector.detect_rtp(*payload_type, payload) {
+                            debug!(track_id = track.id(), digit, "DTMF detected");
+                            event_sender
+                                .send(SessionEvent::Dtmf {
+                                    track_id: packet.track_id.to_string(),
+                                    timestamp: packet.timestamp,
+                                    digit,
+                                    refer: dtmf_detector.refer,
+                                })
+                                .ok();
+                        }
+                    }
+                    continue;
+                }
+                if suppressed {
+                    continue;
+                }
+                // Skip DTMF forwarding if source or destination has it suppressed.
+                if source_suppresses_dtmf || (is_dtmf && dtmf_detector.suppress_dtmf_forward) {
+                    continue;
+                }
+                if packet.track_id == QUEUE_HOLD_TRACK_ID && track.id() == CALLEE_TRACK_ID {
+                    continue;
+                }
+                if let Err(e) = track.send_packet(&packet).await {
+                    warn!(
+                        id = track.id(),
+                        "media_stream: Failed to send packet to track: {}", e
+                    );
+                }
+            }
+        }
+    }
+}
+
+pub struct MuteProcessor;
+
+impl MuteProcessor {
+    pub fn mute_track(track: &mut dyn Track) {
+        let chain = track.processor_chain();
+        if !chain.has_processor::<MuteProcessor>() {
+            chain.insert_processor(Box::new(MuteProcessor));
+        }
+    }
+
+    pub fn unmute_track(track: &mut dyn Track) {
+        let chain = track.processor_chain();
+        chain.remove_processor::<MuteProcessor>();
+    }
+}
+
+impl Processor for MuteProcessor {
+    fn process_frame(&mut self, frame: &mut AudioFrame) -> Result<()> {
+        match &mut frame.samples {
+            Samples::PCM { samples } => {
+                samples.fill(0);
+            }
+            // discard DTMF frames
+            Samples::RTP { payload_type, .. } if *payload_type >= 96 && *payload_type <= 127 => {
+                frame.samples = Samples::Empty;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+pub struct HoldTrack;
+
+impl HoldTrack {
+    pub fn hold_track(track: &mut dyn Track) {
+        let chain = track.processor_chain();
+        // Remove existing processor if present
+        chain.remove_processor::<HoldProcessor>();
+        // Add a new processor with hold state set to true
+        let processor = HoldProcessor::new();
+        processor.set_hold(true);
+        chain.insert_processor(Box::new(processor));
+    }
+
+    pub fn resume_track(track: &mut dyn Track) {
+        let chain = track.processor_chain();
+        // Simply remove the hold processor to resume normal operation
+        chain.remove_processor::<HoldProcessor>();
+    }
+}

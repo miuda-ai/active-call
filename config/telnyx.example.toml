@@ -1,0 +1,73 @@
+# Telnyx SIP Trunk Configuration
+#
+# This example demonstrates configuring active-call to work with
+# Telnyx SIP trunking for global voice connectivity.
+#
+# Key Telnyx benefits:
+# - Global SIP trunking with local presence in 140+ countries
+# - IP-based authentication or SIP registration
+# - Low-latency media routing via global edge network
+# - TeXML (TwiML-compatible) for programmable voice
+# - 53 AI models via OpenAI-compatible API
+#
+# Setup:
+# 1. Create a Telnyx account at https://telnyx.com
+# 2. Create a SIP connection in the Portal
+# 3. Configure your IP for authentication or set up SIP credentials
+# 4. Update the settings below with your connection details
+#
+# Documentation: https://developers.telnyx.com/docs/voice
+
+addr = "0.0.0.0"
+http_addr = "0.0.0.0:8080"
+udp_port = 5060
+
+# Your server's public IP (required for SIP)
+external_ip = "YOUR_SERVER_PUBLIC_IP"
+
+# Media cache for TTS audio
+media_cache_path = "./config/mediacache"
+
+# Recording settings
+[recording]
+enabled = true
+auto_start = true
+
+[callrecord]
+type = "local"
+root = "./config/cdr"
+
+# SIP Registration with Telnyx
+# Telnyx supports both IP-based auth and SIP registration
+# For IP-based auth: add your server IP to your Telnyx SIP Connection
+# For SIP registration: use the credentials below
+
+[[register_users]]
+# Telnyx SIP domain
+server = "sip.telnyx.com:5060"
+# Your Telnyx SIP username (from Portal)
+username = "YOUR_SIP_USERNAME"
+disabled = false
+
+[register_users.credential]
+username = "YOUR_SIP_USERNAME"
+# Your Telnyx SIP password (from Portal)
+password = "YOUR_SIP_PASSWORD"
+
+# Handler for incoming calls
+[handler]
+type = "playbook"
+default = "telnyx_default.md"
+
+# Route calls based on Telnyx phone numbers
+# [[handler.rules]]
+# callee = "^sip:\\+1\\d{10}@.*"
+# playbook = "us_support.md"
+
+# [[handler.rules]]
+# callee = "^sip:\\+44\\d+@.*"
+# playbook = "uk_support.md"
+
+# ICE servers for WebRTC (optional)
+# [[ice_servers]]
+# urls = ["stun:stun.telnyx.com:3478"]
