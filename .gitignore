@@ -18,3 +18,4 @@ models/
 .claude/
 *.bin
 static/webrtc-demo.html
+!src/media/vad/silero_weights.bin
