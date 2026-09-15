@@ -4,7 +4,7 @@ use crate::event::{EventSender, SessionEvent};
 use crate::media::{AudioFrame, Samples, SourcePacket};
 use anyhow::Result;
 use std::any::Any;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::mpsc;
 
 pub trait Processor: Send + Sync + Any {
@@ -61,7 +61,11 @@ pub struct ProcessorChain {
     /// their native (pre-resample) sample rate right after decoding, before
     /// the pipeline normalizes them to `INTERNAL_SAMPLERATE`. Used by the
     /// native-samplerate recorder.
-    pub raw_tap: Option<mpsc::UnboundedSender<AudioFrame>>,
+    ///
+    /// Shared via `Arc<RwLock<..>>`: `RtcTrack::create()` clones the chain
+    /// into its long-lived worker tasks *before* the recorder attaches the
+    /// tap, so a plain field would leave those workers with a stale `None`.
+    pub raw_tap: Arc<RwLock<Option<mpsc::UnboundedSender<AudioFrame>>>>,
 }
 
 impl ProcessorChain {
@@ -71,8 +75,14 @@ impl ProcessorChain {
             codec: TrackCodec::new(),
             sample_rate: INTERNAL_SAMPLERATE,
             force_decode: true,
-            raw_tap: None,
+            raw_tap: Arc::new(RwLock::new(None)),
         }
+    }
+    pub fn set_raw_tap(&mut self, tap: Option<mpsc::UnboundedSender<AudioFrame>>) {
+        *self.raw_tap.write().unwrap() = tap;
+    }
+    fn raw_tap(&self) -> Option<mpsc::UnboundedSender<AudioFrame>> {
+        self.raw_tap.read().unwrap().clone()
     }
     pub fn insert_processor(&mut self, processor: Box<dyn Processor>) {
         self.processors.lock().unwrap().insert(0, processor);
@@ -95,7 +105,7 @@ impl ProcessorChain {
 
     pub fn process_frame(&mut self, frame: &mut AudioFrame) -> Result<()> {
         let mut processors = self.processors.lock().unwrap();
-        if !self.force_decode && processors.is_empty() && self.raw_tap.is_none() {
+        if !self.force_decode && processors.is_empty() && self.raw_tap().is_none() {
             return Ok(());
         }
         match &mut frame.samples {
@@ -123,7 +133,7 @@ impl ProcessorChain {
 
         // Mirror the frame to the raw tap at its native sample rate, before
         // the pipeline resamples it to INTERNAL_SAMPLERATE.
-        if let Some(tap) = &self.raw_tap
+        if let Some(tap) = self.raw_tap()
             && let Samples::PCM { samples } = &frame.samples
             && !samples.is_empty()
             && frame.sample_rate > 0
@@ -198,5 +208,70 @@ impl Processor for SubscribeProcessor {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: `RtcTrack::create()` clones the chain into its worker
+    /// tasks *before* the recorder attaches the raw tap (native-samplerate
+    /// recording). The tap must be shared state so clones taken before the
+    /// attach observe it; with a plain `Option` field this test fails and
+    /// SIP/RTP calls silently fall back to the 16 kHz recorder.
+    #[test]
+    fn raw_tap_visible_to_clones_taken_before_attach() {
+        let mut chain = ProcessorChain::new(INTERNAL_SAMPLERATE);
+        let mut worker = chain.clone();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        chain.set_raw_tap(Some(tx));
+
+        let mut frame = AudioFrame {
+            track_id: "track".to_string(),
+            samples: Samples::PCM {
+                samples: vec![100i16; 160],
+            },
+            sample_rate: 8000,
+            channels: 1,
+            ..Default::default()
+        };
+        worker.process_frame(&mut frame).unwrap();
+
+        let raw = rx
+            .try_recv()
+            .expect("raw tap should receive a frame from a pre-attach clone");
+        assert_eq!(raw.sample_rate, 8000);
+        assert_eq!(raw.channels, 1);
+        match raw.samples {
+            Samples::PCM { samples } => assert_eq!(samples.len(), 160),
+            _ => panic!("expected PCM samples on the raw tap"),
+        }
+        // The pipeline output is still normalized to the internal rate.
+        assert_eq!(frame.sample_rate, INTERNAL_SAMPLERATE);
+    }
+
+    /// Detaching the tap on the original chain must be observed by clones as
+    /// well (e.g. recorder restart swapping the sender).
+    #[test]
+    fn raw_tap_detach_visible_to_clones() {
+        let mut chain = ProcessorChain::new(INTERNAL_SAMPLERATE);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        chain.set_raw_tap(Some(tx));
+        let mut worker = chain.clone();
+        chain.set_raw_tap(None);
+
+        let mut frame = AudioFrame {
+            track_id: "track".to_string(),
+            samples: Samples::PCM {
+                samples: vec![100i16; 160],
+            },
+            sample_rate: 8000,
+            channels: 1,
+            ..Default::default()
+        };
+        worker.process_frame(&mut frame).unwrap();
+        assert_eq!(frame.sample_rate, INTERNAL_SAMPLERATE);
     }
 }

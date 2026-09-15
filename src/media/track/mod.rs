@@ -79,7 +79,7 @@ pub trait Track: Send + Sync {
     /// (pre-resample) sample rate, used by the native-samplerate recorder.
     /// Setting `None` detaches an existing tap.
     fn set_raw_tap(&mut self, tap: Option<mpsc::UnboundedSender<AudioFrame>>) {
-        self.processor_chain().raw_tap = tap;
+        self.processor_chain().set_raw_tap(tap);
     }
     async fn handshake(&mut self, offer: String, timeout: Option<Duration>) -> Result<String>;
     async fn update_remote_description(&mut self, answer: &String) -> Result<()>;
