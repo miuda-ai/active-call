@@ -32,9 +32,6 @@ autobins = false
 autoexamples = false
 autotests = false
 
-[[test]]
-name = "auto_refer_bridge_test"
-path = "tests/auto_refer_bridge_test.rs"
 autobenches = false
 description = "A SIP/WebRTC voice agent"
 readme = "README.md"
@@ -361,3 +358,7 @@ features = [
 
 [dev-dependencies.wiremock]
 version = "0.6"
+
+[[test]]
+name = "auto_refer_bridge_test"
+path = "tests/auto_refer_bridge_test.rs"
