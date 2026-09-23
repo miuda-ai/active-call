@@ -1,9 +1,7 @@
 use anyhow::Result;
+use rsipstack::dialog::{authenticate::Credential, registration::Registration};
 use rsipstack::rsip::{HostWithPort, Response, StatusCodeKind, Transport};
 use rsipstack::transport::SipAddr;
-use rsipstack::{
-    dialog::{authenticate::Credential, registration::Registration},
-};
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;

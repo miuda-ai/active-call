@@ -8,12 +8,12 @@ use reqwest::Client;
 use std::fs::File;
 use std::io::{BufReader, Seek, SeekFrom, Write};
 use std::time::Instant;
-use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::codecs::CodecParameters;
+use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::formats::TrackType;
+use symphonia::core::formats::probe::Hint;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::default::{get_codecs, get_probe};
@@ -231,9 +231,8 @@ pub fn decode_wav(file: File, target_sample_rate: u32) -> Result<Vec<i16>> {
     }
 
     if sample_rate != target_sample_rate && sample_rate > 0 {
-        let mut resampler =
-            BoxedResampler::new(sample_rate as usize, target_sample_rate as usize)
-                .map_err(anyhow::Error::from)?;
+        let mut resampler = BoxedResampler::new(sample_rate as usize, target_sample_rate as usize)
+            .map_err(anyhow::Error::from)?;
         all_samples = resampler.resample(&all_samples);
     }
 
@@ -283,7 +282,8 @@ pub fn decode_audio(
         let track = format
             .default_track(TrackType::Audio)
             .ok_or_else(|| anyhow!("loader: no default audio track found"))?;
-        let codec_params = track.codec_params
+        let codec_params = track
+            .codec_params
             .as_ref()
             .ok_or_else(|| anyhow!("loader: no codec parameters"))?;
         let params = match codec_params {
@@ -293,7 +293,8 @@ pub fn decode_audio(
         (track.id, params)
     };
 
-    let mut decoder = get_codecs().make_audio_decoder(&audio_params, &AudioDecoderOptions::default())?;
+    let mut decoder =
+        get_codecs().make_audio_decoder(&audio_params, &AudioDecoderOptions::default())?;
     let mut all_samples = Vec::new();
     let mut sample_rate = audio_params.sample_rate.unwrap_or(0);
 
@@ -350,9 +351,8 @@ pub fn decode_audio(
     }
 
     if sample_rate != target_sample_rate && sample_rate > 0 {
-        let mut resampler =
-            BoxedResampler::new(sample_rate as usize, target_sample_rate as usize)
-                .map_err(anyhow::Error::from)?;
+        let mut resampler = BoxedResampler::new(sample_rate as usize, target_sample_rate as usize)
+            .map_err(anyhow::Error::from)?;
         all_samples = resampler.resample(&all_samples);
     }
 
@@ -416,7 +416,12 @@ pub async fn load_audio_as_pcm_cached(
 
     // Decoding is CPU-bound and blocking; keep it off the async runtime.
     let mut samples = tokio::task::spawn_blocking(move || {
-        decode_audio(file, &extension, content_type.as_deref(), target_sample_rate)
+        decode_audio(
+            file,
+            &extension,
+            content_type.as_deref(),
+            target_sample_rate,
+        )
     })
     .await??;
 
@@ -443,11 +448,19 @@ pub async fn load_audio_as_pcm(
     let (file, content_type) = if is_url {
         download_from_url(path, use_cache).await?
     } else {
-        (File::open(path).map_err(|e| anyhow!("loader: {} {}", path, e))?, None)
+        (
+            File::open(path).map_err(|e| anyhow!("loader: {} {}", path, e))?,
+            None,
+        )
     };
 
     let extension = if is_url {
-        path.parse::<Url>()?.path().split('.').last().unwrap_or("").to_string()
+        path.parse::<Url>()?
+            .path()
+            .split('.')
+            .last()
+            .unwrap_or("")
+            .to_string()
     } else {
         path.split('.').last().unwrap_or("").to_string()
     };

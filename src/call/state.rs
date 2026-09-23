@@ -314,6 +314,10 @@ pub enum ActorMsg {
         track_id: TrackId,
         forward_dtmf: bool,
         result: Result<String, rsipstack::Error>,
+        /// Final SIP status of the refer leg (200 on success, 408 on
+        /// timeout, ...); reported to the referrer via NOTIFY when this
+        /// transfer was triggered by an incoming REFER.
+        code: Option<u16>,
     },
 }
 

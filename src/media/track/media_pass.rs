@@ -80,8 +80,23 @@ impl MediaPassTrack {
         option: MediaPassOption,
     ) -> Self {
         let sample_rate = option.output_sample_rate;
+        // `inputSampleRate` is sometimes omitted as 0 when ptime is disabled.
+        // A 0 here used to flow into the track's frames and make
+        // `ProcessorChain` build a 0 Hz resampler, panicking inside the media
+        // worker. Fall back to the output rate so the pipeline always has a
+        // valid source rate.
+        let input_sample_rate = if option.input_sample_rate > 0 {
+            option.input_sample_rate
+        } else {
+            warn!(
+                input_sample_rate = option.input_sample_rate,
+                output_sample_rate = sample_rate,
+                "media pass input sample rate is 0, falling back to output sample rate"
+            );
+            sample_rate
+        };
         let mut config = TrackConfig::default();
-        config = config.with_sample_rate(option.input_sample_rate);
+        config = config.with_sample_rate(input_sample_rate);
         config = config.with_ptime(Duration::from_millis(option.ptime.unwrap_or(0) as u64));
         // for 16000Hz, 20ms ptime, 3200 is 5 packets
         let packet_size = option.packet_size.unwrap_or(3200);
@@ -386,5 +401,36 @@ impl Track for MediaPassTrack {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn new_track(input_sample_rate: u32, output_sample_rate: u32) -> MediaPassTrack {
+        MediaPassTrack::new(
+            "session".to_string(),
+            1,
+            "track".to_string(),
+            CancellationToken::new(),
+            MediaPassOption::new(
+                "ws://localhost".to_string(),
+                input_sample_rate,
+                output_sample_rate,
+                None,
+                None,
+            ),
+        )
+    }
+
+    #[test]
+    fn zero_input_sample_rate_falls_back_to_output() {
+        assert_eq!(new_track(0, 16000).config.samplerate, 16000);
+    }
+
+    #[test]
+    fn explicit_input_sample_rate_is_preserved() {
+        assert_eq!(new_track(8000, 16000).config.samplerate, 8000);
     }
 }

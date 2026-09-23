@@ -184,10 +184,7 @@ impl ActiveCall {
     /// `Trying` until the far end times out (production: VOS3000 CANCELs the
     /// unanswered INVITE after 20s). No-op when there is no pending dialog or
     /// the INVITE carries no offer.
-    pub(super) async fn try_prepare_pending_sip_answer(
-        &self,
-        option: &CallOption,
-    ) -> Result<()> {
+    pub(super) async fn try_prepare_pending_sip_answer(&self, option: &CallOption) -> Result<()> {
         let Some(dialog_id) = self
             .invitation
             .find_dialog_id_by_session_id(&self.session_id)
@@ -846,7 +843,8 @@ impl ActiveCall {
             self.media_stream.clone(),
             out.leg.clone(),
             out.cancel_token.clone(),
-            out.auto_hangup.then_some(crate::callrecord::CallRecordHangupReason::ByRefer),
+            out.auto_hangup
+                .then_some(crate::callrecord::CallRecordHangupReason::ByRefer),
         );
 
         let hangup_headers = out

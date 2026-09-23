@@ -1,13 +1,14 @@
 use crate::{media::AudioFrame, media::PcmBuf, media::Samples};
 use audio_codec::{
-    bytes_to_samples,
+    BoxedResampler, CodecType, Decoder, Encoder, bytes_to_samples,
     g722::{G722Decoder, G722Encoder},
     pcma::{PcmaDecoder, PcmaEncoder},
     pcmu::{PcmuDecoder, PcmuEncoder},
-    samples_to_bytes, BoxedResampler, CodecType, Decoder, Encoder,
+    samples_to_bytes,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use tracing::warn;
 
 use audio_codec::g729::{G729Decoder, G729Encoder};
 use audio_codec::opus::{OpusDecoder, OpusEncoder};
@@ -151,7 +152,13 @@ impl TrackCodec {
     }
 
     pub fn resample(&mut self, pcm: PcmBuf, in_rate: u32, out_rate: u32) -> PcmBuf {
-        if in_rate == out_rate {
+        // A zero rate means the caller has no valid source rate (e.g. a
+        // media-pass track created without an explicit input sample rate).
+        // There is nothing sensible to resample from, so pass the samples
+        // through instead of panicking: `BoxedResampler::new` rejects zero
+        // rates, and unwinding here poisons the `ProcessorChain` mutex,
+        // permanently breaking every subsequent frame on the track.
+        if in_rate == 0 || out_rate == 0 || in_rate == out_rate {
             return pcm;
         }
 
@@ -159,12 +166,20 @@ impl TrackCodec {
             || self.resampler_in_rate != in_rate
             || self.resampler_out_rate != out_rate
         {
-            self.resampler = Some(
-                BoxedResampler::new(in_rate as usize, out_rate as usize)
-                    .expect("invalid sample rate"),
-            );
-            self.resampler_in_rate = in_rate;
-            self.resampler_out_rate = out_rate;
+            match BoxedResampler::new(in_rate as usize, out_rate as usize) {
+                Ok(resampler) => {
+                    self.resampler = Some(resampler);
+                    self.resampler_in_rate = in_rate;
+                    self.resampler_out_rate = out_rate;
+                }
+                Err(e) => {
+                    warn!(in_rate, out_rate, "failed to build resampler: {e}");
+                    self.resampler = None;
+                    self.resampler_in_rate = 0;
+                    self.resampler_out_rate = 0;
+                    return pcm;
+                }
+            }
         }
         self.resampler.as_mut().unwrap().resample(&pcm)
     }
@@ -182,21 +197,7 @@ impl TrackCodec {
 
                 let target_samplerate = codec.map(|c| c.samplerate()).unwrap_or(8000);
                 if frame.sample_rate != target_samplerate {
-                    if self.resampler.is_none()
-                        || self.resampler_in_rate != frame.sample_rate
-                        || self.resampler_out_rate != target_samplerate
-                    {
-                        self.resampler = Some(
-                            BoxedResampler::new(
-                                frame.sample_rate as usize,
-                                target_samplerate as usize,
-                            )
-                            .expect("invalid sample rate"),
-                        );
-                        self.resampler_in_rate = frame.sample_rate;
-                        self.resampler_out_rate = target_samplerate;
-                    }
-                    pcm = self.resampler.as_mut().unwrap().resample(&pcm);
+                    pcm = self.resample(pcm, frame.sample_rate, target_samplerate);
                 }
 
                 let payload = match codec {
@@ -252,5 +253,15 @@ mod tests {
         assert!(!payload.is_empty());
         // If this were raw PCM bytes, it would be 640 bytes.
         assert!(payload.len() < 640);
+    }
+
+    #[test]
+    fn test_resample_zero_rate_passes_through_without_panic() {
+        let mut codec = TrackCodec::new();
+        let samples = vec![1000i16; 160];
+
+        assert_eq!(codec.resample(samples.clone(), 0, 16000), samples);
+        assert_eq!(codec.resample(samples.clone(), 16000, 0), samples);
+        assert_eq!(codec.resample(samples.clone(), 0, 0), samples);
     }
 }

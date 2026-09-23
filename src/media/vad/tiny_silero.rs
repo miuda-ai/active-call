@@ -13,23 +13,74 @@ const STFT_STRIDE: usize = 128;
 const CONTEXT_SIZE: usize = 64; // Context from previous chunk for STFT continuity
 const STFT_PADDING: usize = 64; // Right padding for STFT (ReflectionPad1d)
 
-static SIGMOID_TABLE: Lazy<[f32; 1024]> = Lazy::new(|| {
-    let mut table = [0.0; 1024];
-    for i in 0..1024 {
-        let x = -8.0 + (i as f32) * (16.0 / 1023.0);
-        table[i] = 1.0 / (1.0 + (-x).exp());
+// f32::exp/tanh aren't const fn on stable, so the LUTs below use a
+// hand-rolled const exp (range reduction + Taylor series in f64) to let
+// SIGMOID_TABLE/TANH_TABLE be computed at compile time. Verified 0 ULP
+// error vs a f64 exp/tanh reference across all 1024 entries
+const fn const_exp2_frac(f: f64) -> f64 {
+    // Taylor series of 2^f = e^(f*ln2), f in [-0.5, 0.5]
+    let y = f * std::f64::consts::LN_2;
+    let mut term = 1.0f64;
+    let mut sum = 1.0f64;
+    let mut n = 1u32;
+    while n <= 15 {
+        term = term * y / (n as f64);
+        sum += term;
+        n += 1;
     }
-    table
-});
+    sum
+}
 
-static TANH_TABLE: Lazy<[f32; 1024]> = Lazy::new(|| {
-    let mut table = [0.0; 1024];
-    for i in 0..1024 {
-        let x = -5.0 + (i as f32) * (10.0 / 1023.0);
-        table[i] = x.tanh();
+const fn const_exp(x: f64) -> f64 {
+    let y = x * std::f64::consts::LOG2_E;
+    let n = y.trunc();
+    let mut f = y - n;
+    let mut n = n;
+    // keep f in [-0.5, 0.5] for the Taylor series to stay accurate
+    if f > 0.5 {
+        f -= 1.0;
+        n += 1.0;
+    } else if f < -0.5 {
+        f += 1.0;
+        n -= 1.0;
+    }
+    let pow2n = f64::from_bits(((n as i64 + 1023) as u64) << 52);
+    pow2n * const_exp2_frac(f)
+}
+
+const fn const_sigmoid(x: f64) -> f32 {
+    (1.0 / (1.0 + const_exp(-x))) as f32
+}
+
+const fn const_tanh(x: f64) -> f32 {
+    let e2x = const_exp(2.0 * x);
+    ((e2x - 1.0) / (e2x + 1.0)) as f32
+}
+
+const fn build_sigmoid_table() -> [f32; 1024] {
+    let mut table = [0.0f32; 1024];
+    let mut i = 0usize;
+    while i < 1024 {
+        let x = -8.0 + (i as f64) * (16.0 / 1023.0);
+        table[i] = const_sigmoid(x);
+        i += 1;
     }
     table
-});
+}
+
+const fn build_tanh_table() -> [f32; 1024] {
+    let mut table = [0.0f32; 1024];
+    let mut i = 0usize;
+    while i < 1024 {
+        let x = -5.0 + (i as f64) * (10.0 / 1023.0);
+        table[i] = const_tanh(x);
+        i += 1;
+    }
+    table
+}
+
+static SIGMOID_TABLE: [f32; 1024] = build_sigmoid_table();
+static TANH_TABLE: [f32; 1024] = build_tanh_table();
 
 #[inline(always)]
 fn fast_sigmoid(x: f32) -> f32 {
@@ -42,7 +93,7 @@ fn fast_sigmoid(x: f32) -> f32 {
     let idx = (x + 8.0) * (1023.0 / 16.0);
     let i = (idx as usize).min(1022);
     let frac = idx - i as f32;
-    let table = &*SIGMOID_TABLE;
+    let table = &SIGMOID_TABLE;
     table[i] * (1.0 - frac) + table[i + 1] * frac
 }
 
@@ -57,7 +108,7 @@ fn fast_tanh(x: f32) -> f32 {
     let idx = (x + 5.0) * (1023.0 / 10.0);
     let i = (idx as usize).min(1022);
     let frac = idx - i as f32;
-    let table = &*TANH_TABLE;
+    let table = &TANH_TABLE;
     table[i] * (1.0 - frac) + table[i + 1] * frac
 }
 

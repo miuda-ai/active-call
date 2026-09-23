@@ -242,7 +242,10 @@ impl DeepgramAsrClientInner {
         {
             let mut query = url.query_pairs_mut();
             if extra.map(|e| !e.contains_key("model")).unwrap_or(true) {
-                query.append_pair("model", self.option.model_type.as_deref().unwrap_or("nova-3"));
+                query.append_pair(
+                    "model",
+                    self.option.model_type.as_deref().unwrap_or("nova-3"),
+                );
             }
             if extra.map(|e| !e.contains_key("language")).unwrap_or(true) {
                 if let Some(language) = self.option.language.as_deref() {
@@ -254,7 +257,10 @@ impl DeepgramAsrClientInner {
             if extra.map(|e| !e.contains_key("encoding")).unwrap_or(true) {
                 query.append_pair("encoding", "linear16");
             }
-            if extra.map(|e| !e.contains_key("sample_rate")).unwrap_or(true) {
+            if extra
+                .map(|e| !e.contains_key("sample_rate"))
+                .unwrap_or(true)
+            {
                 query.append_pair(
                     "sample_rate",
                     self.option.samplerate.unwrap_or(16000).to_string().as_str(),
@@ -269,10 +275,16 @@ impl DeepgramAsrClientInner {
             {
                 query.append_pair("interim_results", "true");
             }
-            if extra.map(|e| !e.contains_key("endpointing")).unwrap_or(true) {
+            if extra
+                .map(|e| !e.contains_key("endpointing"))
+                .unwrap_or(true)
+            {
                 query.append_pair("endpointing", "300");
             }
-            if extra.map(|e| !e.contains_key("smart_format")).unwrap_or(true) {
+            if extra
+                .map(|e| !e.contains_key("smart_format"))
+                .unwrap_or(true)
+            {
                 query.append_pair("smart_format", "true");
             }
             if let Some(extra) = extra {

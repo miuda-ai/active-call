@@ -560,6 +560,9 @@ pub struct ActiveCall {
     pub wait_input_timeout: ArcSwapOption<u32>,
     /// ASR config to resume on the parent leg once the refer leg ends.
     pub pending_asr_resume: ArcSwapOption<(u32, TranscriptionOption)>,
+    /// RFC 3515 notifier for a transfer triggered by an incoming REFER;
+    /// reports the refer leg's final status back to the referrer.
+    pub refer_notifier: ArcSwapOption<crate::call::sip::ReferProgressNotifier>,
     /// WebSocket audio receiver injected at construction, taken once by setup.
     pub audio_receiver: std::sync::Mutex<Option<WebsocketBytesReceiver>>,
 }
@@ -657,6 +660,15 @@ impl ActiveCall {
 
     pub fn take_pending_asr_resume(&self) -> Option<(u32, TranscriptionOption)> {
         self.pending_asr_resume.swap(None).map(|a| (*a).clone())
+    }
+
+    /// RFC 3515 notifier of the pending incoming-REFER transfer (if any).
+    pub fn set_refer_notifier(&self, v: Option<Arc<crate::call::sip::ReferProgressNotifier>>) {
+        self.refer_notifier.store(v);
+    }
+
+    pub fn take_refer_notifier(&self) -> Option<Arc<crate::call::sip::ReferProgressNotifier>> {
+        self.refer_notifier.swap(None)
     }
 
     /// Insert/overwrite one main-leg extras variable.
@@ -830,6 +842,7 @@ impl ActiveCall {
             refer_call_token: ArcSwapOption::new(None),
             wait_input_timeout: ArcSwapOption::new(None),
             pending_asr_resume: ArcSwapOption::new(None),
+            refer_notifier: ArcSwapOption::new(None),
             audio_receiver: std::sync::Mutex::new(audio_receiver),
         }
     }
@@ -1150,6 +1163,94 @@ impl ActiveCall {
             SessionEvent::Hold { on_hold, .. } => {
                 self.bridge_paused.store(on_hold, Ordering::Relaxed);
             }
+            SessionEvent::TransferRequest {
+                refer_to,
+                referred_by,
+                refer,
+                notify,
+                ..
+            } => {
+                // Parent-leg transfers only: a refer leg must never start
+                // another transfer of its own.
+                if refer == Some(true) {
+                    return;
+                }
+                let Some(notifier) = notify else {
+                    return;
+                };
+                // Remember the notifier so ReferDone can report the final
+                // status to the referrer whatever we decide below.
+                self.set_refer_notifier(Some(notifier.clone()));
+                if !self.app_state.config.auto_refer() {
+                    info!(
+                        session_id = self.session_id,
+                        %refer_to,
+                        "auto refer disabled, terminating refer subscription with 403"
+                    );
+                    notifier.finished(403).await;
+                    return;
+                }
+                if self.refer_leg.load().is_some() {
+                    warn!(
+                        session_id = self.session_id,
+                        %refer_to,
+                        "refer already in progress, rejecting new transfer"
+                    );
+                    notifier.finished(491).await;
+                    return;
+                }
+                let Some(callee) = crate::sip_util::parse_refer_to_target(&refer_to) else {
+                    warn!(
+                        session_id = self.session_id,
+                        %refer_to,
+                        "unparsable Refer-To target, rejecting transfer"
+                    );
+                    notifier.finished(400).await;
+                    return;
+                };
+                let caller = referred_by
+                    .as_deref()
+                    .and_then(crate::sip_util::parse_refer_to_target)
+                    .or_else(|| {
+                        self.progress
+                            .load_full()
+                            .option
+                            .as_ref()
+                            .and_then(|o| o.caller.clone())
+                    })
+                    .unwrap_or_default();
+                let refer_option = ReferOption {
+                    auto_hangup: Some(true),
+                    forward_dtmf: Some(true),
+                    timeout: Some(self.app_state.config.auto_refer_timeout()),
+                    denoise: None,
+                    agc: None,
+                    moh: None,
+                    vad: None,
+                    asr: None,
+                    sip: None,
+                    call_id: None,
+                    pause_parent_asr: None,
+                };
+                info!(
+                    session_id = self.session_id,
+                    %caller,
+                    %callee,
+                    "auto refer: following incoming REFER"
+                );
+                if let Err(e) = self
+                    .do_refer(runtime, caller, callee, Some(refer_option))
+                    .await
+                {
+                    warn!(
+                        session_id = self.session_id,
+                        "auto refer failed to start: {}", e
+                    );
+                    if let Some(notifier) = self.take_refer_notifier() {
+                        notifier.finished(500).await;
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1161,6 +1262,7 @@ impl ActiveCall {
                 track_id,
                 forward_dtmf,
                 result,
+                code,
             } => match result {
                 Ok(answer) => {
                     self.media_stream
@@ -1179,6 +1281,9 @@ impl ActiveCall {
                             refer: Some(true),
                         })
                         .ok();
+                    if let Some(notifier) = self.take_refer_notifier() {
+                        notifier.finished(code.unwrap_or(200)).await;
+                    }
                     Ok(())
                 }
                 Err(e) => {
@@ -1187,6 +1292,15 @@ impl ActiveCall {
                         "failed to create refer sip track: {}", e
                     );
                     self.emit_reject_from_rsip_error(track_id, true, &e);
+                    let status = code
+                        .or_else(|| match &e {
+                            rsipstack::Error::DialogError(_, _, status) => Some(status.code()),
+                            _ => None,
+                        })
+                        .unwrap_or(500);
+                    if let Some(notifier) = self.take_refer_notifier() {
+                        notifier.finished(status).await;
+                    }
                     Err(e.into())
                 }
             },
@@ -1521,7 +1635,9 @@ impl ActiveCall {
             );
             if let Ok(pending) = Arc::try_unwrap(pending) {
                 pending.dialog.reject(code.clone(), reason.clone()).ok();
-                self.invitation.dialog_layer.remove_dialog(&pending.dialog.id());
+                self.invitation
+                    .dialog_layer
+                    .remove_dialog(&pending.dialog.id());
             }
         }
         match self
@@ -2080,6 +2196,7 @@ impl ActiveCall {
                 moh,
                 auto_hangup: auto_hangup_requested,
             };
+            let mut timed_out = false;
             let result = match tokio::time::timeout(
                 Duration::from_secs(timeout_secs as u64),
                 me.create_outgoing_sip_track(out),
@@ -2101,17 +2218,25 @@ impl ActiveCall {
                             refer: Some(true),
                         })
                         .ok();
+                    timed_out = true;
                     Err(rsipstack::Error::Error(
                         "refer sip track creation timed out".to_string(),
                     ))
                 }
             };
             me.set_moh(None);
+            let code = match &result {
+                Ok(_) => Some(200u16),
+                Err(rsipstack::Error::DialogError(_, _, status)) => Some(status.code()),
+                Err(_) if timed_out => Some(408),
+                Err(_) => None,
+            };
             actor_tx
                 .send(ActorMsg::ReferDone {
                     track_id,
                     forward_dtmf,
                     result,
+                    code,
                 })
                 .await
                 .ok();

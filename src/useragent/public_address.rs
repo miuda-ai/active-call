@@ -1,15 +1,17 @@
-use rsipstack::transport::SipAddr;
 use arc_swap::ArcSwap;
 use rsipstack::rsip::{headers::ToTypedHeader, prelude::HeadersExt};
-use rsipstack::{
-    transaction::endpoint::MessageInspector,
-};
+use rsipstack::transaction::endpoint::MessageInspector;
+use rsipstack::transport::SipAddr;
 use std::{net::IpAddr, sync::Arc};
 
 pub type SharedPublicAddress = Arc<ArcSwap<rsipstack::rsip::HostWithPort>>;
 
-pub fn normalize_transport(transport: Option<&rsipstack::rsip::Transport>) -> rsipstack::rsip::Transport {
-    transport.cloned().unwrap_or(rsipstack::rsip::Transport::Udp)
+pub fn normalize_transport(
+    transport: Option<&rsipstack::rsip::Transport>,
+) -> rsipstack::rsip::Transport {
+    transport
+        .cloned()
+        .unwrap_or(rsipstack::rsip::Transport::Udp)
 }
 
 pub fn transport_for_uri(uri: &rsipstack::rsip::Uri) -> rsipstack::rsip::Transport {
@@ -28,7 +30,8 @@ pub fn transport_for_uri(uri: &rsipstack::rsip::Uri) -> rsipstack::rsip::Transpo
 
 pub fn find_local_addr_for_uri(addrs: &[SipAddr], uri: &rsipstack::rsip::Uri) -> Option<SipAddr> {
     let transport = transport_for_uri(uri);
-    addrs.iter()
+    addrs
+        .iter()
         .find(|addr| normalize_transport(addr.r#type.as_ref()) == transport)
         .cloned()
 }
@@ -132,7 +135,11 @@ impl LearningMessageInspector {
 }
 
 impl MessageInspector for LearningMessageInspector {
-    fn before_send(&self, msg: rsipstack::rsip::SipMessage, dest: Option<&SipAddr>) -> rsipstack::rsip::SipMessage {
+    fn before_send(
+        &self,
+        msg: rsipstack::rsip::SipMessage,
+        dest: Option<&SipAddr>,
+    ) -> rsipstack::rsip::SipMessage {
         if let Some(next) = &self.next {
             next.before_send(msg, dest)
         } else {
@@ -140,7 +147,11 @@ impl MessageInspector for LearningMessageInspector {
         }
     }
 
-    fn after_received(&self, msg: rsipstack::rsip::SipMessage, from: Option<&SipAddr>) -> rsipstack::rsip::SipMessage {
+    fn after_received(
+        &self,
+        msg: rsipstack::rsip::SipMessage,
+        from: Option<&SipAddr>,
+    ) -> rsipstack::rsip::SipMessage {
         if let rsipstack::rsip::SipMessage::Response(response) = &msg
             && let Ok(via) = response.via_header()
             && let Ok(via) = via.typed()
@@ -181,7 +192,9 @@ pub fn should_update_address(
 
 fn is_public_address(host_with_port: &rsipstack::rsip::HostWithPort) -> bool {
     match &host_with_port.host {
-        rsipstack::rsip::Host::Domain(domain) => !domain.to_string().eq_ignore_ascii_case("localhost"),
+        rsipstack::rsip::Host::Domain(domain) => {
+            !domain.to_string().eq_ignore_ascii_case("localhost")
+        }
         rsipstack::rsip::Host::IpAddr(ip) => !is_local_or_unspecified(ip),
     }
 }
@@ -259,7 +272,8 @@ mod tests {
     #[test]
     fn identifies_contacts_that_need_resolution() {
         let local_contact: rsipstack::rsip::Uri = "sip:alice@127.0.0.1:5060".try_into().unwrap();
-        let remote_contact: rsipstack::rsip::Uri = "sip:alice@203.0.113.10:62000".try_into().unwrap();
+        let remote_contact: rsipstack::rsip::Uri =
+            "sip:alice@203.0.113.10:62000".try_into().unwrap();
         assert!(contact_needs_public_resolution(&local_contact));
         assert!(!contact_needs_public_resolution(&remote_contact));
     }
@@ -349,13 +363,17 @@ mod tests {
         };
 
         let contact = build_public_contact_uri(&cache, true, &local_addr, Some("alice"), None);
-        assert_eq!(contact.to_string(), "sips:alice@10.0.0.5:5061;transport=TLS");
+        assert_eq!(
+            contact.to_string(),
+            "sips:alice@10.0.0.5:5061;transport=TLS"
+        );
     }
 
     #[test]
     fn infers_transport_from_uri() {
         let sips_uri: rsipstack::rsip::Uri = "sips:alice@example.com".try_into().unwrap();
-        let tcp_uri: rsipstack::rsip::Uri = "sip:alice@example.com;transport=tcp".try_into().unwrap();
+        let tcp_uri: rsipstack::rsip::Uri =
+            "sip:alice@example.com;transport=tcp".try_into().unwrap();
         assert_eq!(transport_for_uri(&sips_uri), Transport::Tls);
         assert_eq!(transport_for_uri(&tcp_uri), Transport::Tcp);
     }

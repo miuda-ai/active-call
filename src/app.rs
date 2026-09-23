@@ -11,6 +11,7 @@ use crate::{
             FnCreateInvitationHandler, PendingDialog, PendingDialogGuard,
             default_create_invite_handler,
         },
+        peer_learning::{PeerAddressLearner, SharedLearnedPeers},
         public_address::{
             LearningMessageInspector, SharedPublicAddress, build_contact, build_public_contact_uri,
             find_local_addr_for_uri,
@@ -52,7 +53,7 @@ use std::{
 use tokio::select;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Generates a short unique session id for incoming calls, e.g. `s.3f9a2b1c4d5e`,
 /// instead of reusing the raw SIP dialog-id string. Collisions with live
@@ -60,11 +61,31 @@ use tracing::{info, warn};
 fn generate_short_session_id(invitation: &Invitation) -> String {
     loop {
         let uuid = uuid::Uuid::new_v4().simple().to_string();
-        let session_id = format!("s.{}", &uuid[..12]);
+        let session_id = format!("s.{}", &uuid);
         if !invitation.session_exists(&session_id) {
             return session_id;
         }
     }
+}
+
+/// Extracts the network source of a received request from its top Via header:
+/// the IP comes from the `received` parameter (populated by our transport for
+/// NAT'd peers) or the sent-by host when it is an IP literal; the hostname is
+/// the sent-by host as written. Port is intentionally ignored (carrier source
+/// ports change between probes).
+fn extract_via_source(request: &rsipstack::rsip::Request) -> (Option<std::net::IpAddr>, String) {
+    use rsipstack::rsip::ToTypedHeader;
+    let Ok(via) = request.via_header().and_then(|v| v.typed()) else {
+        return (None, String::new());
+    };
+    let source_ip = via
+        .received()
+        .and_then(|r| r.ok())
+        .or_else(|| match &via.sent_by().host {
+            rsipstack::rsip::Host::IpAddr(ip) => Some(*ip),
+            _ => None,
+        });
+    (source_ip, via.sent_by().host.to_string())
 }
 
 pub struct AppStateInner {
@@ -81,6 +102,9 @@ pub struct AppStateInner {
     pub routing_state: Arc<crate::call::RoutingState>,
     pub pending_playbooks: Arc<Mutex<HashMap<String, (String, Instant)>>>,
     pub learned_public_address: SharedPublicAddress,
+    /// Peer source addresses learned from call traffic, used by the OPTIONS
+    /// ACL (`[options_response]`).
+    pub learned_peers: crate::useragent::peer_learning::SharedLearnedPeers,
 
     pub active_calls: Arc<std::sync::Mutex<HashMap<String, ActiveCallRef>>>,
     pub total_calls: AtomicU64,
@@ -108,6 +132,28 @@ pub struct AppStateBuilder {
 impl AppStateInner {
     pub fn auto_learn_public_address_enabled(&self) -> bool {
         self.config.auto_learn_public_address.unwrap_or(false)
+    }
+
+    /// Whether an OPTIONS probe from `source_ip`/`source_host` (as extracted
+    /// from the top Via header) should be answered: the source must match the
+    /// static ACL, a registered-server host, or a peer address learned from
+    /// call traffic within the configured TTL.
+    pub fn options_source_allowed(
+        &self,
+        source_ip: Option<std::net::IpAddr>,
+        source_host: &str,
+    ) -> bool {
+        if self.config.options_matches_static(source_ip, source_host) {
+            return true;
+        }
+        if !self.config.options_auto_learn() {
+            return false;
+        }
+        let ttl = self.config.options_learn_ttl();
+        match source_ip {
+            Some(ip) => self.learned_peers.contains_within(&ip, ttl),
+            None => false,
+        }
     }
 
     pub fn get_dump_events_file(&self, session_id: &String) -> String {
@@ -368,10 +414,7 @@ impl AppStateInner {
 
                     let dialog_id = dialog.id();
                     let dialog_id_str = dialog_id.to_string();
-                    // Incoming calls get a short public session id instead of
-                    // the raw dialog-id string; the guard registers the mapping
-                    // below so accept/hangup/message lookups can resolve it.
-                    let session_id = generate_short_session_id(&self.invitation);
+                    let session_id = if dialog_id_str.len() > 64 { generate_short_session_id(&self.invitation) } else { dialog_id_str.clone() };
                     let dialog_id_for_cleanup = dialog_id.clone();
                     let token = self.token.child_token();
                     let pending_dialog = PendingDialog {
@@ -400,7 +443,11 @@ impl AppStateInner {
                     let invitation_for_cleanup = self.invitation.clone();
                     let session_id_for_task = session_id.clone();
                     crate::spawn(async move {
-                        info!(session_id = session_id_for_task, id = dialog_id_str, "incoming invite task started");
+                        info!(
+                            session_id = session_id_for_task,
+                            id = dialog_id_str,
+                            "incoming invite task started"
+                        );
                         let _pending_guard = guard;
                         let token_ref = token.clone();
                         let accept_timeout_sleep = tokio::time::sleep(accept_timeout);
@@ -509,24 +556,39 @@ impl AppStateInner {
                     });
                 }
                 rsipstack::rsip::Method::Options => {
-                    if self.config.enable_options_response.unwrap_or(true) {
-                        info!(?key, "responding to out-of-dialog OPTIONS request");
-                        let allow_header: rsipstack::rsip::Header =
-                            typed::Allow::from(Method::all()).into();
-                        let accept_header =
-                            rsipstack::rsip::Header::Accept(Accept::new("application/sdp"));
-                        match tx
-                            .reply_with(
-                                rsipstack::rsip::StatusCode::OK,
-                                vec![allow_header, accept_header],
-                                None,
-                            )
-                            .await
-                        {
-                            Ok(_) => (),
-                            Err(e) => {
-                                info!("error replying to OPTIONS: {:?}", e);
+                    if self.config.options_response_enabled() {
+                        let (source_ip, source_host) = extract_via_source(&tx.original);
+                        if self.options_source_allowed(source_ip, &source_host) {
+                            info!(?key, %source_host, "responding to out-of-dialog OPTIONS request");
+                            let mut headers = vec![
+                                {
+                                    let allow_header: rsipstack::rsip::Header =
+                                        typed::Allow::from(Method::all()).into();
+                                    allow_header
+                                },
+                                rsipstack::rsip::Header::Accept(Accept::new("application/sdp")),
+                            ];
+                            let extra_headers = self.config.options_extra_headers();
+                            if !extra_headers.is_empty() {
+                                headers.extend(crate::sip_util::sip_headers_from_map(
+                                    &extra_headers.into_iter().collect::<HashMap<_, _>>(),
+                                ));
                             }
+                            match tx
+                                .reply_with(rsipstack::rsip::StatusCode::OK, headers, None)
+                                .await
+                            {
+                                Ok(_) => (),
+                                Err(e) => {
+                                    info!("error replying to OPTIONS: {:?}", e);
+                                }
+                            }
+                        } else {
+                            debug!(
+                                ?key,
+                                %source_host,
+                                "dropping OPTIONS probe from non-allowed source"
+                            );
                         }
                     } else {
                         info!(?key, "ignoring out-of-dialog OPTIONS request");
@@ -957,7 +1019,7 @@ impl AppStateBuilder {
         self
     }
 
-    pub async fn build(self) -> Result<AppState> {
+    pub async fn build(mut self) -> Result<AppState> {
         let config: Arc<Config> = Arc::new(self.config.unwrap_or_default());
         let token = self
             .cancel_token
@@ -1025,6 +1087,8 @@ impl AppStateBuilder {
         let bind_addr = rsipstack::transport::SipConnection::resolve_bind_address(actual_addr);
         let mut learned_public_address: SharedPublicAddress =
             Arc::new(ArcSwap::from_pointee(bind_addr.into()));
+        let learned_peers =
+            SharedLearnedPeers::new(crate::useragent::peer_learning::LEARNED_PEERS_CAPACITY);
 
         let udp_inner = rsipstack::transport::udp::UdpInner {
             conn: tokio_socket,
@@ -1105,14 +1169,25 @@ impl AppStateBuilder {
             .with_transport_layer(transport_layer)
             .with_option(endpoint_option);
 
+        // Inspector chain (outermost runs first): public-address learning
+        // (opt-in) -> call-traffic peer learning (for the OPTIONS ACL) ->
+        // any caller-provided inspector.
+        let mut next_inspector = self.message_inspector.take();
+        if config.options_auto_learn() {
+            info!("learning call-traffic peer addresses for OPTIONS ACL");
+            next_inspector = Some(Box::new(PeerAddressLearner::new_with_next(
+                learned_peers.clone(),
+                next_inspector,
+            )));
+        }
         if config.auto_learn_public_address.unwrap_or_default() {
-            let inspector = LearningMessageInspector::new(bind_addr.into(), self.message_inspector);
+            let inspector = LearningMessageInspector::new(bind_addr.into(), next_inspector);
             learned_public_address = inspector.shared_public_address();
-            endpoint_builder = endpoint_builder.with_inspector(Box::new(inspector));
-        } else if let Some(inspector) = self.message_inspector {
+            next_inspector = Some(Box::new(inspector));
+        }
+        if let Some(inspector) = next_inspector {
             endpoint_builder = endpoint_builder.with_inspector(inspector);
         }
-
         if let Some(locator) = self.target_locator {
             endpoint_builder.with_target_locator(locator);
         } else if let Some(ref rules) = config.rewrites {
@@ -1173,6 +1248,7 @@ impl AppStateBuilder {
             routing_state: Arc::new(crate::call::RoutingState::new()),
             pending_playbooks: Arc::new(Mutex::new(HashMap::new())),
             learned_public_address,
+            learned_peers,
             active_calls: Arc::new(std::sync::Mutex::new(HashMap::new())),
             total_calls: AtomicU64::new(0),
             total_failed_calls: AtomicU64::new(0),

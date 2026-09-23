@@ -1,8 +1,8 @@
 use crate::callrecord::CallRecordHangupReason;
 use crate::event::{EventSender, SessionEvent};
 use crate::media::processor::ProcessorChain;
-use crate::media::{AudioFrame, PcmBuf, Samples, TrackId};
 use crate::media::track::{Track, TrackConfig, TrackPacketSender};
+use crate::media::{AudioFrame, PcmBuf, Samples, TrackId};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use audio_codec::BoxedResampler;
@@ -158,11 +158,9 @@ impl AudioReader for DecodedAudioReader {
         if let Some(resampler) = &mut self.resampler {
             resampler.resample(chunk)
         } else {
-            let mut new_resampler = BoxedResampler::new(
-                self.sample_rate as usize,
-                self.target_sample_rate as usize,
-            )
-            .expect("invalid sample rate");
+            let mut new_resampler =
+                BoxedResampler::new(self.sample_rate as usize, self.target_sample_rate as usize)
+                    .expect("invalid sample rate");
             let result = new_resampler.resample(chunk);
             self.resampler = Some(new_resampler);
             result
@@ -493,8 +491,7 @@ async fn stream_pcm_samples(
     paused: Arc<AtomicBool>,
     packet_sender: TrackPacketSender,
 ) -> Result<()> {
-    let reader =
-        DecodedAudioReader::from_samples(samples, target_sample_rate, target_sample_rate);
+    let reader = DecodedAudioReader::from_samples(samples, target_sample_rate, target_sample_rate);
     let audio_reader = Box::new(reader) as Box<dyn AudioReader>;
     info!(
         "filetrack: streaming {} decoded samples at {} Hz",

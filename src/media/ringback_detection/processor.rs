@@ -55,7 +55,11 @@ impl RingbackSlidingWindow {
     }
 
     fn push(&mut self, state: String, state_index: u32, confidence: f32) {
-        self.window.push_back(RingbackEntry { state, state_index, confidence });
+        self.window.push_back(RingbackEntry {
+            state,
+            state_index,
+            confidence,
+        });
         while self.window.len() > self.window_size {
             self.window.pop_front();
         }
@@ -93,19 +97,18 @@ impl RingbackSlidingWindow {
             }
         }
 
-        let best_state = state_counts
-            .into_iter()
-            .max_by(|(_, count_a, sum_a), (_, count_b, sum_b)| {
-                count_a
-                    .cmp(count_b)
-                    .then_with(|| {
+        let best_state =
+            state_counts
+                .into_iter()
+                .max_by(|(_, count_a, sum_a), (_, count_b, sum_b)| {
+                    count_a.cmp(count_b).then_with(|| {
                         let avg_a = sum_a / *count_a as f32;
                         let avg_b = sum_b / *count_b as f32;
                         avg_a
                             .partial_cmp(&avg_b)
                             .unwrap_or(std::cmp::Ordering::Equal)
                     })
-            })?;
+                })?;
 
         self.window
             .iter()
@@ -150,7 +153,8 @@ impl InferenceTask {
         let state = CLASS_NAMES.get(max_idx).unwrap_or(&"unknown");
         let confidence = max_val;
 
-        self.window.push(state.to_string(), max_idx as u32, confidence);
+        self.window
+            .push(state.to_string(), max_idx as u32, confidence);
 
         if let Some(entry) = self.window.high_confidence_entry() {
             let prev = self.prev_state.take();

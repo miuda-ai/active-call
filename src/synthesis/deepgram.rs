@@ -79,7 +79,9 @@ fn request_url(option: &SynthesisOption, protocol: &str) -> Url {
         query.append_pair("encoding", encoding);
     }
 
-    if extra.map(|e| !e.contains_key("sample_rate")).unwrap_or(true)
+    if extra
+        .map(|e| !e.contains_key("sample_rate"))
+        .unwrap_or(true)
         && matches!(encoding, "linear16" | "mulaw" | "alaw")
     {
         let samplerate = option.samplerate.unwrap_or(16000);

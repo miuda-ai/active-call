@@ -15,7 +15,7 @@ use rsipstack::dialog::invitation::InviteOption;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Remove `id` from the dialog layer and return the dialog, ready to be
 /// hung up. Shared by the dialog guards and `Invitation::hangup`.
@@ -23,6 +23,91 @@ pub(crate) fn remove_dialog(layer: &DialogLayer, id: &DialogId) -> Option<Dialog
     let dialog = layer.get_dialog(id)?;
     layer.remove_dialog(id);
     Some(dialog)
+}
+
+/// Reports transfer progress back to the referrer over the RFC 3515 implicit
+/// subscription created by an in-dialog REFER: `Event: refer` NOTIFYs sent on
+/// the parent dialog (100 Trying after the 202, then a terminal status).
+#[derive(Clone)]
+pub struct ReferProgressNotifier {
+    dialog_layer: Arc<DialogLayer>,
+    dialog_id: DialogId,
+}
+
+impl std::fmt::Debug for ReferProgressNotifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReferProgressNotifier")
+            .field("dialog_id", &self.dialog_id)
+            .finish()
+    }
+}
+
+impl ReferProgressNotifier {
+    pub fn new(dialog_layer: Arc<DialogLayer>, dialog_id: DialogId) -> Self {
+        Self {
+            dialog_layer,
+            dialog_id,
+        }
+    }
+
+    async fn notify(&self, code: u16, sub_state: &str) {
+        let dialog = match self.dialog_layer.get_dialog(&self.dialog_id) {
+            Some(Dialog::Invite(dialog)) => dialog,
+            Some(_) => {
+                debug!(
+                    id = %self.dialog_id,
+                    "refer notify: dialog is not an invite dialog, skipping"
+                );
+                return;
+            }
+            None => {
+                debug!(
+                    id = %self.dialog_id,
+                    "refer notify: parent dialog gone, skipping"
+                );
+                return;
+            }
+        };
+        let status = match rsipstack::rsip::StatusCode::try_from(code) {
+            Ok(status) => status,
+            Err(_) => rsipstack::rsip::StatusCode::ServerInternalError,
+        };
+        match dialog.notify_refer(status, sub_state).await {
+            Ok(Some(_)) => info!(
+                id = %self.dialog_id,
+                code,
+                sub_state,
+                "refer notify sent"
+            ),
+            Ok(None) => warn!(
+                id = %self.dialog_id,
+                code,
+                "refer notify skipped: dialog not confirmed"
+            ),
+            Err(e) => warn!(
+                id = %self.dialog_id,
+                code,
+                "failed to send refer notify: {}",
+                e
+            ),
+        }
+    }
+
+    /// Transfer attempt accepted and in progress (sent right after the 202).
+    pub async fn trying(&self) {
+        self.notify(100, "active").await;
+    }
+
+    /// Terminal status of the transfer attempt: 2xx reports success, any
+    /// other code a failure (body is a `message/sipfrag` status line).
+    pub async fn finished(&self, code: u16) {
+        let sub_state = if (200..300).contains(&code) {
+            "terminated;reason=noresource".to_string()
+        } else {
+            format!("terminated;reason=SIP;cause={code}")
+        };
+        self.notify(code, &sub_state).await;
+    }
 }
 
 pub struct DialogStateReceiverGuard {
@@ -116,6 +201,10 @@ pub(super) struct InviteDialogStates {
     /// Hangup intent carried by this leg (refer legs with `auto_hangup`),
     /// reported on the leg's TrackEnd so the call actor can hang up.
     pub hangup_reason: Option<CallRecordHangupReason>,
+    /// REFER notifier waiting for the dialog to return to the confirmed
+    /// state (the 202 reply transitions it back); the RFC 3515 Trying
+    /// NOTIFY is sent from the next `Confirmed` event.
+    pub pending_refer_notify: Option<Arc<ReferProgressNotifier>>,
 }
 
 impl InviteDialogStates {
@@ -141,6 +230,7 @@ impl InviteDialogStates {
             has_early_media: false,
             initial_confirmed: false,
             hangup_reason,
+            pending_refer_notify: None,
         }
     }
 }
@@ -159,6 +249,13 @@ impl InviteDialogStates {
         });
         let progress = self.leg.progress.load_full();
 
+        // The auto-hangup intent (refer legs) must only fire when the refer
+        // leg was actually ANSWERED: if the transfer target rejected or timed
+        // out, the transfer failed and the caller stays in the original call.
+        let auto_hangup = self
+            .hangup_reason
+            .clone()
+            .filter(|_| progress.answer_time.is_some());
         self.event_sender
             .send(crate::event::SessionEvent::TrackEnd {
                 track_id: self.track_id.clone(),
@@ -169,7 +266,7 @@ impl InviteDialogStates {
                     .unwrap_or_default() as u64,
                 ssrc: self.leg.ssrc,
                 play_id: None,
-                auto_hangup: self.hangup_reason.clone(),
+                auto_hangup,
             })
             .ok();
         let hangup_event = self
@@ -279,6 +376,13 @@ impl DialogStateReceiverGuard {
                                 }
                             }
                         }
+                    }
+                    // The dialog is back in the confirmed state (either the
+                    // initial ACK, or rsipstack returning from a mid-dialog
+                    // request like REFER) — flush the pending RFC 3515
+                    // Trying NOTIFY.
+                    if let Some(notifier) = states.pending_refer_notify.take() {
+                        notifier.trying().await;
                     }
                 }
                 DialogState::Info(dialog_id, req, tx_handle) => {
@@ -413,6 +517,17 @@ impl DialogStateReceiverGuard {
                         .reply(rsipstack::rsip::StatusCode::Other(202, "Accepted".into()))
                         .await
                         .ok();
+                    // RFC 3515: the 202 opens an implicit subscription; report
+                    // progress on the parent dialog. Whether the transfer is
+                    // actually attempted is decided by the call actor. The
+                    // Trying NOTIFY waits for the next Confirmed event — the
+                    // 202 itself flips the dialog back to confirmed, so this
+                    // is deterministic and free of state races.
+                    let notifier = Arc::new(ReferProgressNotifier::new(
+                        self.dialog_layer.clone(),
+                        dialog_id.clone(),
+                    ));
+                    states.pending_refer_notify = Some(notifier.clone());
                     states
                         .event_sender
                         .send(crate::event::SessionEvent::TransferRequest {
@@ -421,8 +536,17 @@ impl DialogStateReceiverGuard {
                             refer_to,
                             referred_by,
                             refer: Some(states.leg.is_refer),
+                            notify: Some(notifier),
                         })
                         .ok();
+                }
+                DialogState::Notify(dialog_id, _req, tx_handle) => {
+                    info!(
+                        session_id = states.session_id,
+                        %dialog_id,
+                        "dialog notify received"
+                    );
+                    tx_handle.reply(rsipstack::rsip::StatusCode::OK).await.ok();
                 }
                 DialogState::Terminated(dialog_id, reason) => {
                     info!(
@@ -519,7 +643,10 @@ impl Invitation {
     }
 
     pub fn unregister_session(&self, session_id: &str) {
-        self.sessions.lock().map(|mut ss| ss.remove(session_id)).ok();
+        self.sessions
+            .lock()
+            .map(|mut ss| ss.remove(session_id))
+            .ok();
     }
 
     pub fn session_exists(&self, session_id: &str) -> bool {
@@ -661,6 +788,7 @@ mod tests {
             has_early_media,
             initial_confirmed: false,
             hangup_reason: None,
+            pending_refer_notify: None,
         }
     }
 
@@ -1044,7 +1172,7 @@ mod tests {
     fn test_find_dialog_id_falls_back_to_pending_scan() {
         use rsipstack::dialog::dialog::DialogInner;
         use rsipstack::dialog::invite_dialog::InviteDialog;
-        use rsipstack::rsip::typed::{Contact, CSeq, From, To, Via};
+        use rsipstack::rsip::typed::{CSeq, Contact, From, To, Via};
         use rsipstack::rsip::{Header, Request};
         use rsipstack::transaction::key::TransactionRole;
 
@@ -1073,7 +1201,9 @@ mod tests {
                     .into(),
                 To::parse("Bob <sip:bob@example.com>").unwrap().into(),
                 Header::CallId("legacy-call-id".into()),
-                Contact::parse("<sip:alice@alice.example.com:5060>").unwrap().into(),
+                Contact::parse("<sip:alice@alice.example.com:5060>")
+                    .unwrap()
+                    .into(),
                 Header::MaxForwards("70".into()),
             ]
             .into(),

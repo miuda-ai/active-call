@@ -1,5 +1,5 @@
 use anyhow::Result;
-use ndarray::{s, Array2};
+use ndarray::{Array2, s};
 use std::ffi::c_float;
 
 #[derive(Clone, Copy, Debug)]
@@ -110,11 +110,7 @@ pub(crate) fn apply_lfr(fbank: &Array2<f32>, lfr_m: usize, lfr_n: usize) -> Arra
                 0
             } else {
                 let shifted = effective_idx - pad;
-                if shifted < t {
-                    shifted
-                } else {
-                    t - 1
-                }
+                if shifted < t { shifted } else { t - 1 }
             };
             let src_row = fbank.row(row_idx);
             let src_slice = src_row

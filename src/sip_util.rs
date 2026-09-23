@@ -10,6 +10,33 @@ pub fn ensure_sip_scheme(uri: String) -> String {
     }
 }
 
+/// Extract the dialable target URI from a `Refer-To` header value.
+///
+/// Accepts the common RFC 3515 spellings:
+/// - `<sip:1002@host:port>`
+/// - `sip:1002@host:port`
+/// - `"Bob" <sip:1002@host:port>;foo=bar`
+///
+/// Display names, angle brackets, URI parameters (`;...`) and the query part
+/// (`?Replaces=...`, attended transfer) are stripped; only the plain
+/// `scheme:user@host[:port]` remains.
+pub fn parse_refer_to_target(refer_to: &str) -> Option<String> {
+    let value = refer_to.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let inner = match (value.find('<'), value.rfind('>')) {
+        (Some(start), Some(end)) if end > start => &value[start + 1..end],
+        // A '>' without a matching '<' means the raw value contained one;
+        // fall through to the unbracketed path which will strip params anyway.
+        _ => value,
+    };
+    // Drop URI parameters and the query (e.g. ?Replaces=...).
+    let inner = inner.split([';', '?']).next()?;
+    let inner = inner.trim();
+    (!inner.is_empty()).then(|| inner.to_string())
+}
+
 /// Convert a map of header name/value pairs into SIP headers.
 pub fn sip_headers_from_map(
     headers: &std::collections::HashMap<String, String>,
@@ -50,6 +77,33 @@ mod tests {
             ensure_sip_scheme("sips:bob@example.com".into()),
             "sips:bob@example.com"
         );
+    }
+
+    #[test]
+    fn parses_refer_to_targets() {
+        assert_eq!(
+            parse_refer_to_target("<sip:1002@127.0.0.1:5080>").as_deref(),
+            Some("sip:1002@127.0.0.1:5080")
+        );
+        assert_eq!(
+            parse_refer_to_target("sip:1002@127.0.0.1:5080").as_deref(),
+            Some("sip:1002@127.0.0.1:5080")
+        );
+        assert_eq!(
+            parse_refer_to_target("\"Bob\" <sip:1002@host>;foo=bar").as_deref(),
+            Some("sip:1002@host")
+        );
+        // Attended-transfer query (Replaces) is stripped.
+        assert_eq!(
+            parse_refer_to_target(
+                "<sip:1003@host?Replaces=abc%40host%3Bto-tag%3D1%3Bfrom-tag%3D2>"
+            )
+            .as_deref(),
+            Some("sip:1003@host")
+        );
+        assert_eq!(parse_refer_to_target(""), None);
+        assert_eq!(parse_refer_to_target("   "), None);
+        assert_eq!(parse_refer_to_target("<>;foo=bar"), None);
     }
 
     #[test]

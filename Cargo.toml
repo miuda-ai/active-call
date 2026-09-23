@@ -12,13 +12,20 @@
 [package]
 edition = "2024"
 name = "active-call"
-version = "0.3.90"
+version = "0.3.96"
 authors = ["jinti<shenjindi@fourz.cn>"]
 build = false
 exclude = [
     "fixtures/**",
     "examples/**",
     "src/media/tests/**",
+    "tests/**",
+    "scripts/**",
+    "docs/**",
+    "config/**",
+    "features/**",
+    "static/**",
+    "dialogue.md",
 ]
 autolib = false
 autobins = false
@@ -64,106 +71,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "active-call"
 path = "src/main.rs"
-
-[[test]]
-name = "asr_pause_resume_test"
-path = "tests/asr_pause_resume_test.rs"
-
-[[test]]
-name = "autohangup_headers_test"
-path = "tests/autohangup_headers_test.rs"
-
-[[test]]
-name = "autohangup_tts_test"
-path = "tests/autohangup_tts_test.rs"
-
-[[test]]
-name = "call_tests"
-path = "tests/call_tests.rs"
-
-[[test]]
-name = "callrecord_tests"
-path = "tests/callrecord_tests.rs"
-
-[[test]]
-name = "deadlock_repro"
-path = "tests/deadlock_repro.rs"
-
-[[test]]
-name = "hold_asr_continuity_test"
-path = "tests/hold_asr_continuity_test.rs"
-
-[[test]]
-name = "memory_leak_test"
-path = "tests/memory_leak_test.rs"
-
-[[test]]
-name = "multi_scene_test"
-path = "tests/multi_scene_test.rs"
-
-[[test]]
-name = "offline_integration_test"
-path = "tests/offline_integration_test.rs"
-
-[[test]]
-name = "peer_forward_test"
-path = "tests/peer_forward_test.rs"
-
-[[test]]
-name = "perf_test"
-path = "tests/perf_test.rs"
-
-[[test]]
-name = "playbook_runner_tests"
-path = "tests/playbook_runner_tests.rs"
-
-[[test]]
-name = "playbook_tests"
-path = "tests/playbook_tests.rs"
-
-[[test]]
-name = "refactor_validation_test"
-path = "tests/refactor_validation_test.rs"
-
-[[test]]
-name = "rtp_track_event_test"
-path = "tests/rtp_track_event_test.rs"
-
-[[test]]
-name = "sip_183_200_reinvite_test"
-path = "tests/sip_183_200_reinvite_test.rs"
-
-[[test]]
-name = "sip_hold_test"
-path = "tests/sip_hold_test.rs"
-
-[[test]]
-name = "sip_integration_test"
-path = "tests/sip_integration_test.rs"
-
-[[test]]
-name = "sip_ssrc_change_test"
-path = "tests/sip_ssrc_change_test.rs"
-
-[[test]]
-name = "test_credentials_match"
-path = "tests/test_credentials_match.rs"
-
-[[test]]
-name = "useragent_tests"
-path = "tests/useragent_tests.rs"
-
-[[test]]
-name = "webrtc_audio_receive_test"
-path = "tests/webrtc_audio_receive_test.rs"
-
-[[test]]
-name = "webrtc_vad_link_test"
-path = "tests/webrtc_vad_link_test.rs"
-
-[[test]]
-name = "ws_accept_answers_sip_test"
-path = "tests/ws_accept_answers_sip_test.rs"
 
 [dependencies.anyhow]
 version = "1"
@@ -234,6 +141,9 @@ version = "3.5.1"
 version = "1.5.0"
 
 [dependencies.humantime]
+version = "2"
+
+[dependencies.ipnet]
 version = "2"
 
 [dependencies.knf-rs-sys]
@@ -325,7 +235,7 @@ features = [
 ]
 
 [dependencies.rsipstack]
-version = "0.6.9"
+version = "0.6.11"
 
 [dependencies.rustfft]
 version = "6.2"
@@ -334,7 +244,7 @@ version = "6.2"
 version = "0.23.43"
 
 [dependencies.rustrtc]
-version = "0.3.124"
+version = "0.3.135"
 
 [dependencies.serde]
 version = "1"

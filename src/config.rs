@@ -111,6 +111,18 @@ fn default_enable_options_response() -> Option<bool> {
     Some(true)
 }
 
+fn default_options_allow_registered_servers() -> Option<bool> {
+    Some(true)
+}
+
+fn default_options_auto_learn() -> Option<bool> {
+    Some(true)
+}
+
+fn default_options_learn_ttl() -> Option<String> {
+    Some("7d".to_string())
+}
+
 fn default_codecs() -> Option<Vec<String>> {
     let codecs = vec![
         "pcmu".to_string(),
@@ -334,6 +346,92 @@ fn regex_is_match(pattern: &str, value: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Extracts the host part of a `register_users[].server` value, which may be
+/// `host`, `host:port`, or `[ipv6]:port`.
+fn host_of_server(server: &str) -> Option<String> {
+    let server = server.trim();
+    if server.is_empty() {
+        return None;
+    }
+    if let Some(rest) = server.strip_prefix('[') {
+        // [ipv6]:port or [ipv6]
+        return rest.split(']').next().map(|h| h.to_ascii_lowercase());
+    }
+    // A bare ipv6 literal without brackets contains multiple colons; keep it whole.
+    if server.matches(':').count() > 1 {
+        return Some(server.to_ascii_lowercase());
+    }
+    server.split(':').next().map(|h| h.to_ascii_lowercase())
+}
+
+/// One parsed `[options_response].allow` entry: an exact IP, a CIDR block, or
+/// a hostname.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OptionsAclEntry {
+    Ip(std::net::IpAddr),
+    Cidr(ipnet::IpNet),
+    Host(String),
+}
+
+impl OptionsAclEntry {
+    fn parse(raw: &str) -> Option<Self> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        if let Ok(ip) = raw.parse::<std::net::IpAddr>() {
+            return Some(Self::Ip(ip));
+        }
+        if let Ok(cidr) = raw.parse::<ipnet::IpNet>() {
+            return Some(Self::Cidr(cidr));
+        }
+        Some(Self::Host(raw.to_ascii_lowercase()))
+    }
+
+    pub fn matches(&self, source_ip: Option<std::net::IpAddr>, source_host: &str) -> bool {
+        match self {
+            Self::Ip(ip) => source_ip == Some(*ip),
+            Self::Cidr(net) => source_ip.map(|ip| net.contains(&ip)).unwrap_or(false),
+            Self::Host(host) => host.eq_ignore_ascii_case(source_host),
+        }
+    }
+}
+
+/// `[options_response]` — customizes the 200 OK answers to out-of-dialog
+/// OPTIONS keep-alive probes and restricts which sources are answered.
+///
+/// A probe is answered only when its source (top Via header) matches the
+/// static `allow` ACL, a `register_users[].server` host, or a peer address
+/// learned from call traffic (`auto_learn`). Everything else is dropped
+/// silently.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct OptionsResponseConfig {
+    /// Answer out-of-dialog OPTIONS probes; falls back to the legacy
+    /// `enable_options_response` field, defaulting to `true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Static ACL entries: exact IP (`139.224.72.64`), CIDR (`10.0.0.0/8`),
+    /// or hostname (`sip.ccc.aliyuncs.com`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+    /// Also answer probes coming from the hosts of `register_users[].server`.
+    #[serde(default = "default_options_allow_registered_servers")]
+    pub allow_registered_servers: Option<bool>,
+    /// Learn peer addresses from call traffic — inbound INVITEs and responses
+    /// to our outbound INVITEs — and answer probes from those sources within
+    /// `learn_ttl` (strict mode: until the first peer is learned, only the
+    /// static ACL and registered hosts apply).
+    #[serde(default = "default_options_auto_learn")]
+    pub auto_learn: Option<bool>,
+    /// How long a learned peer address stays valid, e.g. `"7d"` (default).
+    #[serde(default = "default_options_learn_ttl")]
+    pub learn_ttl: Option<String>,
+    /// Extra headers appended to the OPTIONS 200 OK response.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_headers: Vec<(String, String)>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default = "default_config_http_addr")]
@@ -396,6 +494,31 @@ pub struct Config {
     pub trunk_rules: Option<Vec<TrunkRule>>,
     #[serde(default = "default_enable_options_response")]
     pub enable_options_response: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options_response: Option<OptionsResponseConfig>,
+
+    /// Follow incoming in-dialog REFER automatically: dial the Refer-To
+    /// target and bridge media (transfer). The `transferRequest` session
+    /// event is always emitted regardless; when disabled the RFC 3515
+    /// implicit subscription is terminated with a 403 NOTIFY instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_refer: Option<bool>,
+    /// Timeout in seconds for the INVITE handshake of an auto-refer leg.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_refer_timeout: Option<u32>,
+}
+
+impl Config {
+    /// Whether incoming in-dialog REFERs are followed automatically
+    /// (defaults to true).
+    pub fn auto_refer(&self) -> bool {
+        self.auto_refer.unwrap_or(true)
+    }
+
+    /// INVITE handshake timeout in seconds for auto-refer legs (default 30).
+    pub fn auto_refer_timeout(&self) -> u32 {
+        self.auto_refer_timeout.unwrap_or(30)
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, Serialize)]
@@ -507,6 +630,9 @@ impl Default for Config {
             rewrites: None,
             trunk_rules: None,
             enable_options_response: default_enable_options_response(),
+            options_response: None,
+            auto_refer: None,
+            auto_refer_timeout: None,
         }
     }
 }
@@ -526,6 +652,92 @@ impl Config {
             &std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("{}: {}", e, path))?,
         )?;
         Ok(config)
+    }
+
+    /// Whether out-of-dialog OPTIONS probes should be answered at all.
+    pub fn options_response_enabled(&self) -> bool {
+        self.options_response
+            .as_ref()
+            .and_then(|o| o.enabled)
+            .or(self.enable_options_response)
+            .unwrap_or(true)
+    }
+
+    /// Whether peer addresses should be learned from call traffic.
+    pub fn options_auto_learn(&self) -> bool {
+        self.options_response
+            .as_ref()
+            .and_then(|o| o.auto_learn)
+            .unwrap_or(true)
+    }
+
+    /// TTL for learned peer addresses; unparsable/missing values default to 7 days.
+    pub fn options_learn_ttl(&self) -> std::time::Duration {
+        const DEFAULT: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+        self.options_response
+            .as_ref()
+            .and_then(|o| o.learn_ttl.as_deref())
+            .map(|raw| humantime::parse_duration(raw).unwrap_or(DEFAULT))
+            .unwrap_or(DEFAULT)
+    }
+
+    /// Parsed static ACL entries for OPTIONS probing.
+    pub fn options_acl_entries(&self) -> Vec<OptionsAclEntry> {
+        self.options_response
+            .as_ref()
+            .map(|o| {
+                o.allow
+                    .iter()
+                    .filter_map(|raw| OptionsAclEntry::parse(raw))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Hosts of `register_users[].server` when `allow_registered_servers` is
+    /// on (the default); empty otherwise.
+    pub fn options_registered_hosts(&self) -> Vec<String> {
+        let enabled = self
+            .options_response
+            .as_ref()
+            .and_then(|o| o.allow_registered_servers)
+            .unwrap_or(true);
+        if !enabled {
+            return vec![];
+        }
+        self.register_users
+            .as_ref()
+            .map(|users| {
+                users
+                    .iter()
+                    .filter_map(|user| host_of_server(&user.server))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Extra headers appended to OPTIONS 200 OK responses.
+    pub fn options_extra_headers(&self) -> Vec<(String, String)> {
+        self.options_response
+            .as_ref()
+            .map(|o| o.extra_headers.clone())
+            .unwrap_or_default()
+    }
+
+    /// Whether `source_ip`/`source_host` matches the static ACL or the
+    /// registered-server hosts (the configured, non-learned allow sets).
+    pub fn options_matches_static(
+        &self,
+        source_ip: Option<std::net::IpAddr>,
+        source_host: &str,
+    ) -> bool {
+        self.options_acl_entries()
+            .iter()
+            .any(|entry| entry.matches(source_ip, source_host))
+            || self
+                .options_registered_hosts()
+                .iter()
+                .any(|host| host.eq_ignore_ascii_case(source_host))
     }
 
     pub fn recorder_path(&self) -> String {
@@ -700,6 +912,208 @@ url = "http://example.com/webhook"
         } else {
             panic!("Expected Webhook handler config");
         }
+    }
+
+    // ---------------------------------------------------------------------------
+    // options_response: config parsing + accessors
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_options_response_defaults() {
+        let config: Config = toml::from_str(
+            r#"
+http_addr = "0.0.0.0:8080"
+addr = "0.0.0.0"
+udp_port = 25060
+"#,
+        )
+        .unwrap();
+
+        assert!(config.options_response.is_none());
+        // Section absent: enabled via the legacy field/default, auto-learn on,
+        // 7d TTL, no static entries, no extra headers.
+        assert!(config.options_response_enabled());
+        assert!(config.options_auto_learn());
+        assert_eq!(
+            config.options_learn_ttl(),
+            std::time::Duration::from_secs(7 * 24 * 3600)
+        );
+        assert!(config.options_acl_entries().is_empty());
+        assert!(config.options_registered_hosts().is_empty());
+        assert!(config.options_extra_headers().is_empty());
+    }
+
+    #[test]
+    fn test_options_response_config_parsing() {
+        let toml_config = r#"
+http_addr = "0.0.0.0:8080"
+addr = "0.0.0.0"
+udp_port = 25060
+
+[options_response]
+enabled = true
+allow = ["139.224.72.64", "10.0.0.0/8", "SIP.CCC.AliyunCS.com"]
+allow_registered_servers = false
+auto_learn = false
+learn_ttl = "1h"
+extra_headers = [["X-Node-Id", "node-1"], ["User-Agent", "ActiveCall-Test"]]
+"#;
+
+        let config: Config = toml::from_str(toml_config).unwrap();
+        let options = config.options_response.as_ref().unwrap();
+        assert_eq!(options.enabled, Some(true));
+        assert_eq!(options.allow_registered_servers, Some(false));
+        assert_eq!(options.auto_learn, Some(false));
+
+        assert!(!config.options_auto_learn());
+        assert_eq!(
+            config.options_learn_ttl(),
+            std::time::Duration::from_secs(3600)
+        );
+
+        let entries = config.options_acl_entries();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            entries[0],
+            OptionsAclEntry::Ip("139.224.72.64".parse().unwrap())
+        );
+        assert!(matches!(entries[1], OptionsAclEntry::Cidr(_)));
+        assert_eq!(
+            entries[2],
+            OptionsAclEntry::Host("sip.ccc.aliyuncs.com".to_string())
+        );
+
+        let headers = config.options_extra_headers();
+        assert_eq!(headers.len(), 2);
+        assert_eq!(headers[0], ("X-Node-Id".to_string(), "node-1".to_string()));
+    }
+
+    #[test]
+    fn test_options_response_enabled_fallback_chain() {
+        // Legacy field only.
+        let config: Config = toml::from_str(
+            r#"
+addr = "0.0.0.0"
+udp_port = 25060
+enable_options_response = false
+"#,
+        )
+        .unwrap();
+        assert!(!config.options_response_enabled());
+
+        // New section wins over the legacy field.
+        let config: Config = toml::from_str(
+            r#"
+addr = "0.0.0.0"
+udp_port = 25060
+enable_options_response = false
+
+[options_response]
+enabled = true
+"#,
+        )
+        .unwrap();
+        assert!(config.options_response_enabled());
+
+        // New section with enabled unset falls back to the legacy field.
+        let config: Config = toml::from_str(
+            r#"
+addr = "0.0.0.0"
+udp_port = 25060
+enable_options_response = false
+
+[options_response]
+extra_headers = [["X-A", "1"]]
+"#,
+        )
+        .unwrap();
+        assert!(!config.options_response_enabled());
+    }
+
+    #[test]
+    fn test_options_acl_matching() {
+        let toml_config = r#"
+addr = "0.0.0.0"
+udp_port = 25060
+
+[options_response]
+allow = ["139.224.72.64", "10.0.0.0/8", "sip.ccc.aliyuncs.com"]
+"#;
+        let config: Config = toml::from_str(toml_config).unwrap();
+        let ip = |s: &str| Some(s.parse::<std::net::IpAddr>().unwrap());
+
+        // Exact IP.
+        assert!(config.options_matches_static(ip("139.224.72.64"), "139.224.72.64"));
+        assert!(!config.options_matches_static(ip("139.224.72.65"), "139.224.72.65"));
+        // CIDR.
+        assert!(config.options_matches_static(ip("10.1.2.3"), "10.1.2.3"));
+        assert!(!config.options_matches_static(ip("192.168.1.1"), "192.168.1.1"));
+        // Hostname, case-insensitive.
+        assert!(config.options_matches_static(None, "SIP.CCC.ALIYUNCS.COM"));
+        assert!(!config.options_matches_static(None, "sip.example.com"));
+        // An IP source does not match the hostname entry and vice versa.
+        assert!(!config.options_matches_static(None, "139.224.72.64"));
+    }
+
+    #[test]
+    fn test_options_registered_hosts() {
+        let toml_config = r#"
+addr = "0.0.0.0"
+udp_port = 25060
+
+[[register_users]]
+server = "sip.example.com:5060"
+username = "1001"
+
+[[register_users]]
+server = "10.0.0.5"
+username = "1002"
+"#;
+        let config: Config = toml::from_str(toml_config).unwrap();
+        // Default: registered servers are allowed.
+        assert_eq!(
+            config.options_registered_hosts(),
+            vec!["sip.example.com".to_string(), "10.0.0.5".to_string()]
+        );
+        assert!(config.options_matches_static(None, "SIP.EXAMPLE.COM"));
+        assert!(config.options_matches_static(Some("10.0.0.5".parse().unwrap()), "10.0.0.5"));
+
+        // Opt out via allow_registered_servers = false.
+        let toml_config_off = r#"
+addr = "0.0.0.0"
+udp_port = 25060
+
+[[register_users]]
+server = "sip.example.com"
+username = "1001"
+
+[options_response]
+allow_registered_servers = false
+"#;
+        let config: Config = toml::from_str(toml_config_off).unwrap();
+        assert!(config.options_registered_hosts().is_empty());
+        assert!(!config.options_matches_static(None, "sip.example.com"));
+    }
+
+    #[test]
+    fn test_host_of_server() {
+        assert_eq!(
+            host_of_server("sip.example.com:5060"),
+            Some("sip.example.com".to_string())
+        );
+        assert_eq!(
+            host_of_server("SIP.Example.COM"),
+            Some("sip.example.com".to_string())
+        );
+        assert_eq!(
+            host_of_server("[2001:db8::1]:5060"),
+            Some("2001:db8::1".to_string())
+        );
+        assert_eq!(
+            host_of_server("2001:db8::1"),
+            Some("2001:db8::1".to_string())
+        );
+        assert_eq!(host_of_server(""), None);
     }
 
     // ---------------------------------------------------------------------------

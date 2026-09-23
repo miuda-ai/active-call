@@ -142,6 +142,10 @@ pub enum SessionEvent {
         refer_to: String,
         referred_by: Option<String>,
         refer: Option<bool>,
+        /// RFC 3515 implicit-subscription notifier for the REFER's parent
+        /// dialog; used to report transfer progress back to the referrer.
+        #[serde(skip)]
+        notify: Option<std::sync::Arc<crate::call::sip::ReferProgressNotifier>>,
     },
     Message {
         track_id: String,
