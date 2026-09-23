@@ -2713,3 +2713,249 @@ impl Drop for ActiveCall {
         }
     }
 }
+
+#[cfg(test)]
+mod auto_refer_tests {
+    use super::*;
+    use crate::app::AppStateBuilder;
+    use crate::call::sip::ReferProgressNotifier;
+    use crate::config::Config;
+    use crate::media::engine::StreamEngine;
+    use std::sync::Arc;
+
+    const BRIDGE_REF_ID: &str = "ref-99126-s.test-session";
+
+    async fn make_call() -> Arc<ActiveCall> {
+        let mut config = Config::default();
+        config.udp_port = 0;
+        config.media_cache_path = "/tmp/mediacache".to_string();
+        let app_state = AppStateBuilder::new()
+            .with_config(config)
+            .with_stream_engine(Arc::new(StreamEngine::default()))
+            .build()
+            .await
+            .unwrap();
+        Arc::new(ActiveCall::new(CallSpec {
+            call_type: ActiveCallType::Sip,
+            cancel_token: CancellationToken::new(),
+            session_id: "test-session".to_string(),
+            invitation: app_state.invitation.clone(),
+            app_state: app_state.clone(),
+            track_config: TrackConfig::default(),
+            audio_receiver: None,
+            dump_events: false,
+            server_side_track_id: None,
+            extras: None,
+        }))
+    }
+
+    fn runtime() -> CallRuntime {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<ActorMsg>(16);
+        CallRuntime::new(tx)
+    }
+
+    fn notifier(call: &ActiveCall) -> Arc<ReferProgressNotifier> {
+        Arc::new(ReferProgressNotifier::new(
+            call.invitation.dialog_layer.clone(),
+            rsipstack::dialog::DialogId {
+                call_id: BRIDGE_REF_ID.to_string(),
+                local_tag: String::new(),
+                remote_tag: String::new(),
+            },
+        ))
+    }
+
+    fn transfer_event(
+        leg_session_id: Option<String>,
+        notify: Option<Arc<ReferProgressNotifier>>,
+    ) -> SessionEvent {
+        SessionEvent::TransferRequest {
+            track_id: SERVER_SIDE_TRACK_ID.to_string(),
+            timestamp: 0,
+            refer_to: "sip:952299@example.com".to_string(),
+            referred_by: None,
+            refer: Some(true),
+            leg_session_id,
+            notify,
+        }
+    }
+
+    // A REFER on the current INVITE-mode bridge leg must be followed: the
+    // bridge leg is captured for retirement and a new refer leg (the transfer
+    // INVITE) replaces it in the refer_leg slot.
+    #[tokio::test]
+    async fn bridge_leg_refer_is_followed() {
+        let call = make_call().await;
+        call.set_refer_leg(Some(LegShared::new(
+            7,
+            true,
+            CallProgress {
+                session_id: BRIDGE_REF_ID.to_string(),
+                ..Default::default()
+            },
+        )));
+        call.set_refer_call_token(CancellationToken::new());
+
+        call.handle_event(
+            &mut runtime(),
+            transfer_event(Some(BRIDGE_REF_ID.to_string()), Some(notifier(&call))),
+        )
+        .await;
+
+        let leg = call
+            .refer_leg_value()
+            .expect("refer leg slot should hold the transfer leg");
+        let leg_session = leg.progress.load_full().session_id.clone();
+        assert_ne!(
+            leg_session, BRIDGE_REF_ID,
+            "a new transfer leg must replace the bridge leg in the slot"
+        );
+        assert!(leg_session.starts_with("ref-"));
+    }
+
+    // A REFER on any other refer leg (a transfer result) must be ignored.
+    #[tokio::test]
+    async fn foreign_refer_leg_is_ignored() {
+        let call = make_call().await;
+        call.set_refer_leg(Some(LegShared::new(
+            7,
+            true,
+            CallProgress {
+                session_id: BRIDGE_REF_ID.to_string(),
+                ..Default::default()
+            },
+        )));
+
+        call.handle_event(
+            &mut runtime(),
+            transfer_event(Some("ref-OTHER-s.test-session".to_string()), Some(notifier(&call))),
+        )
+        .await;
+
+        let leg = call.refer_leg_value().expect("refer leg must be untouched");
+        assert_eq!(
+            leg.progress.load_full().session_id,
+            BRIDGE_REF_ID,
+            "foreign refer legs must not start a transfer"
+        );
+    }
+
+    // After the transfer INVITE is confirmed, the superseded bridge leg is
+    // retired (token cancelled) and its ByRefer TrackEnd must NOT tear the
+    // session down — the customer stays connected to the agent.
+    #[tokio::test]
+    async fn refer_done_retires_bridge_without_hangup() {
+        let call = make_call().await;
+        let token = CancellationToken::new();
+        *call.superseded_bridge.lock().unwrap() = Some(SupersededBridge {
+            ssrc: 7,
+            leg: LegShared::new(
+                7,
+                true,
+                CallProgress {
+                    session_id: BRIDGE_REF_ID.to_string(),
+                    ..Default::default()
+                },
+            ),
+            cancel_token: Some(token.clone()),
+        });
+
+        call.handle_actor_msg(ActorMsg::ReferDone {
+            track_id: SERVER_SIDE_TRACK_ID.to_string(),
+            forward_dtmf: true,
+            result: Ok("v=0\r\n".to_string()),
+            code: Some(200),
+        })
+        .await
+        .unwrap();
+
+        assert!(token.is_cancelled(), "superseded bridge leg must be hung up");
+        assert_eq!(
+            call.superseded_refer_ssrc
+                .load(std::sync::atomic::Ordering::Relaxed),
+            7
+        );
+
+        // The superseded bridge leg's TrackEnd (ByRefer) is suppressed...
+        call.handle_event(
+            &mut runtime(),
+            SessionEvent::TrackEnd {
+                track_id: SERVER_SIDE_TRACK_ID.to_string(),
+                timestamp: 0,
+                duration: 0,
+                ssrc: 7,
+                play_id: None,
+                auto_hangup: Some(CallRecordHangupReason::ByRefer),
+            },
+        )
+        .await;
+        assert!(
+            !call.media_stream.cancel_token.is_cancelled(),
+            "superseded bridge leg must not tear the session down"
+        );
+
+        // ...while any other leg's ByRefer still ends the call.
+        call.handle_event(
+            &mut runtime(),
+            SessionEvent::TrackEnd {
+                track_id: SERVER_SIDE_TRACK_ID.to_string(),
+                timestamp: 0,
+                duration: 0,
+                ssrc: 99,
+                play_id: None,
+                auto_hangup: Some(CallRecordHangupReason::ByRefer),
+            },
+        )
+        .await;
+        assert!(
+            call.media_stream.cancel_token.is_cancelled(),
+            "non-superseded ByRefer must still hang up the session"
+        );
+    }
+
+    // If the transfer INVITE fails, the bridge leg is restored as the current
+    // refer leg so a retried REFER can still be followed.
+    #[tokio::test]
+    async fn refer_done_failure_restores_bridge_leg() {
+        let call = make_call().await;
+        let bridge = LegShared::new(
+            7,
+            true,
+            CallProgress {
+                session_id: BRIDGE_REF_ID.to_string(),
+                ..Default::default()
+            },
+        );
+        // Simulate do_refer having replaced the slot with the (failed) transfer leg.
+        call.set_refer_leg(Some(LegShared::new(
+            8,
+            true,
+            CallProgress {
+                session_id: "ref-NEW-s.test-session".to_string(),
+                ..Default::default()
+            },
+        )));
+        *call.superseded_bridge.lock().unwrap() = Some(SupersededBridge {
+            ssrc: 7,
+            leg: bridge,
+            cancel_token: None,
+        });
+
+        call.handle_actor_msg(ActorMsg::ReferDone {
+            track_id: SERVER_SIDE_TRACK_ID.to_string(),
+            forward_dtmf: true,
+            result: Err(rsipstack::Error::Error("timeout".to_string())),
+            code: Some(408),
+        })
+        .await
+        .err()
+        .expect("ReferDone Err propagates");
+
+        let leg = call.refer_leg_value().expect("bridge leg restored");
+        assert_eq!(
+            leg.progress.load_full().session_id,
+            BRIDGE_REF_ID,
+            "failed transfer must restore the bridge leg for retries"
+        );
+    }
+}
