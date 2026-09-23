@@ -142,6 +142,23 @@ impl SipUac {
         )
     }
 
+    /// CANCEL the INVITE (same branch/Call-ID/CSeq number, method CANCEL).
+    fn cancel(&self, call_id: &str, from_tag: &str, branch: &str) -> String {
+        format!(
+            "CANCEL sip:bot@{server} SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 127.0.0.1:{media_port};branch={branch};rport\r\n\
+             From: <sip:caller@127.0.0.1>;tag={from_tag}\r\n\
+             To: <sip:bot@{server}>\r\n\
+             Call-ID: {call_id}\r\n\
+             CSeq: 1 CANCEL\r\n\
+             Max-Forwards: 70\r\n\
+             Content-Length: 0\r\n\
+             \r\n",
+            server = self.server,
+            media_port = self.socket.local_addr().unwrap().port(),
+        )
+    }
+
     /// Wait for a specific status code; returns (matched, matched-message,
     /// all status lines seen).
     async fn wait_for_status(
@@ -348,18 +365,17 @@ async fn attach_and_accept(node: &mut TestNode, call_id: &str) -> (WsSender, WsR
         .expect("webhook not called")
         .expect("webhook channel closed");
     // `sipCallId` carries the raw SIP Call-ID for correlation; `dialogId` is
-    // the short public session id (s.<12 hex>) used to attach the websocket.
+    // the short public session id (s.<hex>) used to attach the websocket.
     assert_eq!(
         payload.sip_call_id, call_id,
         "unexpected sip call id {}",
         payload.sip_call_id
     );
     let dialog_id = payload.dialog_id;
-    // The webhook carries either the short `s.<hex>` session id or the raw
-    // SIP dialog id (for dialogs short enough to be used verbatim); tests
-    // only need a stable handle to attach the websocket.
-    assert!(!dialog_id.is_empty() && dialog_id.len() <= 128,
-        "unexpected session id {dialog_id}");
+    assert!(
+        dialog_id.starts_with("s."),
+        "unexpected session id {dialog_id}"
+    );
     info!(%dialog_id, "got session id from webhook");
 
     let (ws, _) = connect_async(format!(
@@ -1163,5 +1179,117 @@ async fn incoming_refer_failure_notifies_and_keeps_call_alive() {
     assert!(
         !bye,
         "customer dialog must NOT be hung up after a failed transfer; messages: {msgs:?}"
+    );
+}
+
+/// Regression test: a far-end CANCEL arriving while the INVITE is still
+/// ringing — after the websocket client has attached but before it sent any
+/// command (Ringing/Accept) — must terminate the attached call. Before the
+/// fix the attached ActiveCall only started watching the dialog state on its
+/// first command, so the CANCEL left a zombie entry in `active_calls`
+/// (`/call/list` showed a call with no option/ring/answer times) and the
+/// websocket kept pinging forever.
+#[tokio::test]
+async fn ws_cancel_before_first_command_tears_down_attached_call() {
+    tracing_subscriber::fmt()
+        .with_max_level(Level::DEBUG)
+        .with_test_writer()
+        .try_init()
+        .ok();
+
+    let mut node = spawn_node(35073, vec![]).await;
+    let uac = SipUac::new(
+        format!("127.0.0.1:{}", node.sip_port).parse().unwrap(),
+        0,
+    )
+    .await;
+    let call_id = "ws-cancel-regression@127.0.0.1";
+    let from_tag = "fromtag4";
+    let branch = "z9hG4bKwscancel1";
+    uac.socket
+        .send_to(
+            uac.invite(call_id, from_tag, branch, PCMU_OFFER).as_bytes(),
+            uac.server,
+        )
+        .await
+        .unwrap();
+
+    // Attach the websocket to the ringing call, but send NO command — this is
+    // the window where the dialog-state watcher is not yet in place.
+    let payload = tokio::time::timeout(Duration::from_secs(5), node.webhook_rx.recv())
+        .await
+        .expect("webhook not called")
+        .expect("webhook channel closed");
+    let dialog_id = payload.dialog_id;
+    let (ws, _) = connect_async(format!(
+        "ws://127.0.0.1:{}/call?id={dialog_id}",
+        node.http_port
+    ))
+    .await
+    .expect("failed to attach websocket to the ringing call");
+    let (_sink, mut stream) = ws.split();
+    let _ = stream.next().await; // first event confirms the call is attached
+
+    // The caller gives up before the bot ever sends a command.
+    uac.socket
+        .send_to(uac.cancel(call_id, from_tag, branch).as_bytes(), uac.server)
+        .await
+        .unwrap();
+
+    // SIP side: the INVITE must end with 487 Request Terminated.
+    let (terminated, _msg, seen) = uac
+        .wait_for_status("SIP/2.0 487", Duration::from_secs(8))
+        .await;
+    assert!(
+        terminated,
+        "INVITE was never terminated with 487 after CANCEL; responses seen: {seen:?}"
+    );
+
+    // WS side: the attached call must report the hangup and close. Without the
+    // fix the stream just kept emitting pings until the test timed out.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let mut hangup_seen = false;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "websocket was not closed after CANCEL (zombie call)"
+        );
+        match tokio::time::timeout(remaining, stream.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                info!(%text, "bot received event");
+                if text.contains("\"event\":\"hangup\"") {
+                    assert!(
+                        text.contains("Canceled"),
+                        "hangup event must carry the Canceled reason: {text}"
+                    );
+                    hangup_seen = true;
+                }
+            }
+            Ok(Some(Ok(_))) => continue, // pings/binary
+            // The server tears the connection down right after its Close
+            // frame, so the final read may surface as an IO error instead of
+            // a clean stream end.
+            Ok(Some(Err(_))) => break,
+            Ok(None) => break, // closed by the server after teardown
+            Err(_) => continue,
+        }
+    }
+    assert!(
+        hangup_seen,
+        "websocket closed without a hangup event for the cancelled call"
+    );
+
+    // The call must be gone from the registry.
+    let list = reqwest::get(format!("http://127.0.0.1:{}/list", node.http_port))
+        .await
+        .expect("failed to query /list")
+        .json::<serde_json::Value>()
+        .await
+        .expect("failed to parse /list response");
+    let active = list["active_calls"].as_array().cloned().unwrap_or_default();
+    assert!(
+        active.is_empty(),
+        "cancelled call lingered in /list: {active:?}"
     );
 }

@@ -455,6 +455,15 @@ pub async fn call_handler(
             },
         }
 
+        // drain events queued after the losing side of select! above
+        while let Ok(event) = event_receiver_from_core.try_recv() {
+            if let Ok(message) = event.into_ws_message() {
+                if ws_sender.send(message).await.is_err() {
+                    break;
+                }
+            }
+        }
+
         cancel_token.cancel();
         ws_sender.flush().await.ok();
         ws_sender.close().await.ok();

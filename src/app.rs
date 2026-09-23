@@ -441,6 +441,7 @@ impl AppStateInner {
                     let routing_state = self.routing_state.clone();
                     let dialog_for_reject = dialog.clone();
                     let invitation_for_cleanup = self.invitation.clone();
+                    let active_calls_for_task = self.active_calls.clone();
                     let session_id_for_task = session_id.clone();
                     crate::spawn(async move {
                         info!(
@@ -514,15 +515,56 @@ impl AppStateInner {
                                             );
                                         }
                                     }
-                                    if matches!(
-                                        dialog_for_reject.state(),
-                                        rsipstack::dialog::dialog::DialogState::Terminated(_, _)
-                                    ) {
+                                    if let rsipstack::dialog::dialog::DialogState::Terminated(
+                                        _,
+                                        reason,
+                                    ) = dialog_for_reject.state()
+                                    {
                                         info!(
                                             id = dialog_id_str,
                                             "terminated invite dialog finished, cancelling invite token"
                                         );
                                         token_ref.cancel();
+
+                                        // A websocket client may already have
+                                        // attached an ActiveCall for this session,
+                                        // but that call only starts watching the
+                                        // dialog state on its first command
+                                        // (Ringing/Accept). A far-end CANCEL before
+                                        // that command would otherwise leave the
+                                        // call in `active_calls` forever. Propagate
+                                        // the termination: report the hangup and
+                                        // tear the call down.
+                                        let maybe_call = active_calls_for_task
+                                            .lock()
+                                            .unwrap()
+                                            .get(&session_id_for_task)
+                                            .cloned();
+                                        if let Some(call) = maybe_call {
+                                            let has_reason = call
+                                                .progress
+                                                .load_full()
+                                                .hangup_reason
+                                                .is_some();
+                                            if !has_reason {
+                                                let term =
+                                                    crate::call::state::CallProgress::termination(
+                                                        Some(&reason),
+                                                    );
+                                                call.leg().update_progress(|p| {
+                                                    p.last_status_code = term.status_code;
+                                                    p.set_hangup_reason(
+                                                        term.hangup_reason.clone(),
+                                                    );
+                                                });
+                                                let event = call.leg().build_hangup_event(
+                                                    call.session_id.clone(),
+                                                    Some(term.initiator.to_string()),
+                                                );
+                                                call.event_sender.send(event).ok();
+                                            }
+                                            call.cancel_token.cancel();
+                                        }
                                     }
                                     info!(id = dialog_id_str, "incoming invite task finished");
                                     break;
