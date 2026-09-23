@@ -19,3 +19,5 @@ models/
 *.bin
 static/webrtc-demo.html
 !src/media/vad/silero_weights.bin
+.cargo_vcs_info.json
+Cargo.toml.orig
