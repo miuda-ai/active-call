@@ -31,6 +31,10 @@ autolib = false
 autobins = false
 autoexamples = false
 autotests = false
+
+[[test]]
+name = "auto_refer_bridge_test"
+path = "tests/auto_refer_bridge_test.rs"
 autobenches = false
 description = "A SIP/WebRTC voice agent"
 readme = "README.md"
