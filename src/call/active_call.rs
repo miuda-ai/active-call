@@ -1366,6 +1366,8 @@ impl ActiveCall {
                         );
                         self.superseded_refer_ssrc
                             .store(old.ssrc, std::sync::atomic::Ordering::Relaxed);
+                        old.leg
+                            .update_progress(|p| p.superseded = true);
                         if let Some(token) = old.cancel_token {
                             token.cancel();
                         }

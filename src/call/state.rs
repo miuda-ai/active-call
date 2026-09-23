@@ -24,6 +24,11 @@ pub struct CallProgress {
     pub last_status_code: u16,
     pub hangup_reason: Option<CallRecordHangupReason>,
     pub option: Option<CallOption>,
+    /// Set on a superseded INVITE-mode bridge leg after a successful
+    /// auto-refer transfer: its termination is an internal replace, so no
+    /// Hangup event is reported to the client and it must not tear the
+    /// session down.
+    pub superseded: bool,
 }
 
 impl CallProgress {

@@ -298,10 +298,15 @@ impl InviteDialogStates {
                 auto_hangup,
             })
             .ok();
-        let hangup_event = self
-            .leg
-            .build_hangup_event(self.track_id.clone(), Some(term.initiator.to_string()));
-        self.event_sender.send(hangup_event).ok();
+        // A superseded INVITE-mode bridge leg ends by internal replace, not
+        // by a real hangup — the client must not see a Hangup event (it
+        // would close the WebSocket and tear the whole session down).
+        if !progress.superseded {
+            let hangup_event = self
+                .leg
+                .build_hangup_event(self.track_id.clone(), Some(term.initiator.to_string()));
+            self.event_sender.send(hangup_event).ok();
+        }
     }
 }
 
