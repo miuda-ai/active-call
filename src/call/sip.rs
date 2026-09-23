@@ -32,12 +32,16 @@ pub(crate) fn remove_dialog(layer: &DialogLayer, id: &DialogId) -> Option<Dialog
 pub struct ReferProgressNotifier {
     dialog_layer: Arc<DialogLayer>,
     dialog_id: DialogId,
+    /// Set once the referrer shows it does not support refer subscriptions
+    /// (e.g. 405/501 on the first NOTIFY); further NOTIFYs are skipped.
+    disabled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Debug for ReferProgressNotifier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReferProgressNotifier")
             .field("dialog_id", &self.dialog_id)
+            .field("disabled", &self.disabled.load(std::sync::atomic::Ordering::Relaxed))
             .finish()
     }
 }
@@ -47,10 +51,19 @@ impl ReferProgressNotifier {
         Self {
             dialog_layer,
             dialog_id,
+            disabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
     async fn notify(&self, code: u16, sub_state: &str) {
+        if self.disabled.load(std::sync::atomic::Ordering::Relaxed) {
+            debug!(
+                id = %self.dialog_id,
+                code,
+                "refer notify skipped: referrer does not support refer subscriptions"
+            );
+            return;
+        }
         let dialog = match self.dialog_layer.get_dialog(&self.dialog_id) {
             Some(Dialog::Invite(dialog)) => dialog,
             Some(_) => {
@@ -73,12 +86,28 @@ impl ReferProgressNotifier {
             Err(_) => rsipstack::rsip::StatusCode::ServerInternalError,
         };
         match dialog.notify_refer(status, sub_state).await {
-            Ok(Some(_)) => info!(
-                id = %self.dialog_id,
-                code,
-                sub_state,
-                "refer notify sent"
-            ),
+            Ok(Some(response)) => {
+                // A referrer that rejects NOTIFY with 405/501 does not
+                // implement refer subscriptions (e.g. INVITE-mode bridges);
+                // stop sending further notifies for this transfer.
+                let response_code = u16::from(response.status_code().clone());
+                if matches!(response_code, 405 | 501) {
+                    self.disabled
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    info!(
+                        id = %self.dialog_id,
+                        code = response_code,
+                        "refer notify rejected, disabling further refer notifies"
+                    );
+                } else {
+                    info!(
+                        id = %self.dialog_id,
+                        code,
+                        sub_state,
+                        "refer notify sent"
+                    );
+                }
+            },
             Ok(None) => warn!(
                 id = %self.dialog_id,
                 code,
@@ -536,6 +565,9 @@ impl DialogStateReceiverGuard {
                             refer_to,
                             referred_by,
                             refer: Some(states.leg.is_refer),
+                            leg_session_id: Some(
+                                states.leg.progress.load_full().session_id.clone()
+                            ),
                             notify: Some(notifier),
                         })
                         .ok();

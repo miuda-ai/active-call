@@ -142,6 +142,11 @@ pub enum SessionEvent {
         refer_to: String,
         referred_by: Option<String>,
         refer: Option<bool>,
+        /// Session id of the leg that received the REFER (the ref call id
+        /// for refer bridge legs). Lets the actor tell the current
+        /// INVITE-mode bridge leg apart from other refer legs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        leg_session_id: Option<String>,
         /// RFC 3515 implicit-subscription notifier for the REFER's parent
         /// dialog; used to report transfer progress back to the referrer.
         #[serde(skip)]

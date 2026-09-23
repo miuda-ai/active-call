@@ -563,8 +563,23 @@ pub struct ActiveCall {
     /// RFC 3515 notifier for a transfer triggered by an incoming REFER;
     /// reports the refer leg's final status back to the referrer.
     pub refer_notifier: ArcSwapOption<crate::call::sip::ReferProgressNotifier>,
+    /// Pending retire of the superseded INVITE-mode refer bridge leg after
+    /// an auto-refer transfer succeeds: the bridge leg's SSRC (to match its
+    /// TrackEnd) and its cancel token (to hang it up). Captured when the
+    /// auto-refer INVITE starts, consumed in `ReferDone`.
+    pub superseded_bridge: std::sync::Mutex<Option<SupersededBridge>>,
+    /// SSRC of a superseded INVITE-mode bridge leg whose TrackEnd (which
+    /// carries ByRefer) must not tear the session down.
+    pub superseded_refer_ssrc: std::sync::atomic::AtomicU32,
     /// WebSocket audio receiver injected at construction, taken once by setup.
     pub audio_receiver: std::sync::Mutex<Option<WebsocketBytesReceiver>>,
+}
+
+/// The refer bridge leg replaced by a successful auto-refer transfer.
+pub struct SupersededBridge {
+    pub ssrc: u32,
+    pub leg: LegShared,
+    pub cancel_token: Option<CancellationToken>,
 }
 
 impl ActiveCall {
@@ -843,6 +858,8 @@ impl ActiveCall {
             wait_input_timeout: ArcSwapOption::new(None),
             pending_asr_resume: ArcSwapOption::new(None),
             refer_notifier: ArcSwapOption::new(None),
+            superseded_bridge: std::sync::Mutex::new(None),
+            superseded_refer_ssrc: std::sync::atomic::AtomicU32::new(0),
             audio_receiver: std::sync::Mutex::new(audio_receiver),
         }
     }
@@ -1034,13 +1051,28 @@ impl ActiveCall {
                 }
 
                 if let Some(hangup_reason) = auto_hangup {
-                    info!(
-                        session_id = self.session_id,
-                        ssrc, "auto hangup when track end track_id:{}", track_id
-                    );
-                    self.do_hangup(Some(hangup_reason), None, None, None)
-                        .await
-                        .ok();
+                    // A superseded INVITE-mode bridge leg must not tear the
+                    // session down: after a successful auto-refer transfer
+                    // the customer stays connected to the agent.
+                    let superseded = self
+                        .superseded_refer_ssrc
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    if superseded != 0 && superseded == ssrc {
+                        self.superseded_refer_ssrc
+                            .store(0, std::sync::atomic::Ordering::Relaxed);
+                        info!(
+                            session_id = self.session_id,
+                            ssrc, "ignoring auto hangup from superseded refer bridge leg"
+                        );
+                    } else {
+                        info!(
+                            session_id = self.session_id,
+                            ssrc, "auto hangup when track end track_id:{}", track_id
+                        );
+                        self.do_hangup(Some(hangup_reason), None, None, None)
+                            .await
+                            .ok();
+                    }
                 }
 
                 if let Some(timeout) = wait_timeout_val {
@@ -1167,12 +1199,25 @@ impl ActiveCall {
                 refer_to,
                 referred_by,
                 refer,
+                leg_session_id,
                 notify,
                 ..
             } => {
-                // Parent-leg transfers only: a refer leg must never start
-                // another transfer of its own.
-                if refer == Some(true) {
+                // Follow transfers on the parent leg AND on the current
+                // INVITE-mode refer bridge leg: INVITE-mode carriers (e.g.
+                // Aliyun CC) send their REFER on the bridge leg itself to
+                // trigger the transfer INVITE. Any other refer leg (the
+                // result of a previous transfer) must never start another
+                // transfer of its own.
+                let leg_session_id = leg_session_id.unwrap_or_default();
+                let bridge_session_id = self
+                    .refer_leg_value()
+                    .map(|l| l.progress.load_full().session_id.clone())
+                    .unwrap_or_default();
+                let is_current_bridge = refer == Some(true)
+                    && !leg_session_id.is_empty()
+                    && leg_session_id == bridge_session_id;
+                if refer == Some(true) && !is_current_bridge {
                     return;
                 }
                 let Some(notifier) = notify else {
@@ -1190,7 +1235,7 @@ impl ActiveCall {
                     notifier.finished(403).await;
                     return;
                 }
-                if self.refer_leg.load().is_some() {
+                if !is_current_bridge && self.refer_leg.load().is_some() {
                     warn!(
                         session_id = self.session_id,
                         %refer_to,
@@ -1208,15 +1253,19 @@ impl ActiveCall {
                     notifier.finished(400).await;
                     return;
                 };
-                let caller = referred_by
-                    .as_deref()
-                    .and_then(crate::sip_util::parse_refer_to_target)
+                // The transfer INVITE should present the original caller
+                // (the customer, for agent transfers); Referred-By is only a
+                // fallback and usually points at the carrier's own address.
+                let caller = self
+                    .progress
+                    .load_full()
+                    .option
+                    .as_ref()
+                    .and_then(|o| o.caller.clone())
                     .or_else(|| {
-                        self.progress
-                            .load_full()
-                            .option
-                            .as_ref()
-                            .and_then(|o| o.caller.clone())
+                        referred_by
+                            .as_deref()
+                            .and_then(crate::sip_util::parse_refer_to_target)
                     })
                     .unwrap_or_default();
                 let refer_option = ReferOption {
@@ -1236,8 +1285,26 @@ impl ActiveCall {
                     session_id = self.session_id,
                     %caller,
                     %callee,
+                    is_current_bridge,
                     "auto refer: following incoming REFER"
                 );
+                if is_current_bridge {
+                    // Capture the superseded bridge leg so ReferDone can
+                    // retire it without tearing the session down.
+                    let old_leg = self.refer_leg_value();
+                    let old_ssrc = old_leg.as_ref().map(|l| l.ssrc).unwrap_or(0);
+                    let old_token: Option<CancellationToken> = {
+                        let guard = self.refer_call_token.load();
+                        guard.as_ref().map(|t| (**t).clone())
+                    };
+                    if let Some(old_leg) = old_leg {
+                        *self.superseded_bridge.lock().unwrap() = Some(SupersededBridge {
+                            ssrc: old_ssrc,
+                            leg: old_leg,
+                            cancel_token: old_token,
+                        });
+                    }
+                }
                 if let Err(e) = self
                     .do_refer(runtime, caller, callee, Some(refer_option))
                     .await
@@ -1246,6 +1313,8 @@ impl ActiveCall {
                         session_id = self.session_id,
                         "auto refer failed to start: {}", e
                     );
+                    // Transfer will not happen: keep the bridge leg alive.
+                    self.superseded_bridge.lock().unwrap().take();
                     if let Some(notifier) = self.take_refer_notifier() {
                         notifier.finished(500).await;
                     }
@@ -1284,6 +1353,23 @@ impl ActiveCall {
                     if let Some(notifier) = self.take_refer_notifier() {
                         notifier.finished(code.unwrap_or(200)).await;
                     }
+                    // Transfer succeeded: retire the superseded INVITE-mode
+                    // bridge leg. Its TrackEnd carries ByRefer, so arm the
+                    // SSRC suppression first — the customer must stay on the
+                    // line with the agent after the AI/bridge leg goes away.
+                    let superseded = self.superseded_bridge.lock().unwrap().take();
+                    if let Some(old) = superseded {
+                        info!(
+                            session_id = self.session_id,
+                            ssrc = old.ssrc,
+                            "auto refer succeeded, retiring superseded refer bridge leg"
+                        );
+                        self.superseded_refer_ssrc
+                            .store(old.ssrc, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(token) = old.cancel_token {
+                            token.cancel();
+                        }
+                    }
                     Ok(())
                 }
                 Err(e) => {
@@ -1291,6 +1377,12 @@ impl ActiveCall {
                         session_id = self.session_id,
                         "failed to create refer sip track: {}", e
                     );
+                    // Transfer failed: the caller stays in the original call.
+                    // Restore the bridge leg as the current refer leg so a
+                    // retried REFER can be followed, and drop the retire.
+                    if let Some(old) = self.superseded_bridge.lock().unwrap().take() {
+                        self.set_refer_leg(Some(old.leg));
+                    }
                     self.emit_reject_from_rsip_error(track_id, true, &e);
                     let status = code
                         .or_else(|| match &e {
