@@ -318,7 +318,13 @@ impl RtcTrack {
                     _ = stats_interval.tick() => {
                         match pc_stats.get_stats().await {
                             Ok(stats) => {
-                                info!(track_id=%track_id_log, %stats, "RTCP Stats");
+                                // Empty reports are normal for tracks with no
+                                // RTP flowing yet (freshly created / stopped).
+                                if stats.entries.is_empty() {
+                                    debug!(track_id=%track_id_log, "RTCP Stats: empty report");
+                                } else {
+                                    info!(track_id=%track_id_log, %stats, "RTCP Stats");
+                                }
                             }
                             Err(e) => {
                                 debug!(track_id=%track_id_log, "Failed to get stats: {:?}", e);

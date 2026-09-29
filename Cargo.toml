@@ -12,7 +12,7 @@
 [package]
 edition = "2024"
 name = "active-call"
-version = "0.3.97"
+version = "0.3.98"
 authors = ["jinti<shenjindi@fourz.cn>"]
 build = false
 exclude = [
