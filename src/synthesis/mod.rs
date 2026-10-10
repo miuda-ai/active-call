@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 
 mod aliyun;
 mod deepgram;
+mod sixtydb;
 mod tencent_cloud;
 mod tencent_cloud_basic;
 
@@ -16,6 +17,7 @@ mod supertonic;
 
 pub use aliyun::AliyunTtsClient;
 pub use deepgram::DeepegramTtsClient;
+pub use sixtydb::SixtyDBTtsClient;
 pub use tencent_cloud::TencentCloudTtsClient;
 pub use tencent_cloud_basic::TencentCloudTtsBasicClient;
 
@@ -45,6 +47,8 @@ pub enum SynthesisType {
     Aliyun,
     #[serde(rename = "deepgram")]
     Deepgram,
+    #[serde(rename = "60db")]
+    SixtyDB,
     #[cfg(feature = "offline")]
     #[serde(rename = "supertonic")]
     Supertonic,
@@ -58,6 +62,7 @@ impl std::fmt::Display for SynthesisType {
             SynthesisType::TencentCloud => write!(f, "tencent"),
             SynthesisType::Aliyun => write!(f, "aliyun"),
             SynthesisType::Deepgram => write!(f, "deepgram"),
+            SynthesisType::SixtyDB => write!(f, "60db"),
             #[cfg(feature = "offline")]
             SynthesisType::Supertonic => write!(f, "supertonic"),
             SynthesisType::Other(provider) => write!(f, "{}", provider),
@@ -75,6 +80,7 @@ impl<'de> Deserialize<'de> for SynthesisType {
             "tencent" => Ok(SynthesisType::TencentCloud),
             "aliyun" => Ok(SynthesisType::Aliyun),
             "deepgram" => Ok(SynthesisType::Deepgram),
+            "60db" => Ok(SynthesisType::SixtyDB),
             #[cfg(feature = "offline")]
             "supertonic" => Ok(SynthesisType::Supertonic),
             _ => Ok(SynthesisType::Other(value)),
@@ -260,6 +266,14 @@ impl SynthesisOption {
                 "aliyun" => {
                     if self.secret_key.is_none() {
                         self.secret_key = std::env::var("DASHSCOPE_API_KEY").ok();
+                    }
+                }
+                "60db" => {
+                    if self.secret_key.is_none() {
+                        self.secret_key = std::env::var("SIXTYDB_API_KEY").ok();
+                    }
+                    if self.speaker.is_none() {
+                        self.speaker = std::env::var("SIXTYDB_VOICE_ID").ok();
                     }
                 }
                 "deepgram" => {
