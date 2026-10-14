@@ -544,18 +544,24 @@ impl MediaStream {
 #[derive(Clone)]
 pub struct RecorderProcessor {
     sender: mpsc::UnboundedSender<AudioFrame>,
+    /// Only frames tagged with this track id are mirrored. A track may relay
+    /// another leg's audio (e.g. the media-pass track forwards the caller's
+    /// audio to the websocket); that relayed copy is already recorded at its
+    /// origin and must not be written to the recording a second time.
+    owner: TrackId,
 }
 
 impl RecorderProcessor {
-    pub fn new(sender: mpsc::UnboundedSender<AudioFrame>) -> Self {
-        Self { sender }
+    pub fn new(sender: mpsc::UnboundedSender<AudioFrame>, owner: TrackId) -> Self {
+        Self { sender, owner }
     }
 }
 
 impl Processor for RecorderProcessor {
     fn process_frame(&mut self, frame: &mut AudioFrame) -> Result<()> {
-        let frame_clone = frame.clone();
-        let _ = self.sender.send(frame_clone);
+        if frame.track_id == self.owner {
+            let _ = self.sender.send(frame.clone());
+        }
         Ok(())
     }
 }
@@ -615,10 +621,18 @@ impl MediaStream {
             for (track, _) in self.tracks.lock().await.values_mut() {
                 if native {
                     track.set_raw_tap(Some(self.recorder_sender.clone()));
-                } else if !track.processor_chain().has_processor::<RecorderProcessor>() {
-                    track.insert_processor(Box::new(RecorderProcessor::new(
-                        self.recorder_sender.clone(),
-                    )));
+                } else {
+                    let owner = track.id().clone();
+                    // Go through the chain directly: the media-pass track
+                    // deliberately ignores `Track::insert_processor`, but the
+                    // audio it plays into the call must still be recorded.
+                    let chain = track.processor_chain();
+                    if !chain.has_processor::<RecorderProcessor>() {
+                        chain.append_processor(Box::new(RecorderProcessor::new(
+                            self.recorder_sender.clone(),
+                            owner,
+                        )));
+                    }
                 }
             }
         }
@@ -627,8 +641,8 @@ impl MediaStream {
 
     /// Attach the recorder tap to a track according to the recorder mode:
     /// native-samplerate mode mirrors pre-resample frames via the chain's
-    /// raw tap, otherwise a post-pipeline RecorderProcessor is appended.
-    /// No-op when no recorder is configured.
+    /// raw tap, otherwise a post-pipeline RecorderProcessor is appended to
+    /// the track's processor chain. No-op when no recorder is configured.
     async fn attach_recorder_tap(&self, track: &mut Box<dyn Track>) {
         let Some(option) = self.recorder_option.lock().await.clone() else {
             return;
@@ -636,9 +650,17 @@ impl MediaStream {
         if option.native_samplerate.unwrap_or(false) {
             track.set_raw_tap(Some(self.recorder_sender.clone()));
         } else {
-            track.append_processor(Box::new(RecorderProcessor::new(
-                self.recorder_sender.clone(),
-            )));
+            let owner = track.id().clone();
+            // Reach into the processor chain directly rather than calling
+            // `Track::append_processor`: the media-pass track rejects that
+            // (it ignores audio processors) yet still needs to feed the
+            // recorder with the audio it plays into the call.
+            track
+                .processor_chain()
+                .append_processor(Box::new(RecorderProcessor::new(
+                    self.recorder_sender.clone(),
+                    owner,
+                )));
         }
     }
 
@@ -780,5 +802,64 @@ impl HoldTrack {
         let chain = track.processor_chain();
         // Simply remove the hold processor to resume normal operation
         chain.remove_processor::<HoldProcessor>();
+    }
+}
+
+#[cfg(test)]
+mod recorder_owner_tests {
+    use super::*;
+    use crate::media::Samples;
+
+    fn pcm_frame(track_id: &str, len: usize) -> AudioFrame {
+        AudioFrame {
+            track_id: track_id.to_string(),
+            samples: Samples::PCM {
+                samples: vec![100i16; len],
+            },
+            sample_rate: 16000,
+            channels: 1,
+            ..Default::default()
+        }
+    }
+
+    /// Regression for media-pass recordings in non-native mode: the track's own
+    /// processor chain also processes audio it relays for another leg (the
+    /// caller's audio forwarded to the websocket). `RecorderProcessor` must
+    /// mirror only the track's own frames so the relayed copy is not written to
+    /// the recording twice.
+    #[test]
+    fn recorder_processor_only_mirrors_owned_frames() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut processor = RecorderProcessor::new(tx, "server-side-track".to_string());
+
+        let mut relayed = pcm_frame("caller-leg", 160);
+        processor.process_frame(&mut relayed).unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "relayed caller audio must not be recorded"
+        );
+
+        let mut own = pcm_frame("server-side-track", 160);
+        processor.process_frame(&mut own).unwrap();
+        let mirrored = rx
+            .try_recv()
+            .expect("the track's own audio must be recorded");
+        assert_eq!(mirrored.track_id, "server-side-track");
+    }
+
+    /// A bare `RecorderProcessor` (e.g. attached to the caller leg) records its
+    /// own frames and ignores anything else.
+    #[test]
+    fn recorder_processor_records_caller_leg_only() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut processor = RecorderProcessor::new(tx, "caller-leg".to_string());
+
+        let mut own = pcm_frame("caller-leg", 160);
+        processor.process_frame(&mut own).unwrap();
+        assert!(rx.try_recv().is_ok());
+
+        let mut foreign = pcm_frame("server-side-track", 160);
+        processor.process_frame(&mut foreign).unwrap();
+        assert!(rx.try_recv().is_err());
     }
 }

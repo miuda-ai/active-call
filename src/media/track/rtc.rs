@@ -1,4 +1,4 @@
-use super::track_codec::TrackCodec;
+use super::track_codec::{TrackCodec, duration_to_rtp_ticks};
 use crate::{
     event::{EventSender, SessionEvent},
     media::AudioFrame,
@@ -79,10 +79,23 @@ pub struct RtcTrack {
     pub peer_connection: Option<Arc<PeerConnection>>,
     next_rtp_timestamp: u32,
     next_rtp_sequence_number: u16,
-    last_packet_time: Option<Instant>,
+    /// Fixed point tying the RTP media clock to the wall clock; used to keep
+    /// timestamps aligned when the outgoing stream has gaps.
+    anchor: MediaAnchor,
     last_remote_sdp: Option<String>,
-    need_marker: bool,
 }
+
+/// Fixed point tying the RTP media clock to the wall clock: at `instant` the
+/// clock was at `rtp_timestamp`, ticking at `clock_rate` (0 until the first
+/// packet).
+struct MediaAnchor {
+    instant: Instant,
+    rtp_timestamp: u32,
+    clock_rate: u32,
+}
+
+/// Re-anchor the media clock once the wall clock runs this far ahead of it.
+const MEDIA_GAP_THRESHOLD: Duration = Duration::from_millis(30);
 
 impl RtcTrack {
     pub fn new(
@@ -108,9 +121,12 @@ impl RtcTrack {
             peer_connection: None,
             next_rtp_timestamp: 0,
             next_rtp_sequence_number: 0,
-            last_packet_time: None,
+            anchor: MediaAnchor {
+                instant: Instant::now(),
+                rtp_timestamp: 0,
+                clock_rate: 0,
+            },
             last_remote_sdp: None,
-            need_marker: false,
         }
     }
 
@@ -661,6 +677,43 @@ impl RtcTrack {
     }
 }
 
+impl RtcTrack {
+    /// Timestamp and marker for an outgoing media packet carrying `duration` of
+    /// audio. The clock advances by exactly that duration in `clock_rate` ticks,
+    /// after syncing to the wall clock; the marker is set on the packet where
+    /// the clock jumped.
+    fn next_media_timestamp(&mut self, clock_rate: u32, duration: Duration) -> (u32, bool) {
+        let marker = self.sync_media_clock(clock_rate);
+        let rtp_timestamp = self.next_rtp_timestamp;
+        self.next_rtp_timestamp = rtp_timestamp
+            .wrapping_add(duration_to_rtp_ticks(duration, clock_rate));
+        (rtp_timestamp, marker)
+    }
+
+    /// Sync the media clock to the wall clock. The wall-clock position is the
+    /// anchor timestamp plus the time elapsed since the anchor instant; when it
+    /// is ahead of the media clock by more than `MEDIA_GAP_THRESHOLD` (a gap in
+    /// the outgoing audio, or accumulated drift), jump to it. Returns whether it
+    /// jumped. The clock never moves backwards.
+    fn sync_media_clock(&mut self, clock_rate: u32) -> bool {
+        let elapsed = duration_to_rtp_ticks(self.anchor.instant.elapsed(), clock_rate);
+        if self.anchor.clock_rate != clock_rate {
+            // First packet or codec change: keep the instant and re-express the
+            // anchor in this clock so the media clock continues from here.
+            self.anchor.rtp_timestamp = self.next_rtp_timestamp.wrapping_sub(elapsed);
+            self.anchor.clock_rate = clock_rate;
+            return false;
+        }
+        let wall_timestamp = self.anchor.rtp_timestamp.wrapping_add(elapsed);
+        let ahead = wall_timestamp.wrapping_sub(self.next_rtp_timestamp) as i32;
+        if ahead <= duration_to_rtp_ticks(MEDIA_GAP_THRESHOLD, clock_rate) as i32 {
+            return false;
+        }
+        self.next_rtp_timestamp = wall_timestamp;
+        true
+    }
+}
+
 #[async_trait]
 impl Track for RtcTrack {
     fn ssrc(&self) -> u32 {
@@ -785,7 +838,7 @@ impl Track for RtcTrack {
     async fn send_packet(&mut self, packet: &AudioFrame) -> Result<()> {
         let packet = packet.clone();
 
-        if let Some(source) = &self.local_source {
+        if let Some(source) = self.local_source.clone() {
             match &packet.samples {
                 crate::media::Samples::PCM { samples } => {
                     let payload_type = self.get_payload_type();
@@ -797,33 +850,26 @@ impl Track for RtcTrack {
                     if !encoded.is_empty() {
                         let clock_rate = target_codec.clock_rate();
 
-                        let now = Instant::now();
-                        if let Some(last_time) = self.last_packet_time {
-                            let elapsed = now.duration_since(last_time);
-                            if elapsed.as_millis() > 50 {
-                                let gap_increment =
-                                    (elapsed.as_millis() as u32 * clock_rate) / 1000;
-                                self.next_rtp_timestamp += gap_increment;
-                                self.need_marker = true;
-                            }
-                        }
-
-                        self.last_packet_time = Some(now);
-
-                        let timestamp_increment = (samples.len() as u64 * clock_rate as u64
-                            / packet.sample_rate as u64
-                            / self.track_config.channels as u64)
-                            as u32;
-                        let rtp_timestamp = self.next_rtp_timestamp;
-                        self.next_rtp_timestamp += timestamp_increment;
+                        // Advance the media clock by the frame's own duration.
+                        // Real gaps are handled by syncing the clock to the wall
+                        // clock, not by adding the gap on top of the duration:
+                        // the old code did that for any frame longer than 50ms,
+                        // doubling the timestamps of a media-pass bridge (which
+                        // emits 100ms+ frames) and making the callee play the
+                        // audio at half speed.
+                        let frames =
+                            samples.len() as u64 / self.track_config.channels.max(1) as u64;
+                        let duration = if packet.sample_rate > 0 {
+                            Duration::from_nanos(
+                                frames * 1_000_000_000 / packet.sample_rate as u64,
+                            )
+                        } else {
+                            self.track_config.ptime
+                        };
+                        let (rtp_timestamp, marker) =
+                            self.next_media_timestamp(clock_rate, duration);
                         let sequence_number = self.next_rtp_sequence_number;
                         self.next_rtp_sequence_number += 1;
-
-                        let mut marker = false;
-                        if self.need_marker {
-                            marker = true;
-                            self.need_marker = false;
-                        }
 
                         let frame = RtcAudioFrame {
                             data: Bytes::from(encoded),
@@ -848,33 +894,18 @@ impl Track for RtcTrack {
                         .ok_or_else(|| anyhow::anyhow!("Invalid codec type: {}", payload_type))?;
                     let clock_rate = target_codec.clock_rate();
 
-                    let now = Instant::now();
-                    if let Some(last_time) = self.last_packet_time {
-                        let elapsed = now.duration_since(last_time);
-                        if elapsed.as_millis() > 50 {
-                            let gap_increment = (elapsed.as_millis() as u32 * clock_rate) / 1000;
-                            self.next_rtp_timestamp += gap_increment;
-                            self.need_marker = true;
-                        }
-                    }
-                    self.last_packet_time = Some(now);
-
-                    let increment = match *payload_type {
-                        0 | 8 | 18 => payload.len() as u32,
-                        9 => payload.len() as u32,
-                        111 => (clock_rate / 50) as u32,
+                    // Pre-encoded payload: derive its media length from the
+                    // codec clock (mirroring the previous per-payload-type
+                    // increment) while sharing the gap-safe media clock.
+                    let increment_ticks = match *payload_type {
+                        0 | 8 | 9 | 18 => payload.len() as u32,
                         _ => (clock_rate / 50) as u32,
                     };
-
-                    let rtp_timestamp = self.next_rtp_timestamp;
-                    self.next_rtp_timestamp += increment;
+                    let duration = Duration::from_nanos(
+                        increment_ticks as u64 * 1_000_000_000 / clock_rate as u64,
+                    );
+                    let (rtp_timestamp, marker) = self.next_media_timestamp(clock_rate, duration);
                     let sequence_number = *sequence_number;
-
-                    let mut marker = false;
-                    if self.need_marker {
-                        marker = true;
-                        self.need_marker = false;
-                    }
 
                     let frame = RtcAudioFrame {
                         data: Bytes::from(payload.clone()),
@@ -931,6 +962,60 @@ impl RtcTrack {
 mod tests {
     use super::*;
     use crate::media::track::TrackConfig;
+
+    /// Regression: a media-pass bridge emits frames whose own duration exceeds
+    /// the old 50 ms gap threshold. The media clock must advance by exactly the
+    /// frame duration (not duration + wall-clock gap); otherwise every packet's
+    /// timestamp doubles and the callee plays the audio at half speed.
+    #[test]
+    fn media_clock_advances_by_frame_duration() {
+        let mut track = RtcTrack::new(
+            CancellationToken::new(),
+            "clock-track".to_string(),
+            TrackConfig::default(),
+            RtcTrackConfig::default(),
+        );
+        let clock = 8000u32;
+        // A 100 ms frame at 8 kHz is 800 ticks; wall-clock gaps must not add.
+        let frame = Duration::from_millis(100);
+        let (t0, _) = track.next_media_timestamp(clock, frame);
+        let (t1, _) = track.next_media_timestamp(clock, frame);
+        let (t2, _) = track.next_media_timestamp(clock, frame);
+        assert_eq!(t1.wrapping_sub(t0), 800);
+        assert_eq!(t2.wrapping_sub(t1), 800);
+    }
+
+    /// A genuine silence gap (media clock far behind the wall clock) must jump
+    /// the timestamp and set the marker bit exactly once.
+    #[test]
+    fn media_clock_marks_after_a_real_gap() {
+        let mut track = RtcTrack::new(
+            CancellationToken::new(),
+            "gap-track".to_string(),
+            TrackConfig::default(),
+            RtcTrackConfig::default(),
+        );
+        let clock = 8000u32;
+        let frame = Duration::from_millis(20); // 160 ticks
+        let (t0, _) = track.next_media_timestamp(clock, frame);
+
+        // Rewind the anchor so the wall clock sits ~500 ms ahead of the media
+        // clock, i.e. the sender went quiet for half a second.
+        track.anchor.instant = Instant::now() - Duration::from_millis(500);
+
+        let (t1, marker) = track.next_media_timestamp(clock, frame);
+        assert!(marker, "a real gap must set the marker bit");
+        let jumped = t1.wrapping_sub(t0);
+        assert!(
+            (3800..=4200).contains(&jumped),
+            "timestamp should jump to ~500ms (~4000 ticks), got {jumped}"
+        );
+
+        // The following packet is contiguous again: no marker, +160 ticks.
+        let (t2, marker2) = track.next_media_timestamp(clock, frame);
+        assert!(!marker2, "no marker immediately after the gap packet");
+        assert_eq!(t2.wrapping_sub(t1), 160);
+    }
 
     #[test]
     fn test_parse_sdp_payload_types() {

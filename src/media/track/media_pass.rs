@@ -30,11 +30,67 @@ type WsSink = SplitSink<WsConn, Message>;
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaPassOption {
-    url: String,              // websocket url, e.g. ws://localhost:8080/
-    input_sample_rate: u32,   // sample rate of audio receiving from websocket
-    output_sample_rate: u32,  // sample rate of audio sending to websocket server
-    packet_size: Option<u32>, // packet size send to websocket server, default is 3200
-    ptime: Option<u32>, // packet time in milliseconds, if set, buffer and emit at fixed intervals
+    url: String,             // websocket url, e.g. ws://localhost:8080/
+    input_sample_rate: u32,  // sample rate of audio receiving from websocket
+    output_sample_rate: u32, // sample rate of audio sending to websocket server
+    /// Size in bytes of each binary frame sent to the websocket server (uplink
+    /// send buffer). Defaults to [`DEFAULT_BUFFER_MS`] worth of audio at
+    /// `output_sample_rate`.
+    packet_size: Option<u32>,
+    /// Fixed interval in milliseconds at which buffered websocket audio is
+    /// re-emitted towards the call (downlink send buffer). Defaults to
+    /// [`DEFAULT_BUFFER_MS`]; `Some(0)` disables buffering and emits every
+    /// websocket message as it arrives.
+    ptime: Option<u32>,
+}
+
+/// Default buffering window, in milliseconds, applied to **both** directions of
+/// the media-pass bridge when the caller does not specify `packet_size` /
+/// `ptime`: the uplink is chunked into this many milliseconds per websocket
+/// frame and the downlink is re-emitted on this same interval.
+pub const DEFAULT_BUFFER_MS: u32 = 100;
+
+/// Bytes of 16-bit mono PCM covering [`DEFAULT_BUFFER_MS`] at `sample_rate`.
+///
+/// `sample_rate` samples/s * 0.1 s * 2 bytes/sample == `sample_rate / 5`.
+fn default_buffer_bytes(sample_rate: u32) -> u32 {
+    (sample_rate / 5).max(1)
+}
+
+#[cfg(test)]
+mod default_buffer_tests {
+    use super::*;
+
+    #[test]
+    fn default_buffer_is_100ms_of_pcm16_mono() {
+        // 100 ms == sample_rate / 10 samples * 2 bytes.
+        assert_eq!(default_buffer_bytes(8000), 1600);
+        assert_eq!(default_buffer_bytes(16000), 3200);
+        assert_eq!(default_buffer_bytes(48000), 9600);
+        // Never zero, even for a degenerate rate.
+        assert_eq!(default_buffer_bytes(0), 1);
+    }
+
+    #[test]
+    fn explicit_packet_size_wins_and_zero_falls_back() {
+        let opt = MediaPassOption::new("ws://x".into(), 16000, 16000, Some(640), Some(20));
+        let track = MediaPassTrack::new("s".into(), 0, "t".into(), CancellationToken::new(), opt);
+        assert_eq!(track.packet_size, 640);
+        assert_eq!(track.config.ptime, Duration::from_millis(20));
+
+        let opt = MediaPassOption::new("ws://x".into(), 16000, 16000, Some(0), None);
+        let track = MediaPassTrack::new("s".into(), 0, "t".into(), CancellationToken::new(), opt);
+        assert_eq!(track.packet_size, 3200, "0 falls back to the 100ms default");
+        assert_eq!(track.config.ptime, Duration::from_millis(DEFAULT_BUFFER_MS as u64));
+    }
+
+    #[test]
+    fn default_packet_size_tracks_output_sample_rate() {
+        let opt = MediaPassOption::new("ws://x".into(), 8000, 8000, None, None);
+        let track = MediaPassTrack::new("s".into(), 0, "t".into(), CancellationToken::new(), opt);
+        assert_eq!(track.packet_size, 1600);
+        assert_eq!(track.config.ptime, Duration::from_millis(100));
+    }
 }
 
 impl MediaPassOption {
@@ -97,9 +153,17 @@ impl MediaPassTrack {
         };
         let mut config = TrackConfig::default();
         config = config.with_sample_rate(input_sample_rate);
-        config = config.with_ptime(Duration::from_millis(option.ptime.unwrap_or(0) as u64));
-        // for 16000Hz, 20ms ptime, 3200 is 5 packets
-        let packet_size = option.packet_size.unwrap_or(3200);
+        // Downlink send buffer: emit buffered websocket audio every `ptime`.
+        // Default to a 100 ms window; `Some(0)` opts out (immediate pass-through).
+        let ptime_ms = option.ptime.unwrap_or(DEFAULT_BUFFER_MS);
+        config = config.with_ptime(Duration::from_millis(ptime_ms as u64));
+        // Uplink send buffer: chunk websocket sends into `packet_size` bytes.
+        // Default to a 100 ms window at the output rate (3200 bytes @16 kHz,
+        // 1600 bytes @8 kHz); an explicit 0 falls back to the same default.
+        let packet_size = match option.packet_size {
+            Some(size) if size > 0 => size,
+            _ => default_buffer_bytes(sample_rate),
+        };
         let buffer: Mutex<BytesMut> = Mutex::new(BytesMut::with_capacity(packet_size as usize * 2));
         Self {
             session_id,
@@ -131,10 +195,14 @@ impl Track for MediaPassTrack {
         &self.config
     }
     fn processor_chain(&mut self) -> &mut ProcessorChain {
-        warn!(track_id = %self.track_id, "ignore processor for media pass track");
+        // The chain is still used to process this track's own frames, and it
+        // carries the recorder tap: `MediaStream` attaches the recorder through
+        // this accessor so it bypasses the processor-ignoring overrides below.
         &mut self.processor_chain
     }
     fn insert_processor(&mut self, _: Box<dyn Processor>) {
+        // Audio processors (denoise/VAD/ASR…) must not touch the passthrough
+        // media; the recorder reaches the chain via `processor_chain()`.
         warn!(track_id = %self.track_id, "ignore processor for media pass track");
     }
     fn append_processor(&mut self, _: Box<dyn Processor>) {

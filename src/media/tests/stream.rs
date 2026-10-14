@@ -1254,12 +1254,16 @@ async fn test_stream_recorder_native_samplerate() -> Result<()> {
     );
 
     // The track whose id equals the stream id is the caller leg (channel 0).
-    stream
-        .update_track(Box::new(TestTrack::new("caller-track".to_string())), None)
-        .await;
-    stream
-        .update_track(Box::new(TestTrack::new("callee-track".to_string())), None)
-        .await;
+    // Keep clones of each track's processor chain so the test can drive audio
+    // through the *originating* track's chain: the raw tap only mirrors frames
+    // owned by the chain's track, so relayed copies are not recorded twice.
+    let caller_track = TestTrack::new("caller-track".to_string());
+    let mut caller_chain = caller_track.processor_chain.clone();
+    stream.update_track(Box::new(caller_track), None).await;
+
+    let callee_track = TestTrack::new("callee-track".to_string());
+    let mut callee_chain = callee_track.processor_chain.clone();
+    stream.update_track(Box::new(callee_track), None).await;
 
     let stream_clone = stream.clone();
     let handle = tokio::spawn(async move {
@@ -1277,16 +1281,17 @@ async fn test_stream_recorder_native_samplerate() -> Result<()> {
                 ((t * 440.0 * 2.0 * std::f32::consts::PI).sin() * 16384.0) as i16
             })
             .collect();
-        packet_sender
-            .send(AudioFrame {
-                track_id: "caller-track".to_string(),
-                timestamp: (i * 10) as u64,
-                samples: Samples::PCM { samples },
-                sample_rate: 8000,
-                channels: 1,
-                ..Default::default()
-            })
-            .unwrap();
+        let mut frame = AudioFrame {
+            track_id: "caller-track".to_string(),
+            timestamp: (i * 10) as u64,
+            samples: Samples::PCM { samples },
+            sample_rate: 8000,
+            channels: 1,
+            ..Default::default()
+        };
+        // Origin tap: the caller leg's own chain mirrors the native 8 kHz frame.
+        caller_chain.process_frame(&mut frame).unwrap();
+        packet_sender.send(frame).unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
@@ -1298,16 +1303,17 @@ async fn test_stream_recorder_native_samplerate() -> Result<()> {
                 ((t * 880.0 * 2.0 * std::f32::consts::PI).sin() * 16384.0) as i16
             })
             .collect();
-        packet_sender
-            .send(AudioFrame {
-                track_id: "callee-track".to_string(),
-                timestamp: (i * 10) as u64,
-                samples: Samples::PCM { samples },
-                sample_rate: 16000,
-                channels: 1,
-                ..Default::default()
-            })
-            .unwrap();
+        let mut frame = AudioFrame {
+            track_id: "callee-track".to_string(),
+            timestamp: (i * 10) as u64,
+            samples: Samples::PCM { samples },
+            sample_rate: 16000,
+            channels: 1,
+            ..Default::default()
+        };
+        // Origin tap: the server-side leg's own chain mirrors the 16 kHz frame.
+        callee_chain.process_frame(&mut frame).unwrap();
+        packet_sender.send(frame).unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
@@ -1333,4 +1339,45 @@ async fn test_stream_recorder_native_samplerate() -> Result<()> {
     );
 
     Ok(())
+}
+
+/// The recorder raw tap is owned by the track it is attached to: frames the
+/// track merely relays for another leg must not be mirrored, otherwise the
+/// media-pass bridge records the caller's audio from both legs and the
+/// recording comes out twice as long.
+#[tokio::test]
+async fn raw_tap_owner_is_the_track_id() {
+    let mut track = TestTrack::new("server-side-track".to_string());
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    track.set_raw_tap(Some(tx));
+
+    // A frame relayed from the caller leg -> filtered out.
+    let mut relayed = AudioFrame {
+        track_id: "caller-leg".to_string(),
+        samples: Samples::PCM {
+            samples: vec![1i16; 160],
+        },
+        sample_rate: 16000,
+        channels: 1,
+        ..Default::default()
+    };
+    track.processor_chain().process_frame(&mut relayed).unwrap();
+    assert!(
+        rx.try_recv().is_err(),
+        "relayed frames must not reach the raw tap"
+    );
+
+    // The track's own frame -> mirrored.
+    let mut own = AudioFrame {
+        track_id: "server-side-track".to_string(),
+        samples: Samples::PCM {
+            samples: vec![1i16; 160],
+        },
+        sample_rate: 16000,
+        channels: 1,
+        ..Default::default()
+    };
+    track.processor_chain().process_frame(&mut own).unwrap();
+    let raw = rx.try_recv().expect("owned frames must reach the raw tap");
+    assert_eq!(raw.track_id, "server-side-track");
 }

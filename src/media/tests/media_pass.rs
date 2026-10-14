@@ -228,7 +228,10 @@ async fn test_media_pass() -> Result<()> {
         receiving_sample_rate,
         packet_size,
         CancellationToken::new(),
-        None,
+        // Immediate pass-through so the exact echoed sample count can be
+        // asserted below; the 100 ms default buffering is covered by its own
+        // tests.
+        Some(0),
     )?;
     let (event_sender, mut event_receiver) = tokio::sync::broadcast::channel(10);
     let (packet_sender, mut packet_receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -558,6 +561,126 @@ async fn test_ptime_buffering() -> Result<()> {
     assert!(track_end_received, "TrackEnd should be sent");
     assert!(timeout.is_ok(), "Should receive TrackEnd within timeout");
 
+    server_cancel_token.cancel();
+    Ok(())
+}
+
+/// The default uplink send buffer is 100 ms of audio at the output rate,
+/// advertised to the websocket server through the `packet_size` query param.
+#[tokio::test]
+async fn test_default_packet_size_is_100ms() -> Result<()> {
+    for (rate, expected) in [(16000u32, 3200u32), (8000u32, 1600u32)] {
+        let server_cancel_token = CancellationToken::new();
+        let sample_rate_holder = Arc::new(AtomicU32::new(0));
+        let packet_size_holder = Arc::new(AtomicU32::new(0));
+        let addr = start_mock_server(
+            server_cancel_token.clone(),
+            sample_rate_holder.clone(),
+            packet_size_holder.clone(),
+            None,
+            None,
+        )
+        .await?;
+        let url = format!("ws://127.0.0.1:{}/", addr.port());
+        // packet_size and ptime omitted -> both default to 100 ms.
+        let option = MediaPassOption::new(url, rate, rate, None, None);
+        let mut track = MediaPassTrack::new(
+            "default_buf_session".to_string(),
+            0,
+            format!("default_buf_track_{rate}"),
+            CancellationToken::new(),
+            option,
+        );
+        let (event_sender, _event_receiver) = tokio::sync::broadcast::channel(10);
+        let (packet_sender, _packet_receiver) = tokio::sync::mpsc::unbounded_channel();
+        track.start(event_sender, packet_sender).await?;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        assert_eq!(sample_rate_holder.load(Ordering::Relaxed), rate);
+        assert_eq!(
+            packet_size_holder.load(Ordering::Relaxed),
+            expected,
+            "default uplink buffer at {rate}Hz must be 100ms ({expected} bytes)"
+        );
+
+        track.stop().await?;
+        server_cancel_token.cancel();
+    }
+    Ok(())
+}
+
+/// Without an explicit `ptime`, websocket audio is buffered and re-emitted
+/// towards the call in 100 ms chunks (the downlink send buffer).
+#[tokio::test]
+async fn test_default_ptime_buffers_at_100ms() -> Result<()> {
+    let track_id = "default_ptime_track".to_string();
+    let sample_rate = 16000;
+    let cancel_token = CancellationToken::new();
+    let server_cancel_token = CancellationToken::new();
+    let sample_rate_holder = Arc::new(AtomicU32::new(0));
+    let packet_size_holder = Arc::new(AtomicU32::new(0));
+
+    let sample = generate_audio_samples(sample_rate);
+    let audio_bytes = samples_to_bytes(&sample);
+
+    let addr = start_sending_server(
+        server_cancel_token.clone(),
+        sample_rate_holder,
+        packet_size_holder,
+        audio_bytes,
+    )
+    .await?;
+    let url = format!("ws://127.0.0.1:{}/", addr.port());
+    let option = MediaPassOption::new(url, sample_rate, sample_rate, None, None);
+    let mut track = MediaPassTrack::new(
+        "default_ptime_session".to_string(),
+        0,
+        track_id.clone(),
+        cancel_token.clone(),
+        option,
+    );
+    let (event_sender, _event_receiver) = tokio::sync::broadcast::channel(10);
+    let (packet_sender, mut packet_receiver) = tokio::sync::mpsc::unbounded_channel();
+    track.start(event_sender, packet_sender).await?;
+
+    // Let the mock server stream ~1s of audio and the track buffer it.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    let mut emitted = Vec::new();
+    while let Ok(packet) = packet_receiver.try_recv() {
+        emitted.push(packet);
+    }
+    assert!(
+        !emitted.is_empty(),
+        "buffered websocket audio must be re-emitted"
+    );
+
+    let expected_samples = (sample_rate / 10) as usize; // 100 ms of PCM
+    for packet in &emitted {
+        match &packet.samples {
+            Samples::PCM { samples } => assert_eq!(
+                samples.len(),
+                expected_samples,
+                "each emitted frame must be exactly 100ms"
+            ),
+            _ => panic!("expected PCM frames from the media pass"),
+        }
+    }
+
+    // Consecutive frames are emitted ~100ms apart.
+    if emitted.len() >= 2 {
+        let intervals: Vec<u64> = emitted
+            .windows(2)
+            .map(|w| w[1].timestamp.saturating_sub(w[0].timestamp))
+            .collect();
+        let avg = intervals.iter().sum::<u64>() / intervals.len() as u64;
+        assert!(
+            (80..=150).contains(&avg),
+            "frames should be emitted ~100ms apart, got avg {avg}ms from {intervals:?}"
+        );
+    }
+
+    cancel_token.cancel();
     server_cancel_token.cancel();
     Ok(())
 }

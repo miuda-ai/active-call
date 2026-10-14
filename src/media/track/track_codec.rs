@@ -8,7 +8,13 @@ use audio_codec::{
 };
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use tracing::warn;
+
+/// Convert a media `duration` into RTP timestamp ticks at `clock_rate`.
+pub fn duration_to_rtp_ticks(duration: Duration, clock_rate: u32) -> u32 {
+    (duration.as_nanos() * clock_rate as u128 / 1_000_000_000) as u32
+}
 
 use audio_codec::g729::{G729Decoder, G729Encoder};
 use audio_codec::opus::{OpusDecoder, OpusEncoder};

@@ -1,7 +1,7 @@
 use super::INTERNAL_SAMPLERATE;
 use super::track::track_codec::TrackCodec;
 use crate::event::{EventSender, SessionEvent};
-use crate::media::{AudioFrame, Samples, SourcePacket};
+use crate::media::{AudioFrame, Samples, SourcePacket, TrackId};
 use anyhow::Result;
 use std::any::Any;
 use std::sync::{Arc, Mutex, RwLock};
@@ -66,6 +66,12 @@ pub struct ProcessorChain {
     /// into its long-lived worker tasks *before* the recorder attaches the
     /// tap, so a plain field would leave those workers with a stale `None`.
     pub raw_tap: Arc<RwLock<Option<mpsc::UnboundedSender<AudioFrame>>>>,
+    /// Track id that owns this chain. When set, the raw tap only mirrors
+    /// frames tagged with this id. A track often relays another leg's audio
+    /// (e.g. the media-pass track forwards the caller's audio to the
+    /// websocket), and that relayed copy must not be recorded a second time:
+    /// the originating leg already recorded it.
+    pub tap_owner: Arc<RwLock<Option<TrackId>>>,
 }
 
 /// Lock the processor list, recovering from a poisoned mutex.
@@ -92,13 +98,24 @@ impl ProcessorChain {
             sample_rate: INTERNAL_SAMPLERATE,
             force_decode: true,
             raw_tap: Arc::new(RwLock::new(None)),
+            tap_owner: Arc::new(RwLock::new(None)),
         }
     }
     pub fn set_raw_tap(&mut self, tap: Option<mpsc::UnboundedSender<AudioFrame>>) {
         *self.raw_tap.write().unwrap() = tap;
     }
+    /// Restrict the raw tap to frames owned by `owner` (see `tap_owner`).
+    pub fn set_tap_owner(&mut self, owner: Option<TrackId>) {
+        *self.tap_owner.write().unwrap() = owner;
+    }
     fn raw_tap(&self) -> Option<mpsc::UnboundedSender<AudioFrame>> {
         self.raw_tap.read().unwrap().clone()
+    }
+    fn tap_owns(&self, track_id: &str) -> bool {
+        match self.tap_owner.read().unwrap().as_deref() {
+            Some(owner) => owner == track_id,
+            None => true,
+        }
     }
     pub fn insert_processor(&mut self, processor: Box<dyn Processor>) {
         lock_processors(&self.processors).insert(0, processor);
@@ -148,8 +165,11 @@ impl ProcessorChain {
         }
 
         // Mirror the frame to the raw tap at its native sample rate, before
-        // the pipeline resamples it to INTERNAL_SAMPLERATE.
+        // the pipeline resamples it to INTERNAL_SAMPLERATE. Only frames owned
+        // by this chain's track are mirrored: audio the track merely relays
+        // for another leg is already recorded at its origin.
         if let Some(tap) = self.raw_tap()
+            && self.tap_owns(&frame.track_id)
             && let Samples::PCM { samples } = &frame.samples
             && !samples.is_empty()
             && frame.sample_rate > 0
@@ -289,6 +309,53 @@ mod tests {
         };
         worker.process_frame(&mut frame).unwrap();
         assert_eq!(frame.sample_rate, INTERNAL_SAMPLERATE);
+    }
+
+    /// Regression: a track often relays another leg's audio through its own
+    /// processor chain (the media-pass track forwards the caller's audio to the
+    /// websocket). The native-samplerate raw tap must mirror only frames the
+    /// chain owns, otherwise a media-pass call records the caller's audio from
+    /// both legs and the recording comes out twice as long.
+    #[test]
+    fn raw_tap_only_mirrors_owned_frames() {
+        let mut chain = ProcessorChain::new(INTERNAL_SAMPLERATE);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        chain.set_raw_tap(Some(tx));
+        chain.set_tap_owner(Some("server-side-track".to_string()));
+
+        // A frame forwarded from another leg (caller -> websocket) must not be
+        // mirrored by this chain.
+        let mut relayed = AudioFrame {
+            track_id: "caller".to_string(),
+            samples: Samples::PCM {
+                samples: vec![1i16; 160],
+            },
+            sample_rate: 8000,
+            channels: 1,
+            ..Default::default()
+        };
+        chain.process_frame(&mut relayed).unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "relayed frames must not be mirrored to the raw tap"
+        );
+
+        // The chain's own frame must be mirrored.
+        let mut owned = AudioFrame {
+            track_id: "server-side-track".to_string(),
+            samples: Samples::PCM {
+                samples: vec![1i16; 160],
+            },
+            sample_rate: 16000,
+            channels: 1,
+            ..Default::default()
+        };
+        chain.process_frame(&mut owned).unwrap();
+        let raw = rx
+            .try_recv()
+            .expect("owned frames must be mirrored to the raw tap");
+        assert_eq!(raw.track_id, "server-side-track");
+        assert_eq!(raw.sample_rate, 16000);
     }
 
     /// Regression: a track report with no valid source rate (e.g. a media-pass
