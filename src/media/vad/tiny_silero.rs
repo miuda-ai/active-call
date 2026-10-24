@@ -12,6 +12,14 @@ const STFT_WINDOW_SIZE: usize = 256;
 const STFT_STRIDE: usize = 128;
 const CONTEXT_SIZE: usize = 64; // Context from previous chunk for STFT continuity
 const STFT_PADDING: usize = 64; // Right padding for STFT (ReflectionPad1d)
+/// Over long stretches without speech (hold music, tones, line noise) the LSTM's
+/// state can settle into hearing no speech at all, and stay there long after
+/// they end; a state that heard none for this long is reset, as a fresh one
+/// would be.
+const RESET_AFTER_QUIET_CHUNKS: usize = 10 * 16000 / CHUNK_SIZE; // 10 s
+/// A chunk is quiet below the voice threshold less this, as silero-vad's
+/// `neg_threshold` is.
+const QUIET_MARGIN: f32 = 0.15;
 const MAX_CONV_ROWS: usize = 129 * 3; // largest in_channels * kernel_size (enc0)
 const MAX_CONV_STEPS: usize = 4; // largest conv output length (enc0)
 
@@ -285,6 +293,8 @@ pub struct SileroSession {
     processed_samples: u64,
     initialized_timestamp: bool,
     last_score: Option<f32>,
+    /// Quiet chunks in a row, up to `RESET_AFTER_QUIET_CHUNKS`.
+    quiet_chunks: usize,
 }
 
 impl SileroSession {
@@ -318,6 +328,7 @@ impl SileroSession {
             processed_samples: 0,
             initialized_timestamp: false,
             last_score: None,
+            quiet_chunks: 0,
         }
     }
 }
@@ -541,6 +552,15 @@ impl TinySilero {
         })
     }
 
+    /// Clears the model's recurrent state, as at the start of a stream; the
+    /// buffered audio and timestamps are kept.
+    pub fn reset_state(&mut self) {
+        for row in self.session.h.iter_mut().chain(self.session.c.iter_mut()) {
+            row.fill(0.0);
+        }
+        self.session.quiet_chunks = 0;
+    }
+
     /// Probability from the most recently processed chunk, if any.
     pub fn last_probability(&self) -> Option<f32> {
         self.session.last_score
@@ -580,6 +600,15 @@ impl TinySilero {
 
             self.session.buf_chunk_f32 = chunk_f32;
             self.session.last_score = Some(score);
+
+            if score < self.config.voice_threshold - QUIET_MARGIN {
+                self.session.quiet_chunks += 1;
+                if self.session.quiet_chunks >= RESET_AFTER_QUIET_CHUNKS {
+                    self.reset_state();
+                }
+            } else {
+                self.session.quiet_chunks = 0;
+            }
 
             results.push(score);
         }
