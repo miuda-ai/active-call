@@ -1298,6 +1298,97 @@ async fn ws_cancel_before_first_command_tears_down_attached_call() {
     );
 }
 
+/// A `reject` after early-media `ringing` must answer the INVITE with the
+/// requested final response. `ringing` moves the pending dialog into
+/// `ready_to_answer`, and `do_reject` used to look it up in the (now empty)
+/// pending table, send nothing and tear the session down: the carrier was
+/// left with a 183 and no final response until its own timeout, and the
+/// call was recorded as a caller CANCEL (487 `canceled`).
+#[tokio::test]
+async fn sip_reject_after_early_media_ringing_sends_final_response() {
+    tracing_subscriber::fmt()
+        .with_max_level(Level::DEBUG)
+        .with_test_writer()
+        .try_init()
+        .ok();
+
+    let mut node = spawn_node(35077, vec![]).await;
+    let uac = SipUac::new(format!("127.0.0.1:{}", node.sip_port).parse().unwrap(), 0).await;
+    let call_id = "sip-reject-after-ringing@127.0.0.1";
+    uac.socket
+        .send_to(
+            uac.invite(call_id, "fromtag5", "z9hG4bKsipreject1", PCMU_OFFER)
+                .as_bytes(),
+            uac.server,
+        )
+        .await
+        .unwrap();
+
+    let payload = tokio::time::timeout(Duration::from_secs(20), node.webhook_rx.recv())
+        .await
+        .expect("webhook not called")
+        .expect("webhook channel closed");
+    let (ws, _) = connect_async(format!(
+        "ws://127.0.0.1:{}/call/sip?id={}",
+        node.http_port, payload.dialog_id
+    ))
+    .await
+    .expect("failed to attach websocket to the ringing call");
+    let (mut sink, mut stream) = ws.split();
+
+    sink.send(Message::text(
+        r#"{"command":"ringing","earlyMedia":true}"#.to_string(),
+    ))
+    .await
+    .expect("failed to send ringing");
+    let (progress, _msg, seen) = uac
+        .wait_for_status("SIP/2.0 183", Duration::from_secs(10))
+        .await;
+    assert!(
+        progress,
+        "no 183 after early-media ringing; responses seen: {seen:?}"
+    );
+
+    sink.send(Message::text(
+        r#"{"command":"reject","reason":"blacklist","code":607}"#.to_string(),
+    ))
+    .await
+    .expect("failed to send reject");
+
+    // Well within the node's 10s accept_timeout, whose 408 would otherwise
+    // be the first final response the caller sees.
+    let (rejected, _msg, seen) = uac
+        .wait_for_status("SIP/2.0 607", Duration::from_secs(5))
+        .await;
+    assert!(
+        rejected,
+        "INVITE was not rejected with 607 after ringing; responses seen: {seen:?}"
+    );
+
+    // The hangup must report our reject, not a caller CANCEL.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut hangup = None;
+    while hangup.is_none() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!remaining.is_zero(), "no hangup event after reject");
+        match tokio::time::timeout(remaining, stream.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                info!(%text, "bot received event");
+                if text.contains("\"event\":\"hangup\"") {
+                    hangup = Some(text.to_string());
+                }
+            }
+            Ok(Some(Ok(_))) | Err(_) => continue,
+            Ok(Some(Err(_))) | Ok(None) => break,
+        }
+    }
+    let hangup = hangup.expect("websocket closed without a hangup event");
+    assert!(
+        !hangup.contains("Canceled") && !hangup.contains("canceled"),
+        "reject was reported as a caller cancel: {hangup}"
+    );
+}
+
 /// End to end: a `dtmf` command on an answered SIP call must put one RFC 4733
 /// telephone-event on the wire (negotiated PT, one RTP timestamp, growing
 /// duration, marker on the first packet, end packet sent three times) and

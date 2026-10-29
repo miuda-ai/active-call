@@ -1798,6 +1798,26 @@ impl ActiveCall {
                     .remove_dialog(&pending.dialog.id());
             }
         }
+        // `ringing` moves the pending dialog into `ready_to_answer`, so check
+        // it first: the session id still resolves to the dialog id, but the
+        // pending table is empty by then and `Invitation::hangup` would fall
+        // back to `hangup()`, a no-op for an unanswered UAS dialog - the
+        // INVITE got no final response at all.
+        if let Some(ready) = self.take_ready_to_answer() {
+            info!(
+                session_id = self.session_id,
+                ?reason,
+                ?code,
+                "rejecting call from ready_to_answer"
+            );
+            let dialog = &ready.dialog;
+            let dialog_id = dialog.id();
+            self.record_reject(code.as_ref());
+            dialog.reject(code, reason).ok();
+            self.invitation.dialog_layer.remove_dialog(&dialog_id);
+            self.cancel_token.cancel();
+            return Ok(());
+        }
         match self
             .invitation
             .find_dialog_id_by_session_id(&self.session_id)
@@ -1809,29 +1829,27 @@ impl ActiveCall {
                     ?code,
                     "rejecting call"
                 );
+                self.record_reject(code.as_ref());
                 let result = self.invitation.hangup(id, code, reason).await;
                 if result.is_ok() {
                     self.cancel_token.cancel();
                 }
                 result
             }
-            None => {
-                if let Some(ready) = self.take_ready_to_answer() {
-                    info!(
-                        session_id = self.session_id,
-                        ?reason,
-                        ?code,
-                        "rejecting call from ready_to_answer"
-                    );
-                    let dialog = &ready.dialog;
-                    let dialog_id = dialog.id();
-                    dialog.reject(code, reason).ok();
-                    self.invitation.dialog_layer.remove_dialog(&dialog_id);
-                    self.cancel_token.cancel();
-                }
-                Ok(())
-            }
+            None => Ok(()),
         }
+    }
+
+    /// Record a reject on the leg before the session is torn down, so the
+    /// cancel-token teardown isn't taken for a caller CANCEL (487 `canceled`).
+    fn record_reject(&self, code: Option<&rsipstack::rsip::StatusCode>) {
+        let status = code.map_or(603, |c| c.code());
+        self.leg().update_progress(|p| {
+            if p.hangup_reason.is_none() {
+                p.last_status_code = status;
+                p.hangup_reason = Some(CallRecordHangupReason::Rejected);
+            }
+        });
     }
 
     async fn do_ringing(&self, command: Command) -> Result<()> {

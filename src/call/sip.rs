@@ -273,7 +273,11 @@ impl InviteDialogStates {
         let status_code = term.status_code;
         let reason = term.hangup_reason;
         self.leg.update_progress(|p| {
-            p.last_status_code = status_code;
+            // A reason recorded before the dialog ended (our reject) comes
+            // with its own status; keep the pair.
+            if self.terminated_reason.is_some() || p.hangup_reason.is_none() {
+                p.last_status_code = status_code;
+            }
             p.set_hangup_reason(reason.clone());
         });
         let progress = self.leg.progress.load_full();
@@ -647,7 +651,12 @@ impl DialogStateReceiverGuard {
         let token = states.cancel_token.clone();
         tokio::select! {
             _ = token.cancelled() => {
-                states.terminated_reason = Some(TerminatedReason::UacCancel);
+                // Our own teardown (reject/hangup) records its outcome on the
+                // leg before cancelling; only an unexplained cancel is the
+                // caller's.
+                if states.leg.progress.load().hangup_reason.is_none() {
+                    states.terminated_reason = Some(TerminatedReason::UacCancel);
+                }
             }
             _ = self.dialog_event_loop(&mut states) => {}
         };
