@@ -65,6 +65,14 @@ media_cache_path = "./config/mediacache"
 # username = "user"
 # credential = "pass"
 
+# Jitter buffer and packet loss concealment on inbound audio: frames are
+# played out in order, paced at the packet time, with lost ones concealed.
+# Adds 40 ms of delay. A call's jitterBuffer option overrides these.
+# [jitter_buffer]
+# webrtc = true   # browsers on whatever network (default on)
+# sip = false     # carrier trunks are clean, so off by default; turn on for
+#                 # SIP softphones on the open internet
+
 # Invitation handler - handles incoming SIP invitations
 # Option 1: Webhook handler - forward invitations to HTTP endpoint
 # [handler]

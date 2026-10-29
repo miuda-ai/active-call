@@ -67,6 +67,11 @@ pub struct CallOption {
     pub inactivity_timeout: Option<u64>, // inactivity timeout in seconds
     /// Incoming RTC sample timeout in seconds; None or zero disables notifications.
     pub rtp_timeout: Option<u64>,
+    /// Jitter buffer and loss concealment on this leg's inbound audio (see
+    /// `media::jitter`). None: `[jitter_buffer]` in the config, by default
+    /// on for WebRTC, off for SIP. Worth turning on for SIP endpoints on the
+    /// open internet, such as softphones, rather than carrier trunks.
+    pub jitter_buffer: Option<bool>,
     pub sip: Option<SipOption>,
     pub extra: Option<HashMap<String, String>>,
     pub codec: Option<String>, // pcmu, pcma, g722, pcm, only for websocket call
@@ -97,6 +102,7 @@ impl Default for CallOption {
             handshake_timeout: None,
             inactivity_timeout: Some(50), // default 50 seconds
             rtp_timeout: None,
+            jitter_buffer: None,
             enable_ipv6: None,
             sip: None,
             extra: None,
@@ -326,6 +332,33 @@ mod rtp_timeout_tests {
                 match parsed {
                     Command::Invite { option } | Command::Accept { option } => {
                         assert_eq!(option.rtp_timeout, expected);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod jitter_buffer_option_tests {
+    use crate::call::Command;
+
+    #[test]
+    fn jitter_buffer_is_set_per_call_by_invite_and_accept() {
+        for command in ["invite", "accept"] {
+            for (option, expected) in [
+                (serde_json::json!({}), None),
+                (serde_json::json!({"jitterBuffer": true}), Some(true)),
+                (serde_json::json!({"jitterBuffer": false}), Some(false)),
+            ] {
+                let parsed: Command = serde_json::from_value(serde_json::json!({
+                    "command": command, "option": option,
+                }))
+                .unwrap();
+                match parsed {
+                    Command::Invite { option } | Command::Accept { option } => {
+                        assert_eq!(option.jitter_buffer, expected);
                     }
                     _ => unreachable!(),
                 }

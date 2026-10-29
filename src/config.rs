@@ -137,6 +137,17 @@ fn default_codecs() -> Option<Vec<String>> {
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
+pub struct JitterBufferConfig {
+    /// WebRTC legs: browsers on whatever network. Default on.
+    pub webrtc: Option<bool>,
+    /// SIP legs. Default off: carrier trunks are clean and close, so it
+    /// would only add delay; turn it on per call for softphones instead,
+    /// or here if all SIP peers are on the open internet.
+    pub sip: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
 pub struct RecordingPolicy {
     #[serde(default)]
     pub enabled: bool,
@@ -487,6 +498,9 @@ pub struct Config {
     pub media_cache_path: String,
     pub ambiance: Option<AmbianceOption>,
     pub ice_servers: Option<Vec<IceServer>>,
+    /// Jitter buffer and loss concealment on inbound audio, by leg type;
+    /// see `media::jitter`. A call's `jitter_buffer` option overrides it.
+    pub jitter_buffer: Option<JitterBufferConfig>,
     #[serde(default)]
     pub recording: Option<RecordingPolicy>,
     pub rewrites: Option<Vec<RewriteRule>>,
@@ -619,6 +633,7 @@ impl Default for Config {
             ambiance: None,
             callrecord: None,
             ice_servers: None,
+            jitter_buffer: None,
             codecs: None,
             external_ip: None,
             rtp_start_port: default_config_rtp_start_port(),
@@ -1428,5 +1443,31 @@ rule.rewrite.contact.user = "active-call"
         };
         config.apply_trunk_rules(&mut invite);
         assert_eq!(invite.contact.auth.as_ref().unwrap().user, "active-call");
+    }
+
+    #[test]
+    fn test_jitter_buffer_section() {
+        let config: Config = toml::from_str(
+            r#"
+addr = "0.0.0.0"
+udp_port = 25060
+"#,
+        )
+        .unwrap();
+        assert!(config.jitter_buffer.is_none());
+
+        let config: Config = toml::from_str(
+            r#"
+addr = "0.0.0.0"
+udp_port = 25060
+
+[jitter_buffer]
+sip = true
+"#,
+        )
+        .unwrap();
+        let jitter_buffer = config.jitter_buffer.unwrap();
+        assert_eq!(jitter_buffer.webrtc, None);
+        assert_eq!(jitter_buffer.sip, Some(true));
     }
 }
