@@ -239,6 +239,7 @@ mod tests {
         id: TrackId,
         config: crate::media::track::TrackConfig,
         processor_chain: crate::media::processor::ProcessorChain,
+        ended: bool,
     }
 
     impl MockCallerTrack {
@@ -247,6 +248,7 @@ mod tests {
                 id,
                 config: crate::media::track::TrackConfig::default(),
                 processor_chain: crate::media::processor::ProcessorChain::new(16000),
+                ended: false,
             }
         }
     }
@@ -288,6 +290,53 @@ mod tests {
         async fn send_packet(&mut self, _f: &crate::media::AudioFrame) -> Result<()> {
             Ok(())
         }
+        fn has_ended(&self) -> bool {
+            self.ended
+        }
+    }
+
+    /// Feed the call a connection-lost TrackEnd of its caller track, with
+    /// `registered` (if any) as the caller track then in the media stream;
+    /// returns whether the call hung up.
+    async fn caller_track_lost(registered: Option<bool>) -> bool {
+        let call = make_active_call_with_engine_and_option(
+            Arc::new(StreamEngine::default()),
+            "/tmp/mediacache",
+            crate::CallOption::default(),
+        )
+        .await;
+        if let Some(ended) = registered {
+            let mut track = MockCallerTrack::new(call.session_id.clone());
+            track.ended = ended;
+            call.media_stream.update_track(Box::new(track), None).await;
+        }
+        let (tx, _rx) = mpsc::channel::<ActorMsg>(16);
+        call.handle_event(
+            &mut CallRuntime::new(tx),
+            SessionEvent::TrackEnd {
+                track_id: call.session_id.clone(),
+                timestamp: 0,
+                duration: 0,
+                ssrc: 0,
+                play_id: None,
+                auto_hangup: Some(CallRecordHangupReason::Failed),
+            },
+        )
+        .await;
+        call.media_stream.cancel_token.is_cancelled()
+    }
+
+    #[tokio::test]
+    async fn lost_caller_track_hangs_up() {
+        assert!(caller_track_lost(Some(true)).await);
+        assert!(caller_track_lost(None).await);
+    }
+
+    // A caller track replaced (same id and ssrc) after its connection was
+    // lost: the old track's TrackEnd must not hang up the new media.
+    #[tokio::test]
+    async fn lost_replaced_caller_track_keeps_the_call() {
+        assert!(!caller_track_lost(Some(false)).await);
     }
 
     struct MockAsrClient;
@@ -1030,6 +1079,29 @@ impl ActiveCall {
                 ..
             } => {
                 if track_id != self.server_side_track_id {
+                    // The call's own media track only asks to hang up when its
+                    // connection is gone for good (see RtcTrack): without media
+                    // the call would otherwise stay up in dead air. Unless a
+                    // new caller track (same id and ssrc) has replaced it since.
+                    if track_id == self.session_id {
+                        if auto_hangup.is_some()
+                            && self.media_stream.has_live_track(&track_id).await
+                        {
+                            info!(
+                                session_id = self.session_id,
+                                "ignoring connection loss of a replaced caller track"
+                            );
+                        } else if let Some(hangup_reason) = auto_hangup {
+                            info!(
+                                session_id = self.session_id,
+                                ?hangup_reason,
+                                "media connection lost, hanging up"
+                            );
+                            self.do_hangup(Some(hangup_reason), None, None, None)
+                                .await
+                                .ok();
+                        }
+                    }
                     return;
                 }
 

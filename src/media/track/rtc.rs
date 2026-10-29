@@ -1,5 +1,6 @@
 use super::track_codec::{TrackCodec, duration_to_rtp_ticks};
 use crate::{
+    callrecord::CallRecordHangupReason,
     event::{EventSender, SessionEvent},
     media::AudioFrame,
     media::{
@@ -48,6 +49,9 @@ pub struct RtcTrackConfig {
     /// Emit `RtpTimeout` when no audio arrives for this long once the call
     /// is answered; None or zero disables it.
     pub rtp_timeout: Option<Duration>,
+    /// How long rustrtc waits for an ICE-disconnected connection to recover
+    /// before giving up on it; None keeps rustrtc's default.
+    pub ice_disconnect_grace: Option<Duration>,
 }
 
 impl Default for RtcTrackConfig {
@@ -64,6 +68,7 @@ impl Default for RtcTrackConfig {
             enable_latching: None,
             enable_ice_lite: None,
             rtp_timeout: None,
+            ice_disconnect_grace: None,
         }
     }
 }
@@ -77,6 +82,10 @@ pub struct RtcTrack {
     event_sender: Arc<Mutex<Option<EventSender>>>,
     media_ready_sent: Arc<AtomicBool>,
     rtp_timeout: Arc<RtpTimeoutMonitor>,
+    /// Set when the peer connection is gone for good (failed, closed, or
+    /// still disconnected after the grace); the track then ends asking the
+    /// call to hang up.
+    connection_lost: Arc<AtomicBool>,
     cancel_token: CancellationToken,
     local_source: Option<Arc<SampleStreamSource>>,
     encoder: TrackCodec,
@@ -208,6 +217,7 @@ impl RtcTrack {
             event_sender: Arc::new(Mutex::new(None)),
             media_ready_sent: Arc::new(AtomicBool::new(false)),
             rtp_timeout,
+            connection_lost: Arc::new(AtomicBool::new(false)),
             cancel_token,
             local_source: None,
             encoder: TrackCodec::new(),
@@ -276,6 +286,9 @@ impl RtcTrack {
             config.rtp_end_port = Some(rtp_end_port);
         }
         config.enable_ice_lite = self.rtc_config.enable_ice_lite.unwrap_or(false);
+        if let Some(grace) = self.rtc_config.ice_disconnect_grace {
+            config.ice_disconnect_grace = grace;
+        }
         config.enable_latching = self
             .rtc_config
             .enable_latching
@@ -380,6 +393,7 @@ impl RtcTrack {
         media_ready_sent: Arc<AtomicBool>,
     ) {
         let cancel_token = self.cancel_token.clone();
+        let connection_lost = self.connection_lost.clone();
         let packet_sender = self.packet_sender.clone();
         let rtp_timeout = self.rtp_timeout.clone();
         let pc_event = pc.clone();
@@ -402,6 +416,13 @@ impl RtcTrack {
 
             let mut state_rx = if is_webrtc {
                 Some(pc_state.subscribe_peer_state())
+            } else {
+                None
+            };
+            // rustrtc keeps a disconnected connection for its grace period
+            // and only then sets the disconnect reason (also set on failure)
+            let mut disconnect_rx = if is_webrtc {
+                Some(pc_state.subscribe_disconnect_reason())
             } else {
                 None
             };
@@ -532,26 +553,79 @@ impl RtcTrack {
                                 let s = *rx.borrow();
                                 debug!(track_id=%track_id_log, "peer connection state changed: {:?}", s);
                                 match s {
-                                    PeerConnectionState::Disconnected
-                                    | PeerConnectionState::Closed
+                                    PeerConnectionState::Closed
                                     | PeerConnectionState::Failed => {
+                                        Self::close_lost_connection(
+                                            &track_id_log,
+                                            &cancel_token,
+                                            &connection_lost,
+                                            &pc_state,
+                                            format_args!("peer connection is {:?}", s),
+                                        );
+                                        break;
+                                    }
+                                    // Transient: ICE may reconnect within the
+                                    // grace, so keep the media and wait.
+                                    PeerConnectionState::Disconnected => {
                                         info!(
                                             track_id = %track_id_log,
-                                            "peer connection is {:?}, try to close", s
+                                            "peer connection is Disconnected, waiting for it to recover"
                                         );
-                                        cancel_token.cancel();
-                                        pc_state.close();
-                                        break;
+                                    }
+                                    PeerConnectionState::Connected => {
+                                        debug!(track_id = %track_id_log, "peer connection is Connected");
                                     }
                                     _ => {}
                                 }
                             }
                         }
                     }
+
+                    res = async {
+                        if let Some(rx) = disconnect_rx.as_mut() {
+                            rx.changed().await
+                        } else {
+                            std::future::pending().await
+                        }
+                    } => {
+                        if res.is_err() {
+                            disconnect_rx = None;
+                        } else if let Some(reason) =
+                            disconnect_rx.as_ref().and_then(|rx| rx.borrow().clone())
+                        {
+                            Self::close_lost_connection(
+                                &track_id_log,
+                                &cancel_token,
+                                &connection_lost,
+                                &pc_state,
+                                format_args!("peer connection lost: {:?}", reason),
+                            );
+                            break;
+                        }
+                    }
                 }
             }
             debug!(track_id=%track_id_log, "RtcTrack event/stats loop ended, total events: {}", event_count);
         });
+    }
+
+    /// Close a peer connection that is gone for good and mark the track so
+    /// its end asks the call to hang up. Not when the track is already being
+    /// stopped: closing the connection ourselves also ends up here.
+    fn close_lost_connection(
+        track_id: &TrackId,
+        cancel_token: &CancellationToken,
+        connection_lost: &AtomicBool,
+        pc: &PeerConnection,
+        why: std::fmt::Arguments<'_>,
+    ) {
+        if cancel_token.is_cancelled() {
+            return;
+        }
+        info!(track_id = %track_id, "{why}, closing the track");
+        connection_lost.store(true, Ordering::SeqCst);
+        cancel_token.cancel();
+        pc.close();
     }
 
     fn create_track_workers(
@@ -980,6 +1054,7 @@ impl Track for RtcTrack {
         *self.packet_sender.lock().await = Some(packet_sender.clone());
         *self.event_sender.lock().await = Some(event_sender.clone());
         let token_clone = self.cancel_token.clone();
+        let connection_lost = self.connection_lost.clone();
         let event_sender_clone = event_sender.clone();
         let track_id = self.track_id.clone();
         let ssrc = self.ssrc;
@@ -988,13 +1063,16 @@ impl Track for RtcTrack {
             let start_time = crate::media::get_timestamp();
             crate::spawn(async move {
                 token_clone.cancelled().await;
+                let auto_hangup = connection_lost
+                    .load(Ordering::SeqCst)
+                    .then_some(CallRecordHangupReason::Failed);
                 let _ = event_sender_clone.send(SessionEvent::TrackEnd {
                     track_id,
                     timestamp: crate::media::get_timestamp(),
                     duration: crate::media::get_timestamp() - start_time,
                     ssrc,
                     play_id: None,
-                    auto_hangup: None,
+                    auto_hangup,
                 });
             });
         }
@@ -1008,6 +1086,10 @@ impl Track for RtcTrack {
             pc.close();
         }
         Ok(())
+    }
+
+    fn has_ended(&self) -> bool {
+        self.cancel_token.is_cancelled()
     }
 
     async fn send_packet(&mut self, packet: &AudioFrame) -> Result<()> {

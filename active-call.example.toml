@@ -47,6 +47,11 @@ media_cache_path = "./config/mediacache"
 # enable_rtp_latching = true
 # enable_ice_lite = false
 # rtp_bind_ip = 0.0.0.0
+#
+# How long a WebRTC connection may stay ICE-disconnected before the call is
+# hung up (reason "failed"); it carries on if ICE recovers in time.
+# Default: rustrtc's (60s).
+# ice_disconnect_grace = "15s"
 
 # Graceful shutdown: on SIGTERM/Ctrl-C, stop accepting new calls and wait for
 # in-progress calls to finish before exiting.

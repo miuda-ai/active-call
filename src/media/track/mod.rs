@@ -126,4 +126,9 @@ pub trait Track: Send + Sync {
     /// replaces the configured RTP timeout. Default no-op for track types
     /// without RTP timeout monitoring.
     fn on_answered(&self, _rtp_timeout: Option<Duration>) {}
+    /// The track is done for good (stopped, or lost its transport), though
+    /// it may stay registered until replaced. Default: never.
+    fn has_ended(&self) -> bool {
+        false
+    }
 }
