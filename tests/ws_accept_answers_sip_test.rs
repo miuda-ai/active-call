@@ -1298,6 +1298,97 @@ async fn ws_cancel_before_first_command_tears_down_attached_call() {
     );
 }
 
+/// The caller CANCELs after the invite webhook went out but before the
+/// controller attached to `/call/sip` and sent `ringing`. With the pending
+/// dialog gone, `ringing` must reject the session instead of falling through
+/// to the outgoing-call path, which used to dial an INVITE with no callee
+/// (to the local default, `sip:localhost`) and hold the session until that
+/// INVITE timed out.
+#[tokio::test]
+async fn sip_ringing_after_cancel_rejects_instead_of_dialing() {
+    tracing_subscriber::fmt()
+        .with_max_level(Level::DEBUG)
+        .with_test_writer()
+        .try_init()
+        .ok();
+
+    let mut node = spawn_node(35077, vec![]).await;
+    let uac = SipUac::new(format!("127.0.0.1:{}", node.sip_port).parse().unwrap(), 0).await;
+    let call_id = "sip-ringing-after-cancel@127.0.0.1";
+    let from_tag = "fromtag5";
+    let branch = "z9hG4bKringcancel1";
+    uac.socket
+        .send_to(
+            uac.invite(call_id, from_tag, branch, PCMU_OFFER).as_bytes(),
+            uac.server,
+        )
+        .await
+        .unwrap();
+
+    let payload = tokio::time::timeout(Duration::from_secs(20), node.webhook_rx.recv())
+        .await
+        .expect("webhook not called")
+        .expect("webhook channel closed");
+    let dialog_id = payload.dialog_id;
+
+    // The caller gives up before anyone attached to the call.
+    uac.socket
+        .send_to(uac.cancel(call_id, from_tag, branch).as_bytes(), uac.server)
+        .await
+        .unwrap();
+    let (terminated, _msg, seen) = uac
+        .wait_for_status("SIP/2.0 487", Duration::from_secs(10))
+        .await;
+    assert!(
+        terminated,
+        "INVITE was never terminated with 487 after CANCEL; responses seen: {seen:?}"
+    );
+
+    let (ws, _) = connect_async(format!(
+        "ws://127.0.0.1:{}/call/sip?id={dialog_id}",
+        node.http_port
+    ))
+    .await
+    .expect("failed to attach websocket");
+    let (mut sink, mut stream) = ws.split();
+    sink.send(Message::text(
+        r#"{"command":"ringing","earlyMedia":true}"#.to_string(),
+    ))
+    .await
+    .expect("failed to send ringing");
+
+    let reject = wait_ws_event(&mut stream, "reject", Duration::from_secs(5))
+        .await
+        .expect("ringing for a cancelled call was not rejected");
+    assert_eq!(reject["code"], 486, "unexpected reject: {reject}");
+
+    // ...and the session ends rather than lingering on a phantom dial.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "websocket stayed open after the reject"
+        );
+        match tokio::time::timeout(remaining, stream.next()).await {
+            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Err(_))) | Ok(None) => break,
+            Err(_) => continue,
+        }
+    }
+    let list = reqwest::get(format!("http://127.0.0.1:{}/list", node.http_port))
+        .await
+        .expect("failed to query /list")
+        .json::<serde_json::Value>()
+        .await
+        .expect("failed to parse /list response");
+    let active = list["active_calls"].as_array().cloned().unwrap_or_default();
+    assert!(
+        active.is_empty(),
+        "rejected call lingered in /list: {active:?}"
+    );
+}
+
 /// End to end: a `dtmf` command on an answered SIP call must put one RFC 4733
 /// telephone-event on the wire (negotiated PT, one RTP timestamp, growing
 /// duration, marker on the first packet, end packet sent three times) and
