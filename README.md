@@ -185,6 +185,7 @@ enable_srtp   = true
 
 - [Twilio Elastic SIP Trunking Guide](./docs/twilio_integration.md)
 - [Telnyx SIP Trunking Guide](./docs/telnyx_integration.md)
+- [DIDWW SIP Trunking Guide](./docs/didww_integration.md)
 
 ## Feature Flags
 

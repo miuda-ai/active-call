@@ -1,0 +1,19 @@
+# DIDWW inbound calls: Static Endpoint routing, without SIP REGISTER.
+# Replace YOUR_PUBLIC_IP and the webhook URL before starting.
+# See docs/didww_integration.md for DID assignment and firewall requirements.
+addr = "0.0.0.0"
+udp_port = 5060
+http_addr = "127.0.0.1:8080"
+external_ip = "YOUR_PUBLIC_IP"
+rtp_bind_ip = "0.0.0.0"
+rtp_start_port = 16000
+rtp_end_port = 16100
+codecs = ["pcmu", "pcma"]
+enable_srtp = false
+media_cache_path = "./config/mediacache"
+
+# Your existing controller receives the invite webhook and answers via
+# /call/sip?id=<dialogId>. Configure its media/AI handling separately.
+[handler]
+type = "webhook"
+url = "http://127.0.0.1:9001/invite"
