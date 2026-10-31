@@ -903,7 +903,7 @@ The `CallOption` object is used in `invite` and `accept` commands and contains t
   - `secretId` (string, optional): Secret ID for VAD service authentication
 - `tts` (SynthesisOption, optional): Text-to-Speech configuration
   - `samplerate` (number, optional): TTS output sample rate in Hz
-  - `provider` (string, optional): TTS provider ("tencent", "tencent_basic", "aliyun", "deepgram", "supertonic", "voiceapi"). Default: "aliyun" for Chinese (zh), "supertonic" for English (en).
+  - `provider` (string, optional): TTS provider ("tencent", "tencent_basic", "aliyun", "deepgram", "60db", "supertonic", "voiceapi"). Default: "aliyun" for Chinese (zh), "supertonic" for English (en).
   - `speed` (number, optional): Speech speed multiplier (default: 1.0)
   - `appId` (string, optional): Application ID for TTS service
   - `secretId` (string, optional): Secret ID for authentication
