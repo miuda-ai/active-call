@@ -7,7 +7,7 @@ use crate::{
         track::{Track, TrackConfig, TrackId, TrackPacketSender},
     },
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use audio_codec::CodecType;
 use audio_codec::telephone_event::encode_event_payload;
@@ -23,6 +23,7 @@ use rustrtc::{
     },
 };
 use std::{
+    net::IpAddr,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -266,10 +267,16 @@ impl RtcTrack {
         }
 
         if let Some(external_ip) = &self.rtc_config.external_ip {
-            config.external_ip = Some(external_ip.clone());
+            let ip: IpAddr = external_ip
+                .parse()
+                .with_context(|| format!("invalid external_ip: {external_ip}"))?;
+            config.external_ips = vec![ip];
         }
         if let Some(bind_ip) = &self.rtc_config.bind_ip {
-            config.bind_ip = Some(bind_ip.clone());
+            let ip: IpAddr = bind_ip
+                .parse()
+                .with_context(|| format!("invalid bind_ip: {bind_ip}"))?;
+            config.bind_ips = vec![ip];
         }
         if let Some((rtp_start_port, rtp_end_port)) = self.rtc_config.rtp_port_range {
             config.rtp_start_port = Some(rtp_start_port);
