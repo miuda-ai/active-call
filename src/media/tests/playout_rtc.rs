@@ -1,8 +1,10 @@
 //! End to end over a real `RtcTrack` (RTP mode, jitter buffer forced on):
 //! inbound audio sent in bursts, with one packet lost and two swapped, must
 //! come out in order, paced at the packet time, with the lost frame
-//! concealed rather than skipped.
+//! concealed rather than skipped; and a sender going quiet after comfort
+//! noise must not be concealed as loss.
 use crate::event::create_event_sender;
+use crate::media::AudioFrame;
 use crate::media::Samples;
 use crate::media::track::rtc::{RtcTrack, RtcTrackConfig};
 use crate::media::track::{Track, TrackConfig};
@@ -32,8 +34,24 @@ fn tone_packet(encoder: &mut PcmaEncoder, seq: u16) -> Vec<u8> {
     pkt
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn bursty_lossy_rtp_plays_out_paced_and_concealed() -> Result<()> {
+/// A comfort noise packet (RFC 3389): the sender goes quiet after it.
+fn comfort_noise_packet(seq: u16) -> Vec<u8> {
+    let mut pkt = vec![0x80, 13];
+    pkt.extend_from_slice(&seq.to_be_bytes());
+    pkt.extend_from_slice(&(seq as u32 * 160).to_be_bytes());
+    pkt.extend_from_slice(&SSRC.to_be_bytes());
+    // noise level, -70 dBov
+    pkt.push(70);
+    pkt
+}
+
+/// A started PCMA track with the jitter buffer on, the RTP port it listens
+/// on, and the frames it emits.
+async fn playout_track() -> Result<(
+    RtcTrack,
+    u16,
+    tokio::sync::mpsc::UnboundedReceiver<AudioFrame>,
+)> {
     let rtc_config = RtcTrackConfig {
         mode: TransportMode::Rtp,
         bind_ip: Some("127.0.0.1".to_string()),
@@ -77,10 +95,17 @@ async fn bursty_lossy_rtp_plays_out_paced_and_concealed() -> Result<()> {
         })
         .expect("no m=audio port in answer");
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     track.start(create_event_sender(), tx).await?;
-    // (arrival, sequence number or None for a concealed frame, rms)
-    let collector = tokio::spawn(async move {
+    Ok((track, port, rx))
+}
+
+/// Collects `(arrival, sequence number or None for a concealed frame, rms)`
+/// until no frame came for 500 ms.
+fn collect(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<AudioFrame>,
+) -> tokio::task::JoinHandle<Vec<(Instant, Option<u16>, f32)>> {
+    tokio::spawn(async move {
         let mut out = vec![];
         while let Ok(Some(frame)) =
             tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
@@ -98,7 +123,13 @@ async fn bursty_lossy_rtp_plays_out_paced_and_concealed() -> Result<()> {
             ));
         }
         out
-    });
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bursty_lossy_rtp_plays_out_paced_and_concealed() -> Result<()> {
+    let (_track, port, rx) = playout_track().await?;
+    let collector = collect(rx);
 
     // 30 packets in bursts of three every 60 ms; 10 lost, 12 before 11
     let socket = UdpSocket::bind("127.0.0.1:0").await?;
@@ -141,6 +172,42 @@ async fn bursty_lossy_rtp_plays_out_paced_and_concealed() -> Result<()> {
         bunched <= 3,
         "{bunched} of {} frames came out bunched, not paced",
         out.len()
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sender_going_quiet_after_comfort_noise_is_not_concealed() -> Result<()> {
+    // concealed frames after the sender stops at `stop`, with or without
+    // a comfort noise packet first
+    async fn concealed_after_stop(comfort_noise: bool) -> Result<usize> {
+        let (_track, port, rx) = playout_track().await?;
+        let collector = collect(rx);
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        let remote = format!("127.0.0.1:{port}");
+        let mut encoder = PcmaEncoder::new();
+        for seq in 0..10u16 {
+            socket
+                .send_to(&tone_packet(&mut encoder, seq), &remote)
+                .await?;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        if comfort_noise {
+            socket.send_to(&comfort_noise_packet(10), &remote).await?;
+        }
+        let out = collector.await?;
+        let real: Vec<u16> = out.iter().filter_map(|o| o.1).collect();
+        assert_eq!(real, (0..10).collect::<Vec<_>>());
+        Ok(out.iter().filter(|o| o.1.is_none()).count())
+    }
+    assert!(
+        concealed_after_stop(false).await? > 0,
+        "a stream just stopping is concealed (it may be late)"
+    );
+    assert_eq!(
+        concealed_after_stop(true).await?,
+        0,
+        "silence after comfort noise was concealed as loss"
     );
     Ok(())
 }

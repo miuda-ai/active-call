@@ -13,6 +13,11 @@
 //! conceals it without giving up on it, and rebuffers after
 //! `max_conceal_frames` of that. Each such underrun leaves one more frame of
 //! delay behind, which `max_frames` and the drift trim win back.
+//!
+//! A sender in silence suppression (VAD on a softphone, Opus DTX) stops
+//! sending, or sends only comfort noise, until speech resumes. The owner
+//! calls [`PlayoutBuffer::pause`] after a frame saying so, and the buffer
+//! rebuffers instead of concealing the silence as loss.
 
 use std::collections::BTreeMap;
 
@@ -65,6 +70,8 @@ pub struct PlayoutStats {
     /// Dropped to keep the delay down.
     pub dropped: u64,
     pub resets: u64,
+    /// Times the sender went quiet (see [`PlayoutBuffer::pause`]).
+    pub pauses: u64,
 }
 
 /// A sequence jump this large (about 2 s of 20 ms frames) is a new stream
@@ -76,6 +83,9 @@ pub struct PlayoutBuffer<T> {
     frames: BTreeMap<u64, T>,
     /// Extended sequence number of the next frame to play, while playing.
     next: Option<u64>,
+    /// Frames numbered below this are late: their slot was played, lost or
+    /// dropped. Kept through rebuffering, unlike `next`.
+    floor: Option<u64>,
     /// Extended form of the last sequence number seen, to unwrap the next.
     last_seq: Option<u64>,
     /// The sender's SSRC, when known.
@@ -91,6 +101,7 @@ impl<T> PlayoutBuffer<T> {
             config,
             frames: BTreeMap::new(),
             next: None,
+            floor: None,
             last_seq: None,
             source: None,
             concealed_run: 0,
@@ -125,6 +136,7 @@ impl<T> PlayoutBuffer<T> {
     fn reset(&mut self) {
         self.frames.clear();
         self.next = None;
+        self.floor = None;
         self.last_seq = None;
         self.concealed_run = 0;
         self.above_target_ticks = 0;
@@ -154,7 +166,7 @@ impl<T> PlayoutBuffer<T> {
         if self.last_seq.is_none_or(|last| ext > last) {
             self.last_seq = Some(ext);
         }
-        if self.next.is_some_and(|next| ext < next) {
+        if self.floor.is_some_and(|floor| ext < floor) {
             self.stats.late += 1;
             return;
         }
@@ -171,9 +183,22 @@ impl<T> PlayoutBuffer<T> {
     fn drop_oldest(&mut self) {
         if let Some((seq, _)) = self.frames.pop_first() {
             self.stats.dropped += 1;
+            self.floor = Some(seq + 1);
             if self.next.is_some() {
                 self.next = Some(seq + 1);
             }
+        }
+    }
+
+    /// The frame just played said the sender went quiet (comfort noise, a
+    /// DTX or SID frame): what's missing after it is silence, not loss.
+    /// Playout stops without concealing and restarts, rebuffered, when the
+    /// sender resumes. Later frames already buffered play on as usual.
+    pub fn pause(&mut self) {
+        if self.next.is_some() && self.frames.is_empty() {
+            self.next = None;
+            self.concealed_run = 0;
+            self.stats.pauses += 1;
         }
     }
 
@@ -215,6 +240,7 @@ impl<T> PlayoutBuffer<T> {
 
         if let Some(frame) = self.frames.remove(&next) {
             self.next = Some(next + 1);
+            self.floor = Some(next + 1);
             self.concealed_run = 0;
             self.stats.played += 1;
             return Playout::Frame(frame);
@@ -222,6 +248,7 @@ impl<T> PlayoutBuffer<T> {
         if !self.frames.is_empty() {
             // later frames are here, so this one is lost
             self.next = Some(next + 1);
+            self.floor = Some(next + 1);
             self.concealed_run += 1;
             self.stats.lost += 1;
             return Playout::Lost;
@@ -229,6 +256,7 @@ impl<T> PlayoutBuffer<T> {
         if self.concealed_run < self.config.max_conceal_frames {
             // nothing buffered: the frame may only be late, keep its slot
             self.next = Some(next);
+            self.floor = Some(next);
             self.concealed_run += 1;
             self.stats.underruns += 1;
             return Playout::Lost;
@@ -342,6 +370,53 @@ mod tests {
         assert_eq!(buf.tick(), Idle);
         buf.push(4, 4);
         assert_eq!(drain(&mut buf, 2), vec![Frame(3), Frame(4)]);
+    }
+
+    #[test]
+    fn pause_stops_playout_without_concealing() {
+        let mut buf = buffer();
+        buf.push(1, 1);
+        buf.push(2, 2);
+        assert_eq!(drain(&mut buf, 2), vec![Frame(1), Frame(2)]);
+        // 2 said the sender went quiet
+        buf.pause();
+        assert_eq!(drain(&mut buf, 3), vec![Idle, Idle, Idle]);
+        assert_eq!(buf.stats().underruns, 0);
+        assert_eq!(buf.stats().pauses, 1);
+        // a frame from before the pause, arriving late, is still late
+        buf.push(0, 0);
+        assert_eq!(buf.stats().late, 1);
+        // the sender resumes: rebuffered, then played in order
+        buf.push(3, 3);
+        assert_eq!(buf.tick(), Idle);
+        buf.push(4, 4);
+        assert_eq!(drain(&mut buf, 2), vec![Frame(3), Frame(4)]);
+    }
+
+    #[test]
+    fn pause_with_frames_still_buffered_plays_them() {
+        let mut buf = buffer();
+        for seq in [1, 2, 4] {
+            buf.push(seq, seq);
+        }
+        assert_eq!(buf.tick(), Frame(1));
+        buf.pause();
+        assert_eq!(drain(&mut buf, 3), vec![Frame(2), Lost, Frame(4)]);
+        assert_eq!(buf.stats().pauses, 0);
+    }
+
+    #[test]
+    fn frame_late_for_a_rebuffered_slot_is_dropped() {
+        let mut buf = buffer();
+        buf.push(1, 1);
+        buf.push(2, 2);
+        drain(&mut buf, 2 + 5 + 1);
+        // rebuffering, with slot 3 kept: a late 3 is still played
+        buf.push(3, 3);
+        buf.push(4, 4);
+        assert_eq!(drain(&mut buf, 2), vec![Frame(3), Frame(4)]);
+        buf.push(2, 2);
+        assert_eq!(buf.stats().late, 1);
     }
 
     #[test]

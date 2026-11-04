@@ -290,9 +290,20 @@ impl Drop for LoggedPlayout {
             duplicates = stats.duplicates,
             dropped = stats.dropped,
             resets = stats.resets,
+            pauses = stats.pauses,
             "RtcTrack playout stopped"
         );
     }
+}
+
+/// A frame saying the sender went quiet: comfort noise (RFC 3389, static
+/// payload type 13), or a codec's own silence frame: Opus DTX (1 byte),
+/// G.729 Annex B SID (2 bytes). A sender in silence suppression sends
+/// nothing, or only these, until speech resumes, so the frames missing
+/// after one are silence rather than loss. No audio frame is that short,
+/// nor is telephone-event (4 bytes per event).
+fn is_silence_marker(frame: &RtcAudioFrame) -> bool {
+    frame.payload_type == Some(13) || frame.data.len() <= 2
 }
 
 impl RtcTrack {
@@ -848,7 +859,12 @@ impl RtcTrack {
                 _ = ticker.tick() => {
                     let out = match buffer.tick() {
                         Playout::Idle => continue,
-                        Playout::Frame(frame) => Inbound::Frame(frame),
+                        Playout::Frame(frame) => {
+                            if is_silence_marker(&frame) {
+                                buffer.pause();
+                            }
+                            Inbound::Frame(frame)
+                        }
                         Playout::Lost => Inbound::Lost {
                             ptime,
                             next: buffer

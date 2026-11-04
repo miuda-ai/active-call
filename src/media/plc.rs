@@ -10,8 +10,9 @@
 //! drops by 20% per 10 ms and reaches silence 60 ms in. When real frames
 //! resume, the first one is crossfaded with the continued synthesis.
 //!
-//! Codec independent: it works on whatever PCM the decoder produced, so it
-//! covers G.711 and G.722, which have no concealment of their own.
+//! Codec independent: it works on whatever PCM the decoder produced. The
+//! decoders conceal first where they can (see `TrackCodec::conceal`); this
+//! covers the rest, such as G.729, and audio that never went through one.
 
 use crate::media::PcmBuf;
 
@@ -25,7 +26,19 @@ const FULL_LEVEL_MS: u32 = 10;
 /// Fade per 10 ms after `FULL_LEVEL_MS`; reaches silence at 60 ms.
 const FADE_PER_10MS: f32 = 0.2;
 /// Crossfade into the first real frame after a loss.
-const RECOVER_MS: u32 = 4;
+pub(crate) const RECOVER_MS: u32 = 4;
+
+/// Level of concealed audio `t` samples into a loss at `sample_rate`:
+/// full for 10 ms, then fading to silence at 60 ms.
+pub(crate) fn fade_gain(t: usize, sample_rate: u32) -> f32 {
+    let full = (sample_rate * FULL_LEVEL_MS / 1000) as usize;
+    let per_10ms = ((sample_rate / 100) as usize).max(1);
+    if t < full {
+        1.0
+    } else {
+        (1.0 - FADE_PER_10MS * (t - full) as f32 / per_10ms as f32).max(0.0)
+    }
+}
 
 pub struct Concealer {
     sample_rate: u32,
@@ -100,16 +113,8 @@ impl Concealer {
             self.start_period();
         }
         let mut out = self.synthesize(self.frame_len);
-        let full = self.ms(FULL_LEVEL_MS);
-        let per_10ms = self.ms(10).max(1);
         for (i, s) in out.iter_mut().enumerate() {
-            let t = self.concealed + i;
-            let gain = if t < full {
-                1.0
-            } else {
-                (1.0 - FADE_PER_10MS * (t - full) as f32 / per_10ms as f32).max(0.0)
-            };
-            *s = (*s as f32 * gain) as i16;
+            *s = (*s as f32 * fade_gain(self.concealed + i, self.sample_rate)) as i16;
         }
         self.concealed += out.len();
         self.remember(&out);

@@ -1,4 +1,4 @@
-use crate::{media::AudioFrame, media::PcmBuf, media::Samples};
+use crate::{media::AudioFrame, media::PcmBuf, media::Samples, media::plc};
 use audio_codec::{
     BoxedResampler, CodecType, Decoder, Encoder, bytes_to_samples,
     g722::{G722Decoder, G722Encoder},
@@ -43,6 +43,10 @@ pub struct TrackCodec {
     concealment: bool,
     /// Payload type of the last packet decoded, whose decoder conceals.
     last_payload_type: Option<u8>,
+    /// Samples per channel Opus has concealed in the current loss; 0 when
+    /// not concealing. Opus's concealment doesn't fade on its own (it holds
+    /// the level of the last audio), so it's faded here like the others.
+    opus_concealed: usize,
 }
 
 impl Clone for TrackCodec {
@@ -85,6 +89,7 @@ impl TrackCodec {
             payload_type_map,
             concealment: false,
             last_payload_type: None,
+            opus_concealed: 0,
         }
     }
 
@@ -199,7 +204,7 @@ impl TrackCodec {
             .map(|(_, p)| p);
         let used_next = next.is_some();
         let decoder = self.decoder(codec)?;
-        let pcm = match next {
+        let mut pcm = match next {
             Some(next) => decoder.recover(next, samples),
             None => decoder.conceal(samples),
         };
@@ -207,7 +212,49 @@ impl TrackCodec {
             return None;
         }
         let (rate, channels) = Self::native_format(codec, pcm.len());
+        if codec == CodecType::Opus {
+            if used_next {
+                // rebuilt from the sender's own data: real audio
+                self.opus_resume(&mut pcm, channels);
+            } else {
+                self.opus_fade(&mut pcm, channels);
+            }
+        }
         Some((rate, channels, pcm, used_next))
+    }
+
+    /// Fades Opus concealment like G.711 Appendix I (see `media::plc`):
+    /// full level for 10 ms, silence at 60 ms.
+    fn opus_fade(&mut self, pcm: &mut [i16], channels: u16) {
+        let channels = channels.max(1) as usize;
+        for (i, frame) in pcm.chunks_mut(channels).enumerate() {
+            let gain = plc::fade_gain(self.opus_concealed + i, 48000);
+            for s in frame {
+                *s = (*s as f32 * gain) as i16;
+            }
+        }
+        self.opus_concealed += pcm.len() / channels;
+    }
+
+    /// Ends an Opus loss on real audio, ramping it up from where the fade
+    /// had got to.
+    fn opus_resume(&mut self, pcm: &mut [i16], channels: u16) {
+        let from = match self.opus_concealed {
+            0 => return,
+            t => plc::fade_gain(t, 48000),
+        };
+        self.opus_concealed = 0;
+        if from >= 1.0 {
+            return;
+        }
+        let channels = channels.max(1) as usize;
+        let len = (48000 * plc::RECOVER_MS / 1000) as usize;
+        for (i, frame) in pcm.chunks_mut(channels).take(len).enumerate() {
+            let gain = from + (1.0 - from) * (i + 1) as f32 / (len + 1) as f32;
+            for s in frame {
+                *s = (*s as f32 * gain) as i16;
+            }
+        }
     }
 
     pub fn set_payload_type(&mut self, pt: u8, codec: CodecType) {
@@ -230,7 +277,7 @@ impl TrackCodec {
     /// pipeline rate is the caller's responsibility (see ProcessorChain).
     pub fn decode(&mut self, payload_type: u8, payload: &[u8]) -> (u32, u16, PcmBuf) {
         let codec = self.codec_for_pt(payload_type);
-        let pcm = match self.decoder(codec) {
+        let mut pcm = match self.decoder(codec) {
             Some(decoder) => {
                 let pcm = decoder.decode(payload);
                 self.last_payload_type = Some(payload_type);
@@ -239,6 +286,14 @@ impl TrackCodec {
             None => bytes_to_samples(payload),
         };
         let (in_rate, channels) = Self::native_format(codec, pcm.len());
+        if codec == CodecType::Opus && self.concealment {
+            if payload.len() <= 1 {
+                // a DTX frame, which the decoder conceals
+                self.opus_fade(&mut pcm, channels);
+            } else {
+                self.opus_resume(&mut pcm, channels);
+            }
+        }
         (in_rate, channels, pcm)
     }
 
@@ -461,6 +516,68 @@ mod conceal_tests {
         // a next packet of another payload type is no use
         let (_, _, _, used_next) = recovering.conceal(PTIME, Some((0, &packets[1]))).unwrap();
         assert!(!used_next);
+    }
+
+    fn rms(pcm: &[i16]) -> f64 {
+        (pcm.iter().map(|s| (*s as f64).powi(2)).sum::<f64>() / pcm.len() as f64).sqrt()
+    }
+
+    #[test]
+    fn opus_concealment_fades_to_silence_and_ramps_back() {
+        let mut enc = OpusEncoder::new(48000, 1);
+        let packets: Vec<Vec<u8>> = voice(48000, 20).iter().map(|f| enc.encode(f)).collect();
+        let mut codec = TrackCodec::new();
+        codec.enable_concealment();
+        for p in &packets[..10] {
+            codec.decode(111, p);
+        }
+        // opus-rs alone holds the level of the speech it continues
+        let levels: Vec<f64> = (0..5)
+            .map(|_| rms(&codec.conceal(PTIME, None).unwrap().2))
+            .collect();
+        assert!(
+            levels[0] > 300.0,
+            "first frame of a loss is audible: {levels:?}"
+        );
+        assert!(levels[1] < levels[0] * 0.8, "not fading: {levels:?}");
+        assert!(
+            levels[3..].iter().all(|l| *l == 0.0),
+            "not silent at 60 ms: {levels:?}"
+        );
+        // speech resumes from silence without a step: ramped in over 4 ms,
+        // then as decoded
+        let mut unfaded = TrackCodec::new();
+        for p in &packets[..10] {
+            unfaded.decode(111, p);
+        }
+        for _ in 0..5 {
+            unfaded.decoder(CodecType::Opus).unwrap().conceal(960);
+        }
+        let (_, _, expected) = unfaded.decode(111, &packets[10]);
+        let (_, _, resumed) = codec.decode(111, &packets[10]);
+        assert!(resumed[0].abs() <= expected[0].abs() / 100 + 1);
+        assert_eq!(resumed[192..], expected[192..]);
+        // and the next loss starts at full level again
+        let (_, _, _, _) = codec.conceal(PTIME, None).unwrap();
+        assert_eq!(codec.opus_concealed, 960);
+    }
+
+    #[test]
+    fn opus_dtx_frames_fade_like_concealment() {
+        let mut enc = OpusEncoder::new(48000, 1);
+        let packets: Vec<Vec<u8>> = voice(48000, 10).iter().map(|f| enc.encode(f)).collect();
+        let mut codec = TrackCodec::new();
+        codec.enable_concealment();
+        for p in &packets {
+            codec.decode(111, p);
+        }
+        // a DTX frame is the TOC byte alone
+        let dtx = [packets[0][0]];
+        let levels: Vec<f64> = (0..5).map(|_| rms(&codec.decode(111, &dtx).2)).collect();
+        assert!(
+            levels[3..].iter().all(|l| *l == 0.0),
+            "DTX not faded: {levels:?}"
+        );
     }
 }
 
