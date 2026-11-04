@@ -237,8 +237,7 @@ struct LossStats {
     recovered: u64,
     /// Concealed by the codec's decoder.
     concealed: u64,
-    /// Left as gaps: nothing decoded yet, a codec without concealment
-    /// (G.729), or RTP passed through undecoded.
+    /// Left as gaps: nothing decoded yet, or RTP passed through undecoded.
     unconcealed: u64,
 }
 

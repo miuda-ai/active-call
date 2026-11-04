@@ -415,6 +415,22 @@ mod conceal_tests {
     }
 
     #[test]
+    fn g729_conceals_in_its_native_format() {
+        let mut codec = TrackCodec::new();
+        codec.enable_concealment();
+        let mut enc = G729Encoder::new();
+        for frame in voice(8000, 6) {
+            codec.decode(18, &enc.encode(&frame));
+        }
+        let (rate, channels, pcm, used_next) = codec.conceal(PTIME, None).unwrap();
+        assert_eq!(
+            (rate, channels, pcm.len(), used_next),
+            (8000, 1, 160, false)
+        );
+        assert!(pcm.iter().any(|s| *s != 0));
+    }
+
+    #[test]
     fn opus_rebuilds_a_lost_packet_from_the_next_ones_fec() {
         let mut enc = OpusEncoder::new(48000, 1);
         enc.set_bitrate(32000);

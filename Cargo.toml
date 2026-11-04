@@ -143,10 +143,10 @@ harness = false
 
 [patch.crates-io]
 # packet loss concealment and Opus FEC recovery (restsend/audio-codec#6,
-# merged), Opus concealment faded through long losses (restsend/audio-codec#7)
-# and CodecType::is_silence_frame (restsend/audio-codec#8); drop once
-# audio-codec > 0.4.13 is out with them
-audio-codec = { git = "https://github.com/Object905/audio-codec.git", rev = "c427f3deb87e1bcdc933d8259a37c24e98266934" }
+# merged), Opus concealment faded through long losses (restsend/audio-codec#7),
+# CodecType::is_silence_frame (restsend/audio-codec#8) and G.729 concealment
+# (restsend/audio-codec#9); drop once audio-codec > 0.4.13 is out with them
+audio-codec = { git = "https://github.com/Object905/audio-codec.git", rev = "312729f048dac7aece7d8ce945e52062358fdbe7" }
 # JitterBuffer::tick, clocked playout (restsend/rustrtc#85); drop once
 # rustrtc > 0.6.0 is out with it
 rustrtc = { git = "https://github.com/Object905/rustrtc.git", rev = "20911e7bc52247593bc479252193f323d4b439d5" }
