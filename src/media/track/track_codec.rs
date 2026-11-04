@@ -1,4 +1,4 @@
-use crate::{media::AudioFrame, media::PcmBuf, media::Samples, media::plc};
+use crate::{media::AudioFrame, media::PcmBuf, media::Samples};
 use audio_codec::{
     BoxedResampler, CodecType, Decoder, Encoder, bytes_to_samples,
     g722::{G722Decoder, G722Encoder},
@@ -47,6 +47,21 @@ pub struct TrackCodec {
     /// not concealing. Opus's concealment doesn't fade on its own (it holds
     /// the level of the last audio), so it's faded here like the others.
     opus_concealed: usize,
+}
+
+/// Fade of Opus concealment, as G.711 Appendix I fades its own: full level
+/// for 10 ms, then 20% down per 10 ms, silent at 60 ms.
+const FADE_FULL_SAMPLES: usize = 480;
+const FADE_PER_10MS_SAMPLES: usize = 480;
+/// Ramp into the first real frame after a loss, 4 ms.
+const RESUME_SAMPLES: usize = 192;
+
+/// Level of Opus concealment `t` samples (per channel, 48 kHz) into a loss.
+fn fade_gain(t: usize) -> f32 {
+    match t.checked_sub(FADE_FULL_SAMPLES) {
+        None => 1.0,
+        Some(t) => (1.0 - 0.2 * t as f32 / FADE_PER_10MS_SAMPLES as f32).max(0.0),
+    }
 }
 
 impl Clone for TrackCodec {
@@ -223,12 +238,11 @@ impl TrackCodec {
         Some((rate, channels, pcm, used_next))
     }
 
-    /// Fades Opus concealment like G.711 Appendix I (see `media::plc`):
-    /// full level for 10 ms, silence at 60 ms.
+    /// Fades Opus concealment (see [`fade_gain`]).
     fn opus_fade(&mut self, pcm: &mut [i16], channels: u16) {
         let channels = channels.max(1) as usize;
         for (i, frame) in pcm.chunks_mut(channels).enumerate() {
-            let gain = plc::fade_gain(self.opus_concealed + i, 48000);
+            let gain = fade_gain(self.opus_concealed + i);
             for s in frame {
                 *s = (*s as f32 * gain) as i16;
             }
@@ -241,14 +255,14 @@ impl TrackCodec {
     fn opus_resume(&mut self, pcm: &mut [i16], channels: u16) {
         let from = match self.opus_concealed {
             0 => return,
-            t => plc::fade_gain(t, 48000),
+            t => fade_gain(t),
         };
         self.opus_concealed = 0;
         if from >= 1.0 {
             return;
         }
         let channels = channels.max(1) as usize;
-        let len = (48000 * plc::RECOVER_MS / 1000) as usize;
+        let len = RESUME_SAMPLES;
         for (i, frame) in pcm.chunks_mut(channels).take(len).enumerate() {
             let gain = from + (1.0 - from) * (i + 1) as f32 / (len + 1) as f32;
             for s in frame {

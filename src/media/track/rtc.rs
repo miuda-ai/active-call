@@ -5,7 +5,6 @@ use crate::{
     media::AudioFrame,
     media::{
         jitter::{Playout, PlayoutBuffer, PlayoutConfig},
-        plc::Concealer,
         processor::ProcessorChain,
         track::{Track, TrackConfig, TrackId, TrackPacketSender},
     },
@@ -225,10 +224,9 @@ struct LossStats {
     /// where the sender coded any.
     recovered: u64,
     /// Concealed by the codec's decoder.
-    codec_concealed: u64,
-    /// Concealed from the decoded audio (`media::plc`).
     concealed: u64,
-    /// Left as gaps: nothing decoded to conceal from.
+    /// Left as gaps: nothing decoded yet, a codec without concealment
+    /// (G.729), or RTP passed through undecoded.
     unconcealed: u64,
 }
 
@@ -237,7 +235,6 @@ impl LossStats {
         Self {
             track_id,
             recovered: 0,
-            codec_concealed: 0,
             concealed: 0,
             unconcealed: 0,
         }
@@ -249,7 +246,6 @@ impl Drop for LossStats {
         info!(
             track_id=%self.track_id,
             recovered = self.recovered,
-            codec_concealed = self.codec_concealed,
             concealed = self.concealed,
             unconcealed = self.unconcealed,
             "RtcTrack processing worker stopped"
@@ -888,7 +884,6 @@ impl RtcTrack {
         default_payload_type: u8,
     ) {
         info!(track_id=%track_id, "RtcTrack processing worker started");
-        let mut concealer = Concealer::new();
         let mut losses = LossStats::new(track_id.clone());
         while let Some(item) = rx.recv().await {
             let frame = match item {
@@ -896,7 +891,6 @@ impl RtcTrack {
                 Inbound::Lost { ptime, next } => {
                     let next = next.map(|(pt, data)| (pt.unwrap_or(default_payload_type), data));
                     Self::conceal_frame(
-                        &mut concealer,
                         &mut processor_chain,
                         &track_id,
                         &packet_sender,
@@ -914,7 +908,6 @@ impl RtcTrack {
                 &packet_sender,
                 &mut processor_chain,
                 default_payload_type,
-                &mut concealer,
             ))
             .catch_unwind()
             .await;
@@ -934,12 +927,10 @@ impl RtcTrack {
     }
 
     /// Plays a frame in place of a lost one: rebuilt from the next packet's
-    /// in-band FEC, or concealed by the codec's decoder, run through the
-    /// chain like a decoded packet; else concealed from the decoded audio.
-    /// Only possible once the chain decodes this track to PCM; undecoded
-    /// RTP passes through with the gap.
+    /// in-band FEC, or concealed by the codec's decoder, and run through the
+    /// chain like a decoded packet. Only possible once the chain decodes
+    /// this track to PCM; undecoded RTP passes through with the gap.
     async fn conceal_frame(
-        concealer: &mut Concealer,
         processor_chain: &mut ProcessorChain,
         track_id: &TrackId,
         packet_sender: &Arc<Mutex<Option<TrackPacketSender>>>,
@@ -947,51 +938,29 @@ impl RtcTrack {
         next: Option<(u8, Bytes)>,
         losses: &mut LossStats,
     ) {
-        let frame = match processor_chain
+        let Some((sample_rate, channels, samples, used_next)) = processor_chain
             .codec
             .conceal(ptime, next.as_ref().map(|(pt, data)| (*pt, &data[..])))
-        {
-            Some((sample_rate, channels, samples, used_next)) => {
-                if used_next {
-                    losses.recovered += 1;
-                } else {
-                    losses.codec_concealed += 1;
-                }
-                let mut af = AudioFrame {
-                    track_id: track_id.clone(),
-                    samples: crate::media::Samples::PCM { samples },
-                    timestamp: crate::media::get_timestamp(),
-                    sample_rate,
-                    channels,
-                    ..Default::default()
-                };
-                if let Err(e) = processor_chain.process_frame(&mut af) {
-                    debug!(track_id=%track_id, "processor_chain process_frame error: {:?}", e);
-                }
-                if let crate::media::Samples::PCM { samples } = &mut af.samples
-                    && af.channels == 1
-                {
-                    // keeps the fallback's history continuous
-                    concealer.on_frame(samples, af.sample_rate);
-                }
-                af
-            }
-            None => {
-                let Some((samples, sample_rate)) = concealer.conceal() else {
-                    losses.unconcealed += 1;
-                    return;
-                };
-                losses.concealed += 1;
-                AudioFrame {
-                    track_id: track_id.clone(),
-                    samples: crate::media::Samples::PCM { samples },
-                    timestamp: crate::media::get_timestamp(),
-                    sample_rate,
-                    channels: 1,
-                    ..Default::default()
-                }
-            }
+        else {
+            losses.unconcealed += 1;
+            return;
         };
+        if used_next {
+            losses.recovered += 1;
+        } else {
+            losses.concealed += 1;
+        }
+        let mut frame = AudioFrame {
+            track_id: track_id.clone(),
+            samples: crate::media::Samples::PCM { samples },
+            timestamp: crate::media::get_timestamp(),
+            sample_rate,
+            channels,
+            ..Default::default()
+        };
+        if let Err(e) = processor_chain.process_frame(&mut frame) {
+            debug!(track_id=%track_id, "processor_chain process_frame error: {:?}", e);
+        }
         let packet_sender = packet_sender.lock().await;
         if let Some(sender) = packet_sender.as_ref() {
             sender.send(frame).ok();
@@ -1032,7 +1001,6 @@ impl RtcTrack {
         packet_sender: &Arc<Mutex<Option<TrackPacketSender>>>,
         processor_chain: &mut ProcessorChain,
         default_payload_type: u8,
-        concealer: &mut Concealer,
     ) {
         let packet_sender = packet_sender.lock().await;
         if let Some(sender) = packet_sender.as_ref() {
@@ -1060,12 +1028,6 @@ impl RtcTrack {
             if let Err(e) = processor_chain.process_frame(&mut af) {
                 debug!(track_id=%track_id, "processor_chain process_frame error: {:?}", e);
             }
-            if let crate::media::Samples::PCM { samples } = &mut af.samples
-                && af.channels == 1
-            {
-                concealer.on_frame(samples, af.sample_rate);
-            }
-
             sender.send(af).ok();
         }
     }

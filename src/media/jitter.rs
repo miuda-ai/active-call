@@ -5,7 +5,7 @@
 //! reordered packet became a hole. This buffer sits on a playout clock
 //! instead: the owner calls [`PlayoutBuffer::tick`] once per packet time and
 //! gets the next frame in sequence order, or [`Playout::Lost`] for a frame
-//! that is missing, so the gap can be concealed (see [`super::plc`]).
+//! that is missing, so the gap can be concealed (see `TrackCodec::conceal`).
 //!
 //! Playout starts once `target_frames` are buffered, which is the delay that
 //! absorbs jitter. A frame missing while later ones are already buffered is

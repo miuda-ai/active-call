@@ -12,7 +12,6 @@ pub mod jitter;
 pub mod loader;
 pub mod monitor;
 pub mod negotiate;
-pub mod plc;
 pub mod processor;
 pub mod realtime_processor;
 pub mod recorder;
