@@ -190,6 +190,33 @@ mod tests {
     use super::Command;
 
     #[test]
+    fn diagnostic_commands_omit_sip_password() {
+        assert!(format!("{:?}", crate::SipOption::default()).contains("password: None"));
+        let sip = serde_json::json!({"username": "alice", "password": "dummy-sip-secret"});
+        for value in [
+            serde_json::json!({"command": "invite", "option": {"sip": sip}}),
+            serde_json::json!({"command": "accept", "option": {"sip": sip}}),
+            serde_json::json!({"command": "refer", "caller": "a", "callee": "b", "options": {"sip": sip}}),
+        ] {
+            let command: Command = serde_json::from_value(value).unwrap();
+            let debug = format!("{command:?}");
+            assert!(debug.contains("alice"));
+            assert!(debug.contains(r#"password: Some("***")"#));
+            assert!(!debug.contains("dummy-sip-secret"));
+            let serialized = serde_json::to_value(&command).unwrap();
+            let sip = match command {
+                Command::Invite { option } | Command::Accept { option } => option.sip.unwrap(),
+                Command::Refer { options, .. } => options.unwrap().sip.unwrap(),
+                _ => unreachable!(),
+            };
+            assert_eq!(sip.password.as_deref(), Some("dummy-sip-secret"));
+            let options = serialized.get("option").or_else(|| serialized.get("options")).unwrap();
+            assert!(options["sip"].get("password").is_none());
+            assert_eq!(options["sip"]["username"], "alice");
+        }
+    }
+
+    #[test]
     fn message_command_deserializes_body() {
         let command: Command = serde_json::from_value(serde_json::json!({
             "command": "message",

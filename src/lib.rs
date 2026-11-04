@@ -34,10 +34,11 @@ pub mod synthesis;
 pub mod transcription;
 pub mod useragent;
 
-#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+#[derive(Deserialize, Serialize, Default, Clone)]
 #[serde(default)]
 pub struct SipOption {
     pub username: Option<String>,
+    #[serde(skip_serializing)]
     pub password: Option<String>,
     pub realm: Option<String>,
     pub contact: Option<String>,
@@ -45,6 +46,21 @@ pub struct SipOption {
     pub hangup_headers: Option<HashMap<String, String>>,
     pub extract_headers: Option<Vec<String>>,
     pub enable_srtp: Option<bool>,
+}
+
+impl std::fmt::Debug for SipOption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SipOption")
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "***"))
+            .field("realm", &self.realm)
+            .field("contact", &self.contact)
+            .field("headers", &self.headers)
+            .field("hangup_headers", &self.hangup_headers)
+            .field("extract_headers", &self.extract_headers)
+            .field("enable_srtp", &self.enable_srtp)
+            .finish()
+    }
 }
 
 #[skip_serializing_none]
