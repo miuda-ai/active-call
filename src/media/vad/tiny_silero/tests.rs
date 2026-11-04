@@ -409,3 +409,57 @@ fn streaming_in_odd_pieces_matches_one_shot() {
         assert!((a - b).abs() < 1e-6, "{a} != {b}");
     }
 }
+
+/// Notes of 300 ms with two harmonics, like hold music: no speech, but enough to
+/// lock the model's recurrent state into hearing none afterwards.
+fn tones(secs: usize, amp: f32) -> Vec<i16> {
+    let mut seed = 7u32;
+    let mut f0 = 220.0f32;
+    (0..16000 * secs)
+        .map(|i| {
+            if i % 4800 == 0 {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                f0 = 200.0 + (seed >> 20) as f32 % 800.0;
+            }
+            let w = 2.0 * std::f32::consts::PI * f0 * i as f32 / 16000.0;
+            (amp * (w.sin() + 0.5 * (2.0 * w).sin() + 0.25 * (3.0 * w).sin()) / 1.75) as i16
+        })
+        .collect()
+}
+
+fn voiced(p: &[f32]) -> usize {
+    p.iter().filter(|&&p| p > 0.5).count()
+}
+
+#[test]
+fn speech_is_heard_again_after_hold_music() {
+    // Without the reset, none of it is heard after the tones, silence or not.
+    for (name, pcm) in clips() {
+        let fresh = voiced(&probs(&pcm));
+        let mut vad = new_vad();
+        vad.process_samples(&tones(120, 3000.0));
+        vad.process_samples(&vec![0i16; 12 * 16000]);
+        let after = voiced(&vad.process_samples(&pcm));
+        assert!(
+            2 * after >= fresh,
+            "{name}: {after} voiced chunks after the tones, {fresh} from a fresh state"
+        );
+    }
+}
+
+#[test]
+fn reset_state_clears_the_recurrent_state() {
+    let mut vad = new_vad();
+    vad.process_samples(&tones(5, 3000.0));
+    assert!(vad.session.c.iter().flatten().any(|&x| x != 0.0));
+    vad.reset_state();
+    assert!(
+        vad.session
+            .h
+            .iter()
+            .chain(&vad.session.c)
+            .flatten()
+            .all(|&x| x == 0.0)
+    );
+    assert_eq!(vad.session.quiet_chunks, 0);
+}
