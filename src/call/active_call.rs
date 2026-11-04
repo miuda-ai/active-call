@@ -1658,25 +1658,30 @@ impl ActiveCall {
         Ok(())
     }
 
+    /// Ends a session whose inbound call is gone by the time `command` (an
+    /// answering one) arrives, telling the client with a Reject.
+    async fn reject_no_pending_call(&self, command: &str) -> anyhow::Error {
+        warn!(session_id = self.session_id, command, "no pending call");
+        let reject_event = crate::event::SessionEvent::Reject {
+            track_id: self.session_id.clone(),
+            timestamp: crate::media::get_timestamp(),
+            reason: "no pending call".to_string(),
+            refer: None,
+            code: Some(486),
+        };
+        self.event_sender.send(reject_event).ok();
+        self.hangup_now(Some(CallRecordHangupReason::BySystem))
+            .await;
+        anyhow::anyhow!("no pending call to {command}")
+    }
+
     async fn do_accept(&self, mut option: CallOption) -> Result<()> {
         let has_pending = self.has_pending_invite();
         let ready_to_answer_val = !self.has_ready_to_answer();
 
         if ready_to_answer_val {
             if !has_pending {
-                // emit reject event
-                warn!(session_id = self.session_id, "no pending call to accept");
-                let rejet_event = crate::event::SessionEvent::Reject {
-                    track_id: self.session_id.clone(),
-                    timestamp: crate::media::get_timestamp(),
-                    reason: "no pending call".to_string(),
-                    refer: None,
-                    code: Some(486),
-                };
-                self.event_sender.send(rejet_event).ok();
-                self.hangup_now(Some(CallRecordHangupReason::BySystem))
-                    .await;
-                return Err(anyhow::anyhow!("no pending call to accept"));
+                return Err(self.reject_no_pending_call("accept").await);
             }
             option = self.invite_or_accept(option, "accept".to_string()).await?;
         } else {
@@ -1845,6 +1850,12 @@ impl ActiveCall {
         };
 
         if !self.has_ready_to_answer() {
+            // Without a pending inbound dialog (the caller CANCELed before
+            // this command arrived) invite_or_accept would take the outgoing
+            // path and dial a call with no callee.
+            if !self.has_pending_invite() {
+                return Err(self.reject_no_pending_call("ringing").await);
+            }
             let option = CallOption {
                 recorder,
                 ..Default::default()
