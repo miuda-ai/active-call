@@ -34,7 +34,7 @@ not_vad = []
 
 [dependencies]
 libc = "0.2"
-audio-codec = "0.4.13"
+audio-codec = { version = "0.4.13", features = ["plc"] }
 rustrtc = "0.5.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -140,3 +140,8 @@ criterion = "0.8.2"
 [[bench]]
 name = "silero_vad"
 harness = false
+
+[patch.crates-io]
+# packet loss concealment and Opus FEC recovery (restsend/audio-codec#6),
+# merged but not yet released; drop once audio-codec > 0.4.13 is out
+audio-codec = { git = "https://github.com/restsend/audio-codec.git", rev = "21d80c9d9891c874c9fb81d396ec97b34c9659d0" }
