@@ -289,6 +289,15 @@ impl MediaStream {
         self.monitor_hub.lock().await.clone()
     }
 
+    /// Whether a track that has not ended is registered under `id`.
+    pub async fn has_live_track(&self, id: &TrackId) -> bool {
+        self.tracks
+            .lock()
+            .await
+            .get(id)
+            .is_some_and(|(track, _)| !track.has_ended())
+    }
+
     pub async fn remove_track(&self, id: &TrackId, graceful: bool) {
         let track_entry = { self.tracks.lock().await.remove(id) };
         if let Some((track, _)) = track_entry {

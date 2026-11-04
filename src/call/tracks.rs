@@ -111,8 +111,10 @@ impl ActiveCall {
         }
     }
 
-    /// Apply external/bind addresses from the global config.
+    /// Apply external/bind addresses and the ICE disconnect grace from the
+    /// global config.
     fn rtc_apply_network(&self, rtc_config: &mut RtcTrackConfig) {
+        rtc_config.ice_disconnect_grace = self.app_state.config.ice_disconnect_grace();
         if let Some(ref external_ip) = self.app_state.config.external_ip {
             rtc_config.external_ip = Some(external_ip.clone());
         }

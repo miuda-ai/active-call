@@ -475,6 +475,10 @@ pub struct Config {
     #[serde(default = "default_config_rtp_latching")]
     pub enable_rtp_latching: Option<bool>,
     pub enable_ice_lite: Option<bool>,
+    /// How long a WebRTC connection may stay ICE-disconnected before its media
+    /// is torn down and the call hung up, e.g. "15s". The call carries on if
+    /// ICE recovers within it. Unset or unparsable: rustrtc's default (60s).
+    pub ice_disconnect_grace: Option<String>,
     pub rtp_bind_ip: Option<String>,
     pub tls_port: Option<u16>,
     pub tls_cert_file: Option<String>,
@@ -626,6 +630,7 @@ impl Default for Config {
             enable_rtp_latching: Some(true),
             rtp_bind_ip: None,
             enable_ice_lite: None,
+            ice_disconnect_grace: None,
             tls_port: None,
             tls_cert_file: None,
             tls_key_file: None,
@@ -657,6 +662,13 @@ impl Config {
             &std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("{}: {}", e, path))?,
         )?;
         Ok(config)
+    }
+
+    /// Parsed `ice_disconnect_grace`; None keeps rustrtc's default.
+    pub fn ice_disconnect_grace(&self) -> Option<std::time::Duration> {
+        self.ice_disconnect_grace
+            .as_deref()
+            .and_then(|raw| humantime::parse_duration(raw).ok())
     }
 
     /// Whether out-of-dialog OPTIONS probes should be answered at all.
