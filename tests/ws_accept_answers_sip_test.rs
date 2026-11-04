@@ -38,7 +38,7 @@ struct TestNode {
     webhook_rx: mpsc::Receiver<WebhookPayload>,
 }
 
-async fn spawn_node(sip_port: u16, codecs: Vec<String>) -> TestNode {
+async fn spawn_node(codecs: Vec<String>) -> TestNode {
     // Webhook server that reports the invite payload back to the test.
     let (webhook_tx, webhook_rx) = mpsc::channel::<WebhookPayload>(1);
     let webhook = axum::Router::new().route(
@@ -58,10 +58,9 @@ async fn spawn_node(sip_port: u16, codecs: Vec<String>) -> TestNode {
         axum::serve(webhook_listener, webhook).await.unwrap();
     });
 
-    let port_key = (sip_port % 1000) as u16;
     let config = Config {
         addr: "127.0.0.1".to_string(),
-        udp_port: sip_port,
+        udp_port: 0,
         log_level: Some("debug".to_string()),
         useragent: Some("ActiveCallTest".to_string()),
         handler: Some(InviteHandlerConfig::Webhook {
@@ -71,8 +70,8 @@ async fn spawn_node(sip_port: u16, codecs: Vec<String>) -> TestNode {
             urls: None,
         }),
         accept_timeout: Some("10s".to_string()),
-        rtp_start_port: Some(31000 + port_key * 20),
-        rtp_end_port: Some(31020 + port_key * 20),
+        rtp_start_port: None,
+        rtp_end_port: None,
         media_cache_path: "./target/tmp_media".to_string(),
         codecs: if codecs.is_empty() {
             None
@@ -86,6 +85,7 @@ async fn spawn_node(sip_port: u16, codecs: Vec<String>) -> TestNode {
         .build()
         .await
         .expect("failed to build app state");
+    let sip_port = app.endpoint.get_addrs()[0].addr.port.expect("bound SIP port").value();
     let sip_app = app.clone();
     let http_app = app.clone();
     tokio::spawn(async move {
@@ -411,7 +411,7 @@ async fn ws_accept_answers_pending_sip_dialog() {
         .try_init()
         .ok();
 
-    let mut node = spawn_node(35070, vec![]).await;
+    let mut node = spawn_node(vec![]).await;
     let uac = SipUac::new(format!("127.0.0.1:{}", node.sip_port).parse().unwrap(), 0).await;
     let call_id = "ws-accept-regression@127.0.0.1";
     uac.socket
@@ -452,7 +452,7 @@ async fn ws_accept_bridges_bidirectional_media() {
         .try_init()
         .ok();
 
-    let mut node = spawn_node(35071, vec![]).await;
+    let mut node = spawn_node(vec![]).await;
     let media_port = 41000;
     let uac = SipUac::new(
         format!("127.0.0.1:{}", node.sip_port).parse().unwrap(),
@@ -724,7 +724,7 @@ async fn ws_refer_connects_customer_and_agent_media() {
         .try_init()
         .ok();
 
-    let mut node = spawn_node(35072, vec!["pcmu".to_string(), "pcma".to_string()]).await;
+    let mut node = spawn_node(vec!["pcmu".to_string(), "pcma".to_string()]).await;
     let customer_media_port = 42000;
     let customer = SipUac::new(
         format!("127.0.0.1:{}", node.sip_port).parse().unwrap(),
@@ -934,7 +934,7 @@ async fn incoming_refer_transfers_call_and_notifies_referrer() {
         .try_init()
         .ok();
 
-    let mut node = spawn_node(35073, vec!["pcmu".to_string()]).await;
+    let mut node = spawn_node(vec!["pcmu".to_string()]).await;
     let customer = SipUac::new(
         format!("127.0.0.1:{}", node.sip_port).parse().unwrap(),
         42010,
@@ -1079,7 +1079,7 @@ async fn incoming_refer_failure_notifies_and_keeps_call_alive() {
         .try_init()
         .ok();
 
-    let mut node = spawn_node(35074, vec!["pcmu".to_string()]).await;
+    let mut node = spawn_node(vec!["pcmu".to_string()]).await;
     let customer = SipUac::new(
         format!("127.0.0.1:{}", node.sip_port).parse().unwrap(),
         42011,
@@ -1201,7 +1201,7 @@ async fn ws_cancel_before_first_command_tears_down_attached_call() {
         .try_init()
         .ok();
 
-    let mut node = spawn_node(35075, vec![]).await;
+    let mut node = spawn_node(vec![]).await;
     let uac = SipUac::new(
         format!("127.0.0.1:{}", node.sip_port).parse().unwrap(),
         0,
@@ -1312,7 +1312,7 @@ async fn sip_ringing_after_cancel_rejects_instead_of_dialing() {
         .try_init()
         .ok();
 
-    let mut node = spawn_node(35077, vec![]).await;
+    let mut node = spawn_node(vec![]).await;
     let uac = SipUac::new(format!("127.0.0.1:{}", node.sip_port).parse().unwrap(), 0).await;
     let call_id = "sip-ringing-after-cancel@127.0.0.1";
     let from_tag = "fromtag5";
@@ -1403,7 +1403,7 @@ async fn sip_reject_after_early_media_ringing_sends_final_response() {
         .try_init()
         .ok();
 
-    let mut node = spawn_node(35077, vec![]).await;
+    let mut node = spawn_node(vec![]).await;
     let uac = SipUac::new(format!("127.0.0.1:{}", node.sip_port).parse().unwrap(), 0).await;
     let call_id = "sip-reject-after-ringing@127.0.0.1";
     uac.socket
@@ -1492,7 +1492,7 @@ async fn ws_dtmf_command_sends_rfc4733_event() {
         .try_init()
         .ok();
 
-    let mut node = spawn_node(35076, vec![]).await;
+    let mut node = spawn_node(vec![]).await;
     let uac = SipUac::new(
         format!("127.0.0.1:{}", node.sip_port).parse().unwrap(),
         41006,
