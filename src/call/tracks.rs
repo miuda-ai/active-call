@@ -87,12 +87,11 @@ fn offer_audio_codecs(offer: &str) -> Vec<CodecType> {
                     .filter_map(|pt| pt.parse().ok())
                     .collect();
             }
-        } else if in_audio {
-            if let Some(value) = line.strip_prefix("a=rtpmap:") {
-                if let Ok((pt, codec, ..)) = crate::media::negotiate::parse_rtpmap(value) {
-                    rtpmaps.insert(pt, codec);
-                }
-            }
+        } else if in_audio
+            && let Some(value) = line.strip_prefix("a=rtpmap:")
+            && let Ok((pt, codec, ..)) = crate::media::negotiate::parse_rtpmap(value)
+        {
+            rtpmaps.insert(pt, codec);
         }
     }
 
@@ -103,10 +102,10 @@ fn offer_audio_codecs(offer: &str) -> Vec<CodecType> {
             None if pt < 96 => CodecType::try_from(pt).ok(),
             None => None,
         };
-        if let Some(codec) = codec {
-            if !codecs.contains(&codec) {
-                codecs.push(codec);
-            }
+        if let Some(codec) = codec
+            && !codecs.contains(&codec)
+        {
+            codecs.push(codec);
         }
     }
     codecs
@@ -1233,15 +1232,17 @@ a=sendrecv\r\n";
 
     #[test]
     fn restrict_keeps_configured_order_and_preferred_codec() {
-        let mut rtc_config = RtcTrackConfig::default();
-        rtc_config.codecs = vec![
-            CodecType::G722,
-            CodecType::Opus,
-            CodecType::PCMA,
-            CodecType::PCMU,
-            CodecType::TelephoneEvent,
-        ];
-        rtc_config.preferred_codec = Some(CodecType::G722);
+        let mut rtc_config = RtcTrackConfig {
+            codecs: vec![
+                CodecType::G722,
+                CodecType::Opus,
+                CodecType::PCMA,
+                CodecType::PCMU,
+                CodecType::TelephoneEvent,
+            ],
+            preferred_codec: Some(CodecType::G722),
+            ..Default::default()
+        };
         restrict_codecs_to_offer(&mut rtc_config, VOX_OFFER);
         assert_eq!(
             rtc_config.codecs,
@@ -1258,9 +1259,11 @@ a=sendrecv\r\n";
 
     #[test]
     fn restrict_updates_preferred_codec_when_dropped() {
-        let mut rtc_config = RtcTrackConfig::default();
-        rtc_config.codecs = vec![CodecType::G722, CodecType::PCMA, CodecType::TelephoneEvent];
-        rtc_config.preferred_codec = Some(CodecType::G722);
+        let mut rtc_config = RtcTrackConfig {
+            codecs: vec![CodecType::G722, CodecType::PCMA, CodecType::TelephoneEvent],
+            preferred_codec: Some(CodecType::G722),
+            ..Default::default()
+        };
         restrict_codecs_to_offer(
             &mut rtc_config,
             "m=audio 1 RTP/AVP 8 101\r\na=rtpmap:101 telephone-event/8000\r\n",

@@ -1950,6 +1950,71 @@ a=rtpmap:0 PCMU/8000\r\n"
         m=audio 20000 RTP/AVP 0\r\n\
         a=rtpmap:0 PCMU/8000\r\n";
 
+    fn codecs_track(codecs: Vec<CodecType>) -> RtcTrack {
+        RtcTrack::new(
+            CancellationToken::new(),
+            "codecs".to_string(),
+            TrackConfig::default(),
+            RtcTrackConfig {
+                mode: TransportMode::Rtp,
+                preferred_codec: codecs.first().copied(),
+                codecs,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn answer_formats(answer: &str) -> Vec<String> {
+        answer
+            .lines()
+            .find_map(|l| l.strip_prefix("m=audio "))
+            .map(|m| m.split_whitespace().skip(2).map(String::from).collect())
+            .unwrap_or_default()
+    }
+
+    /// Opus offered under a payload type other than our 111: answer and send
+    /// with the offerer's number, otherwise it drops all our packets.
+    #[tokio::test]
+    async fn answer_uses_offer_dynamic_payload_types() {
+        let offer = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+m=audio 40000 RTP/AVP 114 101 120\r\na=rtpmap:114 opus/48000/2\r\n\
+a=rtpmap:101 telephone-event/8000\r\na=rtpmap:120 telephone-event/48000\r\na=sendrecv\r\n";
+        let mut track = codecs_track(vec![CodecType::Opus, CodecType::TelephoneEvent]);
+        let answer = track.handshake(offer.to_string(), None).await.unwrap();
+
+        // our telephone-event follows the opus clock - /48000 under the offer's 120 (ours is 110)
+        assert_eq!(answer_formats(&answer), vec!["114", "120"]);
+        assert!(answer.contains("a=rtpmap:114 opus/48000/2"));
+        assert!(answer.contains("a=rtpmap:120 telephone-event/48000"));
+        assert!(!answer.contains("telephone-event/8000"));
+        assert_eq!(track.get_payload_type(), 114);
+        assert_eq!(track.telephone_event_payload_type(48000), Some(120));
+    }
+
+    /// Voximplant offer (static payload types without rtpmap): our G722 preference wins.
+    #[tokio::test]
+    async fn answer_prefers_configured_static_codec() {
+        let offer = "v=0\r\no=VIMS 234 1 IN IP4 127.0.0.1\r\ns=VIMS\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+m=audio 40000 RTP/AVP 9 114 0 8 100 96 97 18 101\r\na=rtpmap:114 opus/48000/2\r\n\
+a=rtpmap:100 ilbc/8000\r\na=rtpmap:96 AMR-WB/16000\r\na=rtpmap:97 AMR-WB/16000\r\n\
+a=rtpmap:101 telephone-event/8000\r\na=sendrecv\r\n";
+        let mut track = codecs_track(vec![
+            CodecType::G722,
+            CodecType::Opus,
+            CodecType::PCMA,
+            CodecType::PCMU,
+            CodecType::TelephoneEvent,
+        ]);
+        let answer = track.handshake(offer.to_string(), None).await.unwrap();
+
+        let formats = answer_formats(&answer);
+        assert_eq!(formats.first().map(String::as_str), Some("9"));
+        assert!(formats.contains(&"114".to_string()));
+        assert!(!formats.contains(&"111".to_string()));
+        assert_eq!(track.get_payload_type(), 9);
+        assert_eq!(track.telephone_event_payload_type(8000), Some(101));
+    }
+
     fn rtp_timeout_track(id: &str, rtp_timeout: Option<Duration>) -> RtcTrack {
         RtcTrack::new(
             CancellationToken::new(),
