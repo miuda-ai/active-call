@@ -8,7 +8,6 @@ pub mod denoiser;
 pub mod dtmf;
 pub mod engine;
 pub mod inactivity;
-pub mod jitter;
 pub mod loader;
 pub mod monitor;
 pub mod negotiate;

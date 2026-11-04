@@ -45,6 +45,17 @@ pub struct TrackCodec {
     last_payload_type: Option<u8>,
 }
 
+/// The codec for an RTP payload type in a payload type map (as shared by
+/// [`TrackCodec::payload_type_map`]), falling back to the static payload
+/// type registry.
+pub fn codec_for_pt(map: &RwLock<HashMap<u8, CodecType>>, pt: u8) -> Option<CodecType> {
+    map.read()
+        .unwrap()
+        .get(&pt)
+        .cloned()
+        .or_else(|| CodecType::try_from(pt).ok())
+}
+
 impl Clone for TrackCodec {
     fn clone(&self) -> Self {
         let mut new = Self::new();
@@ -217,12 +228,7 @@ impl TrackCodec {
     /// Look up the codec for a given RTP payload type, consulting the negotiated map first
     /// and falling back to the static payload type registry.
     pub fn get_codec_for_pt(&self, pt: u8) -> Option<CodecType> {
-        self.payload_type_map
-            .read()
-            .unwrap()
-            .get(&pt)
-            .cloned()
-            .or_else(|| CodecType::try_from(pt).ok())
+        codec_for_pt(&self.payload_type_map, pt)
     }
 
     /// Decode an RTP payload into PCM at the codec's native sample rate.

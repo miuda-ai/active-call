@@ -503,7 +503,8 @@ pub struct Config {
     pub ambiance: Option<AmbianceOption>,
     pub ice_servers: Option<Vec<IceServer>>,
     /// Jitter buffer and loss concealment on inbound audio, by leg type;
-    /// see `media::jitter`. A call's `jitter_buffer` option overrides it.
+    /// see rustrtc's `JitterBuffer::tick`. A call's `jitter_buffer` option
+    /// overrides it.
     pub jitter_buffer: Option<JitterBufferConfig>,
     #[serde(default)]
     pub recording: Option<RecordingPolicy>,
