@@ -3,7 +3,7 @@ use crate::media::track::{
     rtc::{RtcTrack, RtcTrackConfig},
 };
 use anyhow::Result;
-use rustrtc::TransportMode;
+use crate::media::track::rtc::TransportMode;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]

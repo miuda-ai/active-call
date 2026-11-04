@@ -9,7 +9,7 @@ use active_call::media::{
 };
 use anyhow::Result;
 use audio_codec::CodecType;
-use rustrtc::TransportMode;
+use active_call::media::track::rtc::TransportMode;
 use tokio_util::sync::CancellationToken;
 use tracing::{Level, info};
 

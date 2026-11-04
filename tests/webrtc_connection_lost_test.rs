@@ -166,7 +166,7 @@ async fn connected_call(
     let (mut ws, _) =
         connect_async(format!("ws://127.0.0.1:{port}/call/webrtc?id={session_id}")).await?;
 
-    let pc = Arc::new(PeerConnection::new(RtcConfiguration::default()));
+    let pc = Arc::new(PeerConnection::new(RtcConfiguration::webrtc()));
     let (_source, track, _) = sample_track(MediaKind::Audio, 100);
     pc.add_track(
         track,

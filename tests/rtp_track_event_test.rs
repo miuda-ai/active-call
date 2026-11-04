@@ -16,7 +16,8 @@ use active_call::media::{
 };
 use anyhow::Result;
 use audio_codec::CodecType;
-use rustrtc::{PeerConnectionEvent, TransportMode, media::MediaStreamTrack};
+use active_call::media::track::rtc::TransportMode;
+use rustrtc::{PeerConnectionEvent, media::MediaStreamTrack};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{Level, debug, info};

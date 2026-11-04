@@ -13,7 +13,7 @@ use crate::media::track::rtc::{RtcTrack, RtcTrackConfig};
 use crate::media::{stream::MediaStreamBuilder, track::Track};
 use anyhow::Result;
 use audio_codec::CodecType;
-use rustrtc::TransportMode;
+use crate::media::track::rtc::TransportMode;
 use std::path::Path;
 use std::sync::Arc;
 use tempfile::tempdir;

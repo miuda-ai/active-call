@@ -17,7 +17,7 @@ use bytes::Bytes;
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use rustrtc::{
     AudioCapability, IceCandidate, IceServer, MediaKind, PeerConnection, PeerConnectionEvent,
-    PeerConnectionState, RtcConfiguration, RtpCodecParameters, SdpType, TransportMode,
+    Connectivity, Keying, PeerConnectionState, RtcConfiguration, RtpCodecParameters, SdpType,
     config::MediaCapabilities,
     media::{
         MediaStreamTrack, SampleStreamSource, frame::AudioFrame as RtcAudioFrame, sample_track,
@@ -35,6 +35,18 @@ use std::{
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
+
+/// How a track reaches its peer: active-call's kinds of leg, set up as
+/// rustrtc's connectivity and keying in [`RtcTrack::create`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportMode {
+    /// A browser or SFU: full ICE, DTLS-SRTP.
+    WebRtc,
+    /// A SIP peer, plain RTP to the address of its SDP (or ICE-lite).
+    Rtp,
+    /// A SIP peer with SDES-SRTP.
+    Srtp,
+}
 
 #[derive(Clone)]
 pub struct RtcTrackConfig {
@@ -370,11 +382,24 @@ impl RtcTrack {
             return Ok(());
         }
 
-        let mut config = RtcConfiguration::default();
+        let mut config = match self.rtc_config.mode {
+            TransportMode::WebRtc => RtcConfiguration::webrtc(),
+            TransportMode::Rtp | TransportMode::Srtp => {
+                let mut config = RtcConfiguration::sip();
+                if self.rtc_config.mode == TransportMode::Srtp {
+                    config.keying = Keying::Sdes;
+                }
+                // ICE-lite is for SIP legs answering a full-ICE peer; WebRTC
+                // legs always run full ICE
+                if self.rtc_config.enable_ice_lite.unwrap_or(false) {
+                    config.connectivity = Connectivity::IceLite;
+                }
+                config
+            }
+        };
         if self.ssrc != 0 {
             config.ssrc_start = self.ssrc;
         }
-        config.transport_mode = self.rtc_config.mode.clone();
 
         if let Some(ice_servers) = &self.rtc_config.ice_servers {
             config.ice_servers = ice_servers.clone();
@@ -396,7 +421,6 @@ impl RtcTrack {
             config.rtp_start_port = Some(rtp_start_port);
             config.rtp_end_port = Some(rtp_end_port);
         }
-        config.enable_ice_lite = self.rtc_config.enable_ice_lite.unwrap_or(false);
         if let Some(grace) = self.rtc_config.ice_disconnect_grace {
             config.ice_disconnect_grace = grace;
         }
@@ -1703,7 +1727,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rtp_mode_handshake_spawns_handler() {
-        use rustrtc::TransportMode;
+        use super::TransportMode;
 
         let track_id = "test-track-sip".to_string();
         let cancel = CancellationToken::new();
@@ -1779,7 +1803,7 @@ a=rtpmap:0 PCMU/8000\r\n"
     #[tokio::test]
     async fn test_webrtc_reoffer_restarts_ice_on_same_peer_connection() {
         let mut rtc_config = RtcTrackConfig::default();
-        rtc_config.mode = rustrtc::TransportMode::WebRtc;
+        rtc_config.mode = TransportMode::WebRtc;
         rtc_config.enable_ice_lite = Some(true);
         rtc_config.codecs = vec![CodecType::PCMU];
 
@@ -2093,7 +2117,7 @@ a=rtpmap:0 PCMU/8000\r\n"
 
     async fn offer_with_codecs(codecs: Vec<CodecType>) -> String {
         let mut rtc_config = RtcTrackConfig::default();
-        rtc_config.mode = rustrtc::TransportMode::Rtp;
+        rtc_config.mode = TransportMode::Rtp;
         rtc_config.codecs = codecs;
         let mut track = RtcTrack::new(
             CancellationToken::new(),
@@ -2180,7 +2204,7 @@ a=rtpmap:0 PCMU/8000\r\n"
     /// returning the track together with its peer connection.
     async fn rtp_track_with_local_offer(id: &str) -> RtcTrack {
         let mut rtc_config = RtcTrackConfig::default();
-        rtc_config.mode = rustrtc::TransportMode::Rtp;
+        rtc_config.mode = TransportMode::Rtp;
         rtc_config.preferred_codec = Some(CodecType::PCMU);
         rtc_config.codecs = vec![CodecType::PCMU, CodecType::PCMA];
 
