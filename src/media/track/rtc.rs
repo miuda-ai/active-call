@@ -1,4 +1,4 @@
-use super::track_codec::{TrackCodec, duration_to_rtp_ticks};
+use super::track_codec::{TrackCodec, codec_for_pt, duration_to_rtp_ticks};
 use crate::{
     callrecord::CallRecordHangupReason,
     event::{EventSender, SessionEvent},
@@ -19,8 +19,8 @@ use rustrtc::{
     PeerConnectionEvent, PeerConnectionState, RtcConfiguration, RtpCodecParameters, SdpType,
     config::MediaCapabilities,
     media::{
-        MediaStreamTrack, SampleStreamSource, frame::AudioFrame as RtcAudioFrame, sample_track,
-        track::SampleStreamTrack,
+        JitterBuffer, MediaSample, MediaStreamTrack, Playout, SampleStreamSource,
+        frame::AudioFrame as RtcAudioFrame, sample_track, track::SampleStreamTrack,
     },
 };
 use std::{
@@ -63,6 +63,11 @@ pub struct RtcTrackConfig {
     /// Emit `RtpTimeout` when no audio arrives for this long once the call
     /// is answered; None or zero disables it.
     pub rtp_timeout: Option<Duration>,
+    /// Play inbound audio out through a jitter buffer (rustrtc's
+    /// `JitterBuffer::tick`), concealing lost frames. None: on for WebRTC,
+    /// whose peers are
+    /// browsers on whatever network, off for plain RTP trunks.
+    pub jitter_buffer: Option<bool>,
     /// How long rustrtc waits for an ICE-disconnected connection to recover
     /// before giving up on it; None keeps rustrtc's default.
     pub ice_disconnect_grace: Option<Duration>,
@@ -82,6 +87,7 @@ impl Default for RtcTrackConfig {
             enable_latching: None,
             enable_ice_lite: None,
             rtp_timeout: None,
+            jitter_buffer: None,
             ice_disconnect_grace: None,
         }
     }
@@ -210,6 +216,113 @@ const DTMF_VOLUME: u8 = 10;
 const DTMF_STALE_TIMEOUT: Duration = Duration::from_millis(1000);
 /// Re-anchor the media clock once wall clock runs this far ahead of it.
 const MEDIA_GAP_THRESHOLD: Duration = Duration::from_millis(30);
+
+/// Inbound audio passed from the receiving worker, through the playout
+/// worker when there is one, to the processing worker.
+enum Inbound {
+    Frame(RtcAudioFrame),
+    /// A frame of `ptime` was due but lost. `next` is the frame right after
+    /// it, when already buffered, to rebuild it from (Opus in-band FEC).
+    Lost {
+        ptime: Duration,
+        next: Option<(Option<u8>, Bytes)>,
+    },
+}
+
+/// How the processing worker filled in lost frames. Logged when dropped:
+/// the worker is dropped with its track rather than run to its end.
+struct LossStats {
+    track_id: TrackId,
+    /// Opus with the next packet at hand: rebuilt from its in-band FEC,
+    /// where the sender coded any.
+    recovered: u64,
+    /// Concealed by the codec's decoder.
+    concealed: u64,
+    /// Left as gaps: nothing decoded yet, or RTP passed through undecoded.
+    unconcealed: u64,
+}
+
+impl LossStats {
+    fn new(track_id: TrackId) -> Self {
+        Self {
+            track_id,
+            recovered: 0,
+            concealed: 0,
+            unconcealed: 0,
+        }
+    }
+}
+
+impl Drop for LossStats {
+    fn drop(&mut self) {
+        info!(
+            track_id=%self.track_id,
+            recovered = self.recovered,
+            concealed = self.concealed,
+            unconcealed = self.unconcealed,
+            "RtcTrack processing worker stopped"
+        );
+    }
+}
+
+/// The playout worker's buffer, its stats logged when dropped (see
+/// [`LossStats`]).
+struct LoggedPlayout {
+    track_id: TrackId,
+    buffer: JitterBuffer,
+}
+
+impl std::ops::Deref for LoggedPlayout {
+    type Target = JitterBuffer;
+    fn deref(&self) -> &Self::Target {
+        &self.buffer
+    }
+}
+
+impl std::ops::DerefMut for LoggedPlayout {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.buffer
+    }
+}
+
+impl Drop for LoggedPlayout {
+    fn drop(&mut self) {
+        let stats = self.buffer.stats();
+        info!(
+            track_id=%self.track_id,
+            received = stats.received,
+            played = stats.played,
+            lost = stats.lost,
+            underruns = stats.underruns,
+            late = stats.late,
+            duplicates = stats.duplicates,
+            dropped = stats.dropped,
+            resets = stats.resets,
+            pauses = stats.pauses,
+            "RtcTrack playout stopped"
+        );
+    }
+}
+
+/// A codec's DTX or SID frame: the sender went quiet, so what's missing
+/// after it is silence, not loss. (Comfort noise, payload type 13, the
+/// jitter buffer recognises itself.)
+fn is_silence_frame(
+    payload_types: &std::sync::RwLock<std::collections::HashMap<u8, CodecType>>,
+    default_payload_type: u8,
+    frame: &RtcAudioFrame,
+) -> bool {
+    let payload_type = frame.payload_type.unwrap_or(default_payload_type);
+    codec_for_pt(payload_types, payload_type)
+        .is_some_and(|codec| codec.is_silence_frame(&frame.data))
+}
+
+/// Playout depth: the delay that absorbs jitter.
+const PLAYOUT_DELAY: Duration = Duration::from_millis(40);
+/// Most audio the playout buffer holds before dropping the oldest.
+const PLAYOUT_MAX_DELAY: Duration = Duration::from_millis(200);
+/// Hard cap on buffered frames, for packet times below 10 ms.
+const PLAYOUT_CAPACITY: usize = 64;
 
 impl RtcTrack {
     pub fn new(
@@ -436,6 +549,11 @@ impl RtcTrack {
             TransportMode::Rtp | TransportMode::Srtp
         );
         let is_webrtc = self.rtc_config.mode != TransportMode::Rtp;
+        let playout_ptime = self
+            .rtc_config
+            .jitter_buffer
+            .unwrap_or(self.rtc_config.mode == TransportMode::WebRtc)
+            .then_some(self.track_config.ptime);
 
         crate::spawn(async move {
             info!(track_id=%track_id_log, "RtcTrack event/stats loop started");
@@ -514,6 +632,7 @@ impl RtcTrack {
                                     processor_chain.clone(),
                                     default_payload_type,
                                     rtp_timeout.clone(),
+                                    playout_ptime,
                                 );
                                 workers.push(f1);
                                 workers.push(f2);
@@ -666,40 +785,145 @@ impl RtcTrack {
         processor_chain: ProcessorChain,
         default_payload_type: u8,
         rtp_timeout: Arc<RtpTimeoutMonitor>,
+        playout_ptime: Option<Duration>,
     ) -> (
         std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
         std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
     ) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<rustrtc::media::frame::AudioFrame>();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Inbound>();
 
-        // Processing Worker
-        let track_id_proc = track_id.clone();
-        let packet_sender_proc = packet_sender_arc.clone();
-        let processor_chain_proc = processor_chain.clone();
-        let proc_fut = Self::run_processing_worker(
-            rx,
-            track_id_proc,
-            packet_sender_proc,
-            processor_chain_proc,
-            default_payload_type,
-        );
+        let recv_fut = Self::run_receiving_worker(track, tx, track_id.clone(), rtp_timeout);
+        let proc_fut = match playout_ptime {
+            Some(ptime) => {
+                // the playout worker reports losses: have the decoders
+                // conceal them
+                let mut processor_chain = processor_chain;
+                processor_chain.codec.enable_concealment();
+                let (playout_tx, playout_rx) = tokio::sync::mpsc::unbounded_channel();
+                let playout = Self::run_playout_worker(
+                    rx,
+                    playout_tx,
+                    track_id.clone(),
+                    ptime,
+                    processor_chain.codec.payload_type_map.clone(),
+                    default_payload_type,
+                );
+                let processing = Self::run_processing_worker(
+                    playout_rx,
+                    track_id,
+                    packet_sender_arc,
+                    processor_chain,
+                    default_payload_type,
+                );
+                async move {
+                    futures::join!(playout, processing);
+                }
+                .boxed()
+            }
+            None => Self::run_processing_worker(
+                rx,
+                track_id,
+                packet_sender_arc,
+                processor_chain,
+                default_payload_type,
+            )
+            .boxed(),
+        };
 
-        // Receiving Worker
-        let track_id_recv = track_id.clone();
-        let recv_fut = Self::run_receiving_worker(track, tx, track_id_recv, rtp_timeout);
+        (proc_fut, recv_fut.boxed())
+    }
 
-        (proc_fut.boxed(), recv_fut.boxed())
+    /// Releases received frames one per packet time, in sequence order,
+    /// reporting the missing ones as `Inbound::Lost` (rustrtc's
+    /// `JitterBuffer::tick`).
+    async fn run_playout_worker(
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<Inbound>,
+        tx: tokio::sync::mpsc::UnboundedSender<Inbound>,
+        track_id: TrackId,
+        ptime: Duration,
+        payload_types: Arc<std::sync::RwLock<std::collections::HashMap<u8, CodecType>>>,
+        default_payload_type: u8,
+    ) {
+        let mut buffer = LoggedPlayout {
+            track_id: track_id.clone(),
+            buffer: JitterBuffer::new(PLAYOUT_DELAY, PLAYOUT_MAX_DELAY, PLAYOUT_CAPACITY),
+        };
+        buffer.set_ptime(ptime);
+        // the buffer follows the sender's packet time; the clock follows it
+        let mut ptime = buffer.ptime();
+        let mut ticker = tokio::time::interval(ptime);
+        loop {
+            tokio::select! {
+                item = rx.recv() => {
+                    let Some(Inbound::Frame(frame)) = item else { break };
+                    if frame.sequence_number.is_none() {
+                        // nothing to order it by
+                        if tx.send(Inbound::Frame(frame)).is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                    buffer.push(MediaSample::Audio(frame));
+                    if buffer.ptime() != ptime {
+                        ptime = buffer.ptime();
+                        info!(track_id=%track_id, ?ptime, "playout packet time changed");
+                        ticker = tokio::time::interval(ptime);
+                    }
+                }
+                _ = ticker.tick() => {
+                    let out = match buffer.tick() {
+                        Playout::Idle => continue,
+                        Playout::Sample(MediaSample::Audio(frame)) => {
+                            if is_silence_frame(&payload_types, default_payload_type, &frame) {
+                                buffer.pause();
+                            }
+                            Inbound::Frame(frame)
+                        }
+                        Playout::Sample(MediaSample::Video(_)) => continue,
+                        Playout::Lost => Inbound::Lost {
+                            ptime,
+                            next: match buffer.following() {
+                                Some(MediaSample::Audio(f)) => {
+                                    Some((f.payload_type, f.data.clone()))
+                                }
+                                _ => None,
+                            },
+                        },
+                    };
+                    if tx.send(out).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     async fn run_processing_worker(
-        mut rx: tokio::sync::mpsc::UnboundedReceiver<rustrtc::media::frame::AudioFrame>,
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<Inbound>,
         track_id: TrackId,
         packet_sender: Arc<Mutex<Option<TrackPacketSender>>>,
         mut processor_chain: ProcessorChain,
         default_payload_type: u8,
     ) {
         info!(track_id=%track_id, "RtcTrack processing worker started");
-        while let Some(frame) = rx.recv().await {
+        let mut losses = LossStats::new(track_id.clone());
+        while let Some(item) = rx.recv().await {
+            let frame = match item {
+                Inbound::Frame(frame) => frame,
+                Inbound::Lost { ptime, next } => {
+                    let next = next.map(|(pt, data)| (pt.unwrap_or(default_payload_type), data));
+                    Self::conceal_frame(
+                        &mut processor_chain,
+                        &track_id,
+                        &packet_sender,
+                        ptime,
+                        next,
+                        &mut losses,
+                    )
+                    .await;
+                    continue;
+                }
+            };
             let res = std::panic::AssertUnwindSafe(Self::process_audio_frame(
                 frame,
                 &track_id,
@@ -722,12 +946,52 @@ impl RtcTrack {
                 break;
             }
         }
-        info!(track_id=%track_id, "RtcTrack processing worker stopped");
+    }
+
+    /// Plays a frame in place of a lost one: rebuilt from the next packet's
+    /// in-band FEC, or concealed by the codec's decoder, and run through the
+    /// chain like a decoded packet. Only possible once the chain decodes
+    /// this track to PCM; undecoded RTP passes through with the gap.
+    async fn conceal_frame(
+        processor_chain: &mut ProcessorChain,
+        track_id: &TrackId,
+        packet_sender: &Arc<Mutex<Option<TrackPacketSender>>>,
+        ptime: Duration,
+        next: Option<(u8, Bytes)>,
+        losses: &mut LossStats,
+    ) {
+        let Some((sample_rate, channels, samples, used_next)) = processor_chain
+            .codec
+            .conceal(ptime, next.as_ref().map(|(pt, data)| (*pt, &data[..])))
+        else {
+            losses.unconcealed += 1;
+            return;
+        };
+        if used_next {
+            losses.recovered += 1;
+        } else {
+            losses.concealed += 1;
+        }
+        let mut frame = AudioFrame {
+            track_id: track_id.clone(),
+            samples: crate::media::Samples::PCM { samples },
+            timestamp: crate::media::get_timestamp(),
+            sample_rate,
+            channels,
+            ..Default::default()
+        };
+        if let Err(e) = processor_chain.process_frame(&mut frame) {
+            debug!(track_id=%track_id, "processor_chain process_frame error: {:?}", e);
+        }
+        let packet_sender = packet_sender.lock().await;
+        if let Some(sender) = packet_sender.as_ref() {
+            sender.send(frame).ok();
+        }
     }
 
     async fn run_receiving_worker(
         track: Arc<SampleStreamTrack>,
-        tx: tokio::sync::mpsc::UnboundedSender<rustrtc::media::frame::AudioFrame>,
+        tx: tokio::sync::mpsc::UnboundedSender<Inbound>,
         track_id: TrackId,
         rtp_timeout: Arc<RtpTimeoutMonitor>,
     ) {
@@ -743,7 +1007,7 @@ impl RtcTrack {
                 rtp_timeout
                     .last_rx_ms
                     .store(rtp_timeout.now_ms(), Ordering::Relaxed);
-                if let Err(_) = tx.send(frame) {
+                if let Err(_) = tx.send(Inbound::Frame(frame)) {
                     break;
                 }
             } else {
@@ -786,7 +1050,6 @@ impl RtcTrack {
             if let Err(e) = processor_chain.process_frame(&mut af) {
                 debug!(track_id=%track_id, "processor_chain process_frame error: {:?}", e);
             }
-
             sender.send(af).ok();
         }
     }
@@ -2252,5 +2515,38 @@ a=rtpmap:101 telephone-event/8000\r\na=sendrecv\r\n";
             SignalingState::Stable,
             "forced final answer must stabilize even with unchanged SDP"
         );
+    }
+}
+
+#[cfg(test)]
+mod silence_frame_tests {
+    use super::*;
+    use audio_codec::Encoder;
+
+    fn frame(payload_type: u8, data: Vec<u8>) -> RtcAudioFrame {
+        RtcAudioFrame {
+            payload_type: Some(payload_type),
+            data: data.into(),
+            sequence_number: Some(1),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn dtx_and_sid_frames_by_negotiated_codec() {
+        let payload_types = TrackCodec::new().payload_type_map;
+        // Opus negotiated on a dynamic payload type
+        payload_types.write().unwrap().insert(96, CodecType::Opus);
+        let quiet = |pt, data| is_silence_frame(&payload_types, 0, &frame(pt, data));
+
+        let speech = audio_codec::opus::OpusEncoder::new(48000, 1).encode(&[1000i16; 960]);
+        assert!(!quiet(96, speech.clone()));
+        assert!(quiet(96, vec![speech[0]]), "Opus DTX");
+        // a G.729 Annex B SID frame, after a speech frame
+        assert!(quiet(18, vec![0; 12]));
+        assert!(!quiet(18, vec![0; 20]));
+        // G.711 has no DTX; telephone-event isn't a codec with one either
+        assert!(!quiet(8, vec![0; 2]));
+        assert!(!quiet(101, vec![0; 4]));
     }
 }
