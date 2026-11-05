@@ -233,9 +233,34 @@ TENCENT_SECRET_KEY=...
 # Deepgram
 DEEPGRAM_API_KEY=...
 
+# 60db
+SIXTYDB_API_KEY=...
+SIXTYDB_VOICE_ID=... # UUID from GET https://api.60db.ai/voices
+
 # Offline models
 OFFLINE_MODELS_DIR=/path/to/models
 ```
+
+### 60db text-to-speech
+
+60db is a hosted speech API. Select it in a playbook using a voice UUID from
+`GET https://api.60db.ai/voices`:
+
+```yaml
+tts:
+  provider: "60db"
+  apiKey: "${SIXTYDB_API_KEY}"
+  speaker: "${SIXTYDB_VOICE_ID}"
+  samplerate: 16000
+  codec: "pcm"
+  speed: 1.0
+```
+
+The provider supports mono PCM16 at 16000, 24000 or 48000 Hz, a speaking rate
+from 0.5 to 2.0, and an optional `language` hint. It sends each text command over
+HTTP in order and accepts JSON or NDJSON audio responses. For streaming tracks,
+completion is emitted after all accepted commands finish. Dropping the track
+cancels its HTTP response. `endpoint` can override the full synthesis URL.
 
 ## Demo
 
