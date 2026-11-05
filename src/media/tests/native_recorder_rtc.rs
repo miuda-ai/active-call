@@ -9,11 +9,10 @@
 use crate::event::create_event_sender;
 use crate::media::recorder::RecorderOption;
 use crate::media::track::TrackConfig;
-use crate::media::track::rtc::{RtcTrack, RtcTrackConfig};
+use crate::media::track::rtc::{RtcTrack, RtcTrackConfig, TransportMode};
 use crate::media::{stream::MediaStreamBuilder, track::Track};
 use anyhow::Result;
 use audio_codec::CodecType;
-use rustrtc::TransportMode;
 use std::path::Path;
 use std::sync::Arc;
 use tempfile::tempdir;

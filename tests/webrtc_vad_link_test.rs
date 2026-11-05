@@ -65,7 +65,7 @@ async fn test_webrtc_vad_link() -> Result<()> {
     let (mut ws_stream, _) = connect_async(&ws_url).await?;
 
     // 3. Setup WebRTC PeerConnection (Client Side)
-    let mut rtc_config = RtcConfiguration::default();
+    let mut rtc_config = RtcConfiguration::webrtc();
     rtc_config.ice_servers = vec![];
     let pc = Arc::new(PeerConnection::new(rtc_config));
 

@@ -15,8 +15,8 @@ use audio_codec::telephone_event::encode_event_payload;
 use bytes::Bytes;
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use rustrtc::{
-    AudioCapability, IceCandidate, IceServer, MediaKind, PeerConnection, PeerConnectionEvent,
-    PeerConnectionState, RtcConfiguration, RtpCodecParameters, SdpType, TransportMode,
+    AudioCapability, Connectivity, IceCandidate, IceServer, Keying, MediaKind, PeerConnection,
+    PeerConnectionEvent, PeerConnectionState, RtcConfiguration, RtpCodecParameters, SdpType,
     config::MediaCapabilities,
     media::{
         MediaStreamTrack, SampleStreamSource, frame::AudioFrame as RtcAudioFrame, sample_track,
@@ -34,6 +34,19 @@ use std::{
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
+
+/// How the media transport to the peer is set up. Mirrors rustrtc's old
+/// `TransportMode`, which rustrtc 0.6 replaced with `connectivity`/`keying`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TransportMode {
+    /// Full ICE, DTLS-SRTP and WebRTC header extensions (browsers, SFUs).
+    #[default]
+    WebRtc,
+    /// SIP peer with SDES-SRTP (`a=crypto`).
+    Srtp,
+    /// SIP peer with plain RTP.
+    Rtp,
+}
 
 #[derive(Clone)]
 pub struct RtcTrackConfig {
@@ -266,11 +279,23 @@ impl RtcTrack {
             return Ok(());
         }
 
-        let mut config = RtcConfiguration::default();
+        let mut config = match self.rtc_config.mode {
+            TransportMode::WebRtc => RtcConfiguration::webrtc(),
+            TransportMode::Srtp => {
+                let mut config = RtcConfiguration::sip();
+                config.keying = Keying::Sdes;
+                config
+            }
+            TransportMode::Rtp => RtcConfiguration::sip(),
+        };
+        if self.rtc_config.mode != TransportMode::WebRtc
+            && self.rtc_config.enable_ice_lite.unwrap_or(false)
+        {
+            config.connectivity = Connectivity::IceLite;
+        }
         if self.ssrc != 0 {
             config.ssrc_start = self.ssrc;
         }
-        config.transport_mode = self.rtc_config.mode.clone();
 
         if let Some(ice_servers) = &self.rtc_config.ice_servers {
             config.ice_servers = ice_servers.clone();
@@ -292,14 +317,13 @@ impl RtcTrack {
             config.rtp_start_port = Some(rtp_start_port);
             config.rtp_end_port = Some(rtp_end_port);
         }
-        config.enable_ice_lite = self.rtc_config.enable_ice_lite.unwrap_or(false);
-        if let Some(grace) = self.rtc_config.ice_disconnect_grace {
-            config.ice_disconnect_grace = grace;
-        }
         config.enable_latching = self
             .rtc_config
             .enable_latching
             .unwrap_or_else(|| self.rtc_config.mode == TransportMode::Rtp);
+        if let Some(grace) = self.rtc_config.ice_disconnect_grace {
+            config.ice_disconnect_grace = grace;
+        }
 
         // Audio codecs in the configured order (rustrtc's default audio set
         // when none are configured), followed by one telephone-event per
@@ -1438,8 +1462,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_rtp_mode_handshake_spawns_handler() {
-        use rustrtc::TransportMode;
-
         let track_id = "test-track-sip".to_string();
         let cancel = CancellationToken::new();
         let track_config = TrackConfig::default();
@@ -1514,7 +1536,7 @@ a=rtpmap:0 PCMU/8000\r\n"
     #[tokio::test]
     async fn test_webrtc_reoffer_restarts_ice_on_same_peer_connection() {
         let mut rtc_config = RtcTrackConfig::default();
-        rtc_config.mode = rustrtc::TransportMode::WebRtc;
+        rtc_config.mode = TransportMode::WebRtc;
         rtc_config.enable_ice_lite = Some(true);
         rtc_config.codecs = vec![CodecType::PCMU];
 
@@ -1828,7 +1850,7 @@ a=rtpmap:0 PCMU/8000\r\n"
 
     async fn offer_with_codecs(codecs: Vec<CodecType>) -> String {
         let mut rtc_config = RtcTrackConfig::default();
-        rtc_config.mode = rustrtc::TransportMode::Rtp;
+        rtc_config.mode = TransportMode::Rtp;
         rtc_config.codecs = codecs;
         let mut track = RtcTrack::new(
             CancellationToken::new(),
@@ -1915,7 +1937,7 @@ a=rtpmap:0 PCMU/8000\r\n"
     /// returning the track together with its peer connection.
     async fn rtp_track_with_local_offer(id: &str) -> RtcTrack {
         let mut rtc_config = RtcTrackConfig::default();
-        rtc_config.mode = rustrtc::TransportMode::Rtp;
+        rtc_config.mode = TransportMode::Rtp;
         rtc_config.preferred_codec = Some(CodecType::PCMU);
         rtc_config.codecs = vec![CodecType::PCMU, CodecType::PCMA];
 

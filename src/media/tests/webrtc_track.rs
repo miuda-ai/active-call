@@ -1,9 +1,8 @@
 use crate::media::track::{
     Track, TrackConfig,
-    rtc::{RtcTrack, RtcTrackConfig},
+    rtc::{RtcTrack, RtcTrackConfig, TransportMode},
 };
 use anyhow::Result;
-use rustrtc::TransportMode;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]

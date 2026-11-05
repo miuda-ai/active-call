@@ -183,7 +183,7 @@ async fn test_webrtc_call_workflow() -> Result<()> {
     let (mut ws_stream, _) = connect_async(&ws_url).await?;
 
     // 4. Setup WebRTC PeerConnection
-    let mut rtc_config = RtcConfiguration::default();
+    let mut rtc_config = RtcConfiguration::webrtc();
     // Use local candidates only
     rtc_config.ice_servers = vec![];
     let pc = Arc::new(PeerConnection::new(rtc_config));

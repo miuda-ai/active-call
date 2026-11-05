@@ -11,12 +11,12 @@ use active_call::media::{
     TrackId,
     track::{
         Track, TrackConfig,
-        rtc::{RtcTrack, RtcTrackConfig},
+        rtc::{RtcTrack, RtcTrackConfig, TransportMode},
     },
 };
 use anyhow::Result;
 use audio_codec::CodecType;
-use rustrtc::{PeerConnectionEvent, TransportMode, media::MediaStreamTrack};
+use rustrtc::{PeerConnectionEvent, media::MediaStreamTrack};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{Level, debug, info};

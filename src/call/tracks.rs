@@ -15,7 +15,7 @@ use crate::media::processor::SubscribeProcessor;
 use crate::media::monitor::{LEG_AGENT, LEG_CALLER, MonitorProcessor};
 use crate::media::track::Track;
 use crate::media::track::file::FileTrack;
-use crate::media::track::rtc::{RtcTrack, RtcTrackConfig};
+use crate::media::track::rtc::{RtcTrack, RtcTrackConfig, TransportMode};
 use crate::media::track::websocket::{WebsocketBytesReceiver, WebsocketTrack};
 use crate::useragent::invitation::PendingDialog;
 use crate::useragent::public_address::{
@@ -228,9 +228,9 @@ impl ActiveCall {
             .or(self.app_state.config.enable_srtp)
             .unwrap_or(false);
         rtc_config.mode = if use_srtp {
-            rustrtc::TransportMode::Srtp
+            TransportMode::Srtp
         } else {
-            rustrtc::TransportMode::Rtp
+            TransportMode::Rtp
         };
         self.rtc_apply_codecs(&mut rtc_config);
         if rtc_config.preferred_codec.is_none() {
@@ -326,9 +326,9 @@ impl ActiveCall {
             .or(self.app_state.config.enable_srtp)
             .unwrap_or(false);
         rtc_config.mode = if use_srtp {
-            rustrtc::TransportMode::Srtp
+            TransportMode::Srtp
         } else {
-            rustrtc::TransportMode::Rtp
+            TransportMode::Rtp
         };
 
         self.rtc_apply_codecs(&mut rtc_config);
@@ -714,7 +714,7 @@ impl ActiveCall {
 
         let mut rtc_config = RtcTrackConfig::default();
         rtc_config.rtp_timeout = option.rtp_timeout.map(Duration::from_secs);
-        rtc_config.mode = rustrtc::TransportMode::WebRtc; // WebRTC
+        rtc_config.mode = TransportMode::WebRtc; // WebRTC
         rtc_config.ice_servers = self.app_state.config.ice_servers.clone();
 
         self.rtc_apply_codecs(&mut rtc_config);
@@ -1018,7 +1018,7 @@ impl ActiveCall {
         let mut media_track = if Self::is_webrtc_sdp(&offer) {
             let mut rtc_config = RtcTrackConfig::default();
             rtc_config.rtp_timeout = option.rtp_timeout.map(Duration::from_secs);
-            rtc_config.mode = rustrtc::TransportMode::WebRtc;
+            rtc_config.mode = TransportMode::WebRtc;
             rtc_config.ice_servers = self.app_state.config.ice_servers.clone();
             self.rtc_apply_network(&mut rtc_config);
             self.rtc_apply_latching(&mut rtc_config);
