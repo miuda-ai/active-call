@@ -68,70 +68,91 @@ pub fn prefer_audio_codec(sdp: &SessionDescription) -> Option<CodecType> {
         .cloned()
 }
 
+/// Restricts the answer to codecs the offer has, in the offer's order, and
+/// renumbers them to the offer's payload types. RFC 3264 6.1: the answerer
+/// SHOULD use the offer's payload type for the same codec - we also send with
+/// the answer's numbers, so otherwise our packets carry a dynamic payload type
+/// the offerer never declared (opus 111 vs offered 114) and get dropped.
+/// Dynamic payload types match by codec and clock rate, so e.g. our
+/// telephone-event/48000 is dropped when only telephone-event/8000 is offered.
 pub fn intersect_answer(offer: &SessionDescription, answer: &mut SessionDescription) {
-    let offer_media = if let Some(m) = select_peer_media(offer, "audio") {
-        m
-    } else {
+    let Some(offer_media) = offer
+        .media_sections
+        .iter()
+        .find(|m| m.kind == MediaKind::Audio)
+    else {
         return;
     };
+    let offer_formats = audio_formats(offer_media);
 
     for media in answer.media_sections.iter_mut() {
-        if media.kind == MediaKind::Audio {
-            // 1. Build map of Answer PT -> CodecType
-            let mut answer_pt_codec = std::collections::HashMap::new();
-
-            for attr in &media.attributes {
-                if attr.key == "rtpmap" {
-                    if let Some(val) = &attr.value {
-                        if let Ok((pt, codec, _, _)) = parse_rtpmap(val) {
-                            answer_pt_codec.insert(pt, codec);
-                        }
-                    }
-                }
-            }
-
-            // 2. Filter formats, but following the OFFER'S order
-            let mut new_formats: Vec<String> = Vec::new();
-
-            for offer_codec in &offer_media.codecs {
-                for fmt in &media.formats {
-                    if let Ok(pt) = fmt.parse::<u8>() {
-                        let codec = if let Some(c) = answer_pt_codec.get(&pt) {
-                            Some(*c)
-                        } else {
-                            CodecType::try_from(pt).ok()
-                        };
-
-                        if let Some(c) = codec {
-                            if c == *offer_codec {
-                                if !new_formats.contains(fmt) {
-                                    new_formats.push(fmt.clone());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Ensure we don't leave an empty list if there was a matching codec but something went wrong.
-            // But if intersection is empty, it's empty.
-            media.formats = new_formats;
-
-            // 3. Clean attributes
-            media.attributes.retain(|attr| {
-                if attr.key == "rtpmap" || attr.key == "fmtp" || attr.key == "rtcp-fb" {
-                    if let Some(val) = &attr.value {
-                        if let Some(first_word) = val.split_whitespace().next() {
-                            // This checks if the attribute refers to a PT that is still in media.formats
-                            return media.formats.iter().any(|f| f == first_word);
-                        }
-                    }
-                    return false;
-                }
-                true
-            });
+        if media.kind != MediaKind::Audio {
+            continue;
         }
+        let answer_formats = audio_formats(media);
+
+        // answer payload type -> offer payload type, in the offer's order
+        let mut renumber: Vec<(u8, u8)> = Vec::new();
+        for (offer_pt, offer_codec, offer_clock) in &offer_formats {
+            if renumber.iter().any(|(_, o)| o == offer_pt) {
+                continue;
+            }
+            let matched = answer_formats.iter().find(|(pt, codec, clock)| {
+                codec == offer_codec
+                    // static payload types may come without rtpmap - no clock rate to compare
+                    && (clock.is_none() || offer_clock.is_none() || clock == offer_clock)
+                    && !renumber.iter().any(|(a, _)| a == pt)
+            });
+            if let Some((answer_pt, ..)) = matched {
+                renumber.push((*answer_pt, *offer_pt));
+            }
+        }
+
+        media.formats = renumber.iter().map(|(_, o)| o.to_string()).collect();
+
+        // Keep rtpmap/fmtp/rtcp-fb of the kept payload types only, renumbered
+        media.attributes.retain_mut(|attr| {
+            if attr.key != "rtpmap" && attr.key != "fmtp" && attr.key != "rtcp-fb" {
+                return true;
+            }
+            let Some(value) = &attr.value else {
+                return false;
+            };
+            let (pt, rest) = value.split_once(' ').unwrap_or((value.as_str(), ""));
+            let Ok(pt) = pt.parse::<u8>() else {
+                return false;
+            };
+            let Some((_, offer_pt)) = renumber.iter().find(|(a, _)| *a == pt) else {
+                return false;
+            };
+            attr.value = Some(format!("{offer_pt} {rest}").trim_end().to_string());
+            true
+        });
     }
+}
+
+/// (payload type, codec, clock rate) of an audio section's formats, in order.
+/// Clock rate is None for static payload types listed without rtpmap.
+fn audio_formats(media: &rustrtc::sdp::MediaSection) -> Vec<(u8, CodecType, Option<u32>)> {
+    let rtpmaps: std::collections::HashMap<u8, (CodecType, u32)> = media
+        .attributes
+        .iter()
+        .filter(|attr| attr.key == "rtpmap")
+        .filter_map(|attr| parse_rtpmap(attr.value.as_deref()?).ok())
+        .map(|(pt, codec, clock, _)| (pt, (codec, clock)))
+        .collect();
+    media
+        .formats
+        .iter()
+        .filter_map(|fmt| {
+            let pt = fmt.parse::<u8>().ok()?;
+            match rtpmaps.get(&pt) {
+                Some((codec, clock)) => Some((pt, *codec, Some(*clock))),
+                None if pt < 96 => Some((pt, CodecType::try_from(pt).ok()?, None)),
+                None => None,
+            }
+        })
+        .collect()
 }
 
 pub fn select_peer_media(sdp: &SessionDescription, media_type: &str) -> Option<PeerMedia> {
@@ -414,6 +435,104 @@ a=rtpmap:101 telephone-event/8000
             media.formats,
             vec!["8".to_string(), "0".to_string(), "101".to_string()]
         );
+    }
+
+    /// Voximplant SBC offer: static payload types without rtpmap, opus as 114
+    const VOX_OFFER: &str = "v=0\r
+o=VIMS 234 1 IN IP4 185.164.148.135\r
+s=VIMS\r
+c=IN IP4 185.164.148.135\r
+t=0 0\r
+m=audio 15762 RTP/AVP 9 114 0 8 100 96 97 18 101\r
+a=rtpmap:114 opus/48000/2\r
+a=fmtp:114 minptime=10;useinbandfec=1;stereo=0;usedtx=1\r
+a=rtcp-fb:114 transport-cc\r
+a=rtpmap:100 ilbc/8000\r
+a=rtpmap:96 AMR-WB/16000\r
+a=rtpmap:101 telephone-event/8000\r
+a=fmtp:101 0-15\r
+a=sendrecv\r
+";
+
+    /// What we answer with before intersection: our numbering
+    const OUR_ANSWER: &str = "v=0\r
+o=- 1 1 IN IP4 31.129.43.67\r
+s=-\r
+c=IN IP4 31.129.43.67\r
+t=0 0\r
+m=audio 30816 RTP/AVP 9 111 8 0 101 110\r
+a=rtpmap:9 G722/8000\r
+a=rtpmap:111 opus/48000/2\r
+a=fmtp:111 minptime=10;useinbandfec=1;stereo=1\r
+a=rtpmap:8 PCMA/8000\r
+a=rtpmap:0 PCMU/8000\r
+a=rtpmap:101 telephone-event/8000\r
+a=fmtp:101 0-16\r
+a=rtpmap:110 telephone-event/48000\r
+a=fmtp:110 0-16\r
+a=sendrecv\r
+";
+
+    fn rtp_attrs(media: &rustrtc::sdp::MediaSection, key: &str) -> Vec<String> {
+        media
+            .attributes
+            .iter()
+            .filter(|a| a.key == key)
+            .filter_map(|a| a.value.clone())
+            .collect()
+    }
+
+    #[test]
+    fn test_answer_intersection_uses_offer_payload_types() {
+        use crate::media::negotiate::intersect_answer;
+        let offer = SessionDescription::parse(rustrtc::sdp::SdpType::Offer, VOX_OFFER).unwrap();
+        let mut answer =
+            SessionDescription::parse(rustrtc::sdp::SdpType::Answer, OUR_ANSWER).unwrap();
+
+        intersect_answer(&offer, &mut answer);
+
+        let media = &answer.media_sections[0];
+        // offer order, offer numbering; opus renumbered 111 -> 114
+        assert_eq!(media.formats, vec!["9", "114", "0", "8", "101"]);
+        let rtpmaps = rtp_attrs(media, "rtpmap");
+        assert!(rtpmaps.contains(&"114 opus/48000/2".to_string()));
+        assert!(rtpmaps.contains(&"101 telephone-event/8000".to_string()));
+        assert!(!rtpmaps.iter().any(|v| v.starts_with("111 ")));
+        // telephone-event/48000 wasn't offered
+        assert!(!rtpmaps.iter().any(|v| v.contains("telephone-event/48000")));
+        // our fmtp follows the renumbered payload type
+        let fmtps = rtp_attrs(media, "fmtp");
+        assert!(fmtps.contains(&"114 minptime=10;useinbandfec=1;stereo=1".to_string()));
+        assert!(fmtps.contains(&"101 0-16".to_string()));
+        assert!(!fmtps.iter().any(|v| v.starts_with("110 ")));
+    }
+
+    #[test]
+    fn test_answer_intersection_matches_dynamic_by_clock_rate() {
+        use crate::media::negotiate::intersect_answer;
+        // offerer uses 96 for telephone-event/48000 and 97 for /8000
+        let offer_str = "v=0\r
+o=- 1 1 IN IP4 127.0.0.1\r
+s=-\r
+c=IN IP4 127.0.0.1\r
+t=0 0\r
+m=audio 9000 RTP/AVP 120 97 96\r
+a=rtpmap:120 opus/48000/2\r
+a=rtpmap:97 telephone-event/8000\r
+a=rtpmap:96 telephone-event/48000\r
+";
+        let offer = SessionDescription::parse(rustrtc::sdp::SdpType::Offer, offer_str).unwrap();
+        let mut answer =
+            SessionDescription::parse(rustrtc::sdp::SdpType::Answer, OUR_ANSWER).unwrap();
+
+        intersect_answer(&offer, &mut answer);
+
+        let media = &answer.media_sections[0];
+        assert_eq!(media.formats, vec!["120", "97", "96"]);
+        let rtpmaps = rtp_attrs(media, "rtpmap");
+        assert!(rtpmaps.contains(&"120 opus/48000/2".to_string()));
+        assert!(rtpmaps.contains(&"97 telephone-event/8000".to_string()));
+        assert!(rtpmaps.contains(&"96 telephone-event/48000".to_string()));
     }
 
     #[test]

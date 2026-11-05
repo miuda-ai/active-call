@@ -46,15 +46,7 @@ const SIP_LEG_TRACK_ID: &str = "sip-leg-track";
 /// unparseable `m=` line). Configured codecs win when they overlap the offer;
 /// the offer wins when they don't.
 fn restrict_codecs_to_offer(rtc_config: &mut RtcTrackConfig, offer: &str) {
-    let offer_codecs: Vec<CodecType> = offer
-        .lines()
-        .filter_map(|line| {
-            let value = line.trim().strip_prefix("a=rtpmap:")?;
-            crate::media::negotiate::parse_rtpmap(value)
-                .ok()
-                .map(|(_, codec, ..)| codec)
-        })
-        .collect();
+    let offer_codecs = offer_audio_codecs(offer);
     if offer_codecs.is_empty() {
         return;
     }
@@ -66,6 +58,57 @@ fn restrict_codecs_to_offer(rtc_config: &mut RtcTrackConfig, offer: &str) {
             rtc_config.codecs = offer_codecs;
         }
     }
+    // Keep the preferred codec in the restricted set - otherwise it still points
+    // to a configured codec the offer dropped.
+    if let Some(first) = rtc_config
+        .codecs
+        .iter()
+        .find(|c| **c != CodecType::TelephoneEvent)
+    {
+        rtc_config.preferred_codec = Some(*first);
+    }
+}
+
+/// Audio codecs of an SDP offer, in the offerer's order. Static payload types
+/// (< 96) may be listed on the `m=audio` line without an `a=rtpmap` (RFC 3551),
+/// e.g. Voximplant sends `m=audio ... 9 114 0 8 ...` with rtpmaps only for the
+/// dynamic ones, so they're resolved by their well-known number.
+fn offer_audio_codecs(offer: &str) -> Vec<CodecType> {
+    let mut rtpmaps = std::collections::HashMap::new();
+    let mut formats: Vec<u8> = Vec::new();
+    let mut in_audio = false;
+    for line in offer.lines().map(str::trim) {
+        if let Some(media) = line.strip_prefix("m=") {
+            in_audio = media.starts_with("audio ");
+            if in_audio {
+                formats = media
+                    .split_whitespace()
+                    .skip(3) // audio <port> <proto>
+                    .filter_map(|pt| pt.parse().ok())
+                    .collect();
+            }
+        } else if in_audio
+            && let Some(value) = line.strip_prefix("a=rtpmap:")
+            && let Ok((pt, codec, ..)) = crate::media::negotiate::parse_rtpmap(value)
+        {
+            rtpmaps.insert(pt, codec);
+        }
+    }
+
+    let mut codecs = Vec::new();
+    for pt in formats {
+        let codec = match rtpmaps.get(&pt) {
+            Some(codec) => Some(*codec),
+            None if pt < 96 => CodecType::try_from(pt).ok(),
+            None => None,
+        };
+        if let Some(codec) = codec
+            && !codecs.contains(&codec)
+        {
+            codecs.push(codec);
+        }
+    }
+    codecs
 }
 
 /// Everything needed to place one outgoing INVITE (main leg or refer leg).
@@ -449,7 +492,9 @@ impl ActiveCall {
             // Reach into the chain directly: the media-pass track ignores
             // `Track::append_processor`, yet its own downlink frames must
             // still be subscribed like any other track.
-            track.processor_chain().append_processor(Box::new(sub_processor));
+            track
+                .processor_chain()
+                .append_processor(Box::new(sub_processor));
         }
 
         // Side-path audio distribution (see `media::monitor`): tap this
@@ -1149,5 +1194,84 @@ impl ActiveCall {
             client_dialog_handler.process_dialog(states).await;
         });
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Voximplant SBC offer: static payload types without rtpmap lines
+    const VOX_OFFER: &str = "v=0\r\n\
+o=VIMS 234 1 IN IP4 185.164.148.135\r\n\
+s=VIMS\r\n\
+c=IN IP4 185.164.148.135\r\n\
+t=0 0\r\n\
+m=audio 15762 RTP/AVP 9 114 0 8 100 96 97 18 101\r\n\
+a=rtpmap:114 opus/48000/2\r\n\
+a=rtpmap:100 ilbc/8000\r\n\
+a=rtpmap:96 AMR-WB/16000\r\n\
+a=rtpmap:101 telephone-event/8000\r\n\
+a=sendrecv\r\n";
+
+    #[test]
+    fn offer_codecs_include_static_payload_types_without_rtpmap() {
+        let codecs = offer_audio_codecs(VOX_OFFER);
+        assert_eq!(codecs[0], CodecType::G722);
+        assert_eq!(codecs[1], CodecType::Opus);
+        assert!(codecs.contains(&CodecType::PCMU));
+        assert!(codecs.contains(&CodecType::PCMA));
+        assert!(codecs.contains(&CodecType::TelephoneEvent));
+    }
+
+    #[test]
+    fn offer_codecs_ignore_unmapped_dynamic_and_other_media() {
+        let offer = "m=audio 1 RTP/AVP 0 120\r\nm=video 2 RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\n";
+        assert_eq!(offer_audio_codecs(offer), vec![CodecType::PCMU]);
+    }
+
+    #[test]
+    fn restrict_keeps_configured_order_and_preferred_codec() {
+        let mut rtc_config = RtcTrackConfig {
+            codecs: vec![
+                CodecType::G722,
+                CodecType::Opus,
+                CodecType::PCMA,
+                CodecType::PCMU,
+                CodecType::TelephoneEvent,
+            ],
+            preferred_codec: Some(CodecType::G722),
+            ..Default::default()
+        };
+        restrict_codecs_to_offer(&mut rtc_config, VOX_OFFER);
+        assert_eq!(
+            rtc_config.codecs,
+            vec![
+                CodecType::G722,
+                CodecType::Opus,
+                CodecType::PCMA,
+                CodecType::PCMU,
+                CodecType::TelephoneEvent,
+            ]
+        );
+        assert_eq!(rtc_config.preferred_codec, Some(CodecType::G722));
+    }
+
+    #[test]
+    fn restrict_updates_preferred_codec_when_dropped() {
+        let mut rtc_config = RtcTrackConfig {
+            codecs: vec![CodecType::G722, CodecType::PCMA, CodecType::TelephoneEvent],
+            preferred_codec: Some(CodecType::G722),
+            ..Default::default()
+        };
+        restrict_codecs_to_offer(
+            &mut rtc_config,
+            "m=audio 1 RTP/AVP 8 101\r\na=rtpmap:101 telephone-event/8000\r\n",
+        );
+        assert_eq!(
+            rtc_config.codecs,
+            vec![CodecType::PCMA, CodecType::TelephoneEvent]
+        );
+        assert_eq!(rtc_config.preferred_codec, Some(CodecType::PCMA));
     }
 }
