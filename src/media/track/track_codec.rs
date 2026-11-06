@@ -17,11 +17,57 @@ use audio_codec::opus::{OpusDecoder, OpusEncoder};
 /// Opus bitrate when the receiver sets no lower `maxaveragebitrate`: speech
 /// to fullband, with room for in-band FEC.
 const OPUS_BITRATE: u32 = 64000;
-/// Packet loss the Opus encoder expects when the receiver asked for in-band
-/// FEC, for want of the actual loss. Gates the FEC and sets its quality: up
-/// to 5% none is coded at 32 kbit/s, more lowers the audio bandwidth to fit
-/// it.
-const OPUS_FEC_LOSS_PERC: i32 = 10;
+
+/// The packet loss to tell the Opus encoder to expect, from the receiver's
+/// reports of the loss it sees (RTCP `fraction lost`), as libwebrtc does:
+/// smoothed over ~10 s, then snapped to 0, 1, 5, 10 or 20% with hysteresis
+/// so it doesn't flip the encoder on every report. It sets how robust the
+/// encoding is, and gates in-band FEC: none is coded at 0%, and at 32 kbit/s
+/// none up to 5%.
+#[derive(Debug, Default)]
+pub struct OpusLossEstimate {
+    smoothed: Option<f32>,
+    level: f32,
+}
+
+impl OpusLossEstimate {
+    /// libwebrtc's smoothing, per millisecond
+    const ALPHA_PER_MS: f32 = 0.9999;
+
+    /// Takes the loss reported (0-1) over `elapsed`; returns the loss for
+    /// the encoder, in percent.
+    pub fn update(&mut self, fraction_lost: f32, elapsed: Duration) -> i32 {
+        let fraction_lost = fraction_lost.clamp(0.0, 1.0);
+        let smoothed = match self.smoothed {
+            Some(smoothed) => {
+                let alpha = Self::ALPHA_PER_MS.powf(elapsed.as_millis() as f32);
+                alpha * smoothed + (1.0 - alpha) * fraction_lost
+            }
+            None => fraction_lost,
+        };
+        self.smoothed = Some(smoothed);
+        self.level = Self::level(smoothed, self.level);
+        (self.level * 100.0).round() as i32
+    }
+
+    /// libwebrtc's `OptimizePacketLossRate`: a level is entered past its
+    /// value plus a margin, and left below its value minus it.
+    fn level(loss: f32, level: f32) -> f32 {
+        let past =
+            |rate: f32, margin: f32| loss >= rate + if rate > level { margin } else { -margin };
+        if past(0.20, 0.02) {
+            0.20
+        } else if past(0.10, 0.01) {
+            0.10
+        } else if past(0.05, 0.01) {
+            0.05
+        } else if loss >= 0.01 {
+            0.01
+        } else {
+            0.0
+        }
+    }
+}
 
 /// How to encode Opus for a receiver, from the `a=fmtp` of its description
 /// (RFC 7587 6.1). Always mono: `stereo=1` is only a preference, and the
@@ -86,13 +132,11 @@ impl OpusParams {
             .clamp(6000, 510_000)
     }
 
-    fn encoder(&self) -> OpusEncoder {
+    fn encoder(&self, packet_loss_perc: i32) -> OpusEncoder {
         let mut encoder = OpusEncoder::new(self.sample_rate(), 1);
         encoder.set_bitrate(self.bitrate() as i32);
-        if self.inband_fec {
-            encoder.set_inband_fec(true);
-            encoder.set_packet_loss_perc(OPUS_FEC_LOSS_PERC);
-        }
+        encoder.set_inband_fec(self.inband_fec);
+        encoder.set_packet_loss_perc(packet_loss_perc);
         encoder
     }
 }
@@ -117,6 +161,8 @@ pub struct TrackCodec {
     opus_encoder: Option<OpusEncoder>,
     /// What the receiver takes, for `opus_encoder`.
     opus_params: OpusParams,
+    /// Packet loss `opus_encoder` expects, in percent.
+    opus_packet_loss: i32,
     opus_decoder: Option<OpusDecoder>,
 
     resampler: Option<BoxedResampler>,
@@ -176,6 +222,7 @@ impl TrackCodec {
             g729_decoder: None,
             opus_encoder: None,
             opus_params: OpusParams::default(),
+            opus_packet_loss: 0,
             opus_decoder: None,
             resampler: None,
             resampler_in_rate: 0,
@@ -316,6 +363,17 @@ impl TrackCodec {
         }
     }
 
+    /// Have Opus expect this packet loss, in percent (see
+    /// [`OpusLossEstimate`]).
+    pub fn set_opus_packet_loss(&mut self, percent: i32) {
+        if percent != self.opus_packet_loss {
+            self.opus_packet_loss = percent;
+            if let Some(encoder) = self.opus_encoder.as_mut() {
+                encoder.set_packet_loss_perc(percent);
+            }
+        }
+    }
+
     pub fn opus_params(&self) -> OpusParams {
         self.opus_params
     }
@@ -412,9 +470,9 @@ impl TrackCodec {
                         .get_or_insert_with(|| Box::new(G729Encoder::new()))
                         .encode(&pcm),
                     Some(CodecType::Opus) => {
-                        let params = self.opus_params;
+                        let (params, loss) = (self.opus_params, self.opus_packet_loss);
                         self.opus_encoder
-                            .get_or_insert_with(|| params.encoder())
+                            .get_or_insert_with(|| params.encoder(loss))
                             .encode(&pcm)
                     }
                     _ => samples_to_bytes(&pcm),
@@ -624,11 +682,29 @@ mod conceal_tests {
     }
 
     #[test]
+    fn opus_loss_estimate_follows_reports_like_libwebrtc() {
+        let every = Duration::from_secs(5);
+        let mut estimate = OpusLossEstimate::default();
+        // the first report is taken as is
+        assert_eq!(estimate.update(0.0, every), 0);
+        // 12% loss is smoothed in over reports (4.7, 7.6, 9.3, 10.4, 11.0,
+        // 11.4%); 10% is entered past 11%
+        let rising: Vec<i32> = (0..6).map(|_| estimate.update(0.12, every)).collect();
+        assert_eq!(rising, [1, 5, 5, 5, 10, 10]);
+        // and left only below 9% (10.7%, then 6.5, 3.9, 2.4, 1.4, 0.9%)
+        assert_eq!(estimate.update(0.095, every), 10);
+        let falling: Vec<i32> = (0..6).map(|_| estimate.update(0.0, every)).collect();
+        assert_eq!(falling, [5, 1, 1, 1, 0, 0]);
+    }
+
+    #[test]
     fn opus_encoded_for_a_fec_receiver_carries_fec() {
         let mut sender = TrackCodec::new();
         sender.set_opus_params(OpusParams::from_fmtp(
             "maxplaybackrate=48000;stereo=1;useinbandfec=1",
         ));
+        // the receiver reports 10% loss
+        sender.set_opus_packet_loss(10);
         // the pipeline's 16 kHz audio
         let packets: Vec<Vec<u8>> = voice(16000, 30)
             .into_iter()

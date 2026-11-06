@@ -1,4 +1,6 @@
-use super::track_codec::{OpusParams, TrackCodec, codec_for_pt, duration_to_rtp_ticks};
+use super::track_codec::{
+    OpusLossEstimate, OpusParams, TrackCodec, codec_for_pt, duration_to_rtp_ticks,
+};
 use crate::{
     callrecord::CallRecordHangupReason,
     event::{EventSender, SessionEvent},
@@ -27,7 +29,7 @@ use std::{
     net::IpAddr,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -109,6 +111,9 @@ pub struct RtcTrack {
     cancel_token: CancellationToken,
     local_source: Option<Arc<SampleStreamSource>>,
     encoder: TrackCodec,
+    /// Packet loss for the encoder to expect, in percent, from the
+    /// receiver's reports (see `OpusLossEstimate`).
+    remote_loss: Arc<AtomicI32>,
     ssrc: u32,
     payload_type: Option<u8>,
     pub peer_connection: Option<Arc<PeerConnection>>,
@@ -317,6 +322,9 @@ fn is_silence_frame(
         .is_some_and(|codec| codec.is_silence_frame(&frame.data))
 }
 
+/// How often the peer connection's stats are read: logged, and the
+/// receiver's reported loss passed to the encoder.
+const STATS_INTERVAL: Duration = Duration::from_secs(5);
 /// Playout depth: the delay that absorbs jitter.
 const PLAYOUT_DELAY: Duration = Duration::from_millis(40);
 /// Most audio the playout buffer holds before dropping the oldest.
@@ -348,6 +356,7 @@ impl RtcTrack {
             cancel_token,
             local_source: None,
             encoder: TrackCodec::new(),
+            remote_loss: Arc::new(AtomicI32::new(0)),
             ssrc: 0,
             payload_type: None,
             peer_connection: None,
@@ -543,6 +552,8 @@ impl RtcTrack {
         let pc_event = pc.clone();
         let pc_stats = pc.clone();
         let pc_state = pc.clone();
+        let remote_loss = self.remote_loss.clone();
+        let ssrc = self.ssrc;
         let track_id_log = track_id.clone();
         let is_rtp_media = matches!(
             self.rtc_config.mode,
@@ -576,7 +587,8 @@ impl RtcTrack {
                 None
             };
 
-            let mut stats_interval = tokio::time::interval(Duration::from_secs(5));
+            let mut stats_interval = tokio::time::interval(STATS_INTERVAL);
+            let mut loss_estimate = OpusLossEstimate::default();
             let mut timeout_interval = tokio::time::interval(Duration::from_secs(1));
             timeout_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut timeout_state = rtp_timeout.state.subscribe();
@@ -682,6 +694,12 @@ impl RtcTrack {
                                     debug!(track_id=%track_id_log, "RTCP Stats: empty report");
                                 } else {
                                     info!(track_id=%track_id_log, %stats, "RTCP Stats");
+                                }
+                                if let Some(fraction_lost) = Self::reported_fraction_lost(&stats, ssrc) {
+                                    let percent = loss_estimate.update(fraction_lost, STATS_INTERVAL);
+                                    if remote_loss.swap(percent, Ordering::Relaxed) != percent {
+                                        debug!(track_id=%track_id_log, fraction_lost, percent, "encoding for remote packet loss");
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -1130,6 +1148,27 @@ impl RtcTrack {
         Ok(())
     }
 
+    /// The share of our packets the receiver last reported lost (RTCP
+    /// `fraction lost`, 0-1), if it has reported.
+    fn reported_fraction_lost(stats: &rustrtc::StatsReport, ssrc: u32) -> Option<f32> {
+        let reports: Vec<_> = stats
+            .entries
+            .iter()
+            .filter(|e| e.kind == rustrtc::StatsKind::RemoteInboundRtp)
+            .collect();
+        // ours, or the only one when our SSRC was left to rustrtc
+        let report = reports
+            .iter()
+            .find(|e| e.values.get("ssrc").and_then(|v| v.as_u64()) == Some(ssrc as u64))
+            .or(if reports.len() == 1 {
+                reports.first()
+            } else {
+                None
+            })?;
+        let fraction_lost = report.values.get("fractionLost")?.as_u64()?;
+        Some(fraction_lost as f32 / 256.0)
+    }
+
     /// Encode Opus as the remote description's `a=fmtp` for it asks: its
     /// rate, bitrate and in-band FEC. Only for the remote's description, the
     /// parameters being what it receives.
@@ -1434,6 +1473,8 @@ impl Track for RtcTrack {
             }
             crate::media::Samples::PCM { samples } => {
                 let payload_type = self.get_payload_type();
+                self.encoder
+                    .set_opus_packet_loss(self.remote_loss.load(Ordering::Relaxed));
                 let (_, encoded) = self.encoder.encode(payload_type, packet.clone());
                 let target_codec = self
                     .encoder
@@ -2366,6 +2407,33 @@ a=fmtp:109 {fmtp}\r\na=sendrecv\r\n"
                 inband_fec: false,
             }
         );
+    }
+
+    /// The loss the receiver reports for our stream, out of the stats.
+    #[test]
+    fn reported_fraction_lost_is_ours() {
+        use rustrtc::{StatsEntry, StatsId, StatsKind, StatsReport};
+        use serde_json::json;
+        let report = |ssrc: u32, fraction_lost: u8| {
+            StatsEntry::new(
+                StatsId::new(format!("r-{ssrc}")),
+                StatsKind::RemoteInboundRtp,
+            )
+            .with_value("ssrc", json!(ssrc))
+            .with_value("fractionLost", json!(fraction_lost))
+        };
+        let inbound = StatsEntry::new(StatsId::new("i"), StatsKind::InboundRtp)
+            .with_value("ssrc", json!(7))
+            .with_value("fractionLost", json!(255));
+        let stats = StatsReport::new(vec![inbound.clone(), report(1, 64), report(2, 128)]);
+        assert_eq!(RtcTrack::reported_fraction_lost(&stats, 2), Some(0.5));
+        // ours unknown: only the one report there is
+        assert_eq!(RtcTrack::reported_fraction_lost(&stats, 0), None);
+        let stats = StatsReport::new(vec![inbound.clone(), report(1, 64)]);
+        assert_eq!(RtcTrack::reported_fraction_lost(&stats, 0), Some(0.25));
+        // none yet
+        let stats = StatsReport::new(vec![inbound]);
+        assert_eq!(RtcTrack::reported_fraction_lost(&stats, 7), None);
     }
 
     /// Voximplant offer (static payload types without rtpmap): our G722 preference wins.
