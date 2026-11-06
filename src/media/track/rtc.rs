@@ -1,4 +1,4 @@
-use super::track_codec::{TrackCodec, codec_for_pt, duration_to_rtp_ticks};
+use super::track_codec::{OpusParams, TrackCodec, codec_for_pt, duration_to_rtp_ticks};
 use crate::{
     callrecord::CallRecordHangupReason,
     event::{EventSender, SessionEvent},
@@ -1130,6 +1130,34 @@ impl RtcTrack {
         Ok(())
     }
 
+    /// Encode Opus as the remote description's `a=fmtp` for it asks: its
+    /// rate, bitrate and in-band FEC. Only for the remote's description, the
+    /// parameters being what it receives.
+    fn apply_remote_opus_fmtp(&mut self, sdp: &rustrtc::SessionDescription) {
+        let opus: Vec<_> = sdp
+            .first_audio_section()
+            .map(|media| media.to_audio_capabilities())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|cap| CodecType::try_from(cap.codec_name.as_str()) == Ok(CodecType::Opus))
+            .collect();
+        // the payload type we send, else the remote's preferred Opus one
+        let Some(cap) = opus
+            .iter()
+            .find(|cap| Some(cap.payload_type) == self.payload_type)
+            .or(opus.first())
+        else {
+            return;
+        };
+        let params = cap
+            .fmtp
+            .as_deref()
+            .map(OpusParams::from_fmtp)
+            .unwrap_or_default();
+        debug!(track_id=%self.track_id, pt = cap.payload_type, ?params, "remote Opus parameters");
+        self.encoder.set_opus_params(params);
+    }
+
     fn normalize_sdp(sdp: &str) -> String {
         sdp.lines()
             .map(|line| {
@@ -1247,6 +1275,7 @@ impl RtcTrack {
 
             // Extract negotiated payload types from SDP string
             self.parse_sdp_payload_types(sdp_type, answer)?;
+            self.apply_remote_opus_fmtp(&sdp_obj);
         }
         Ok(())
     }
@@ -1300,6 +1329,7 @@ impl Track for RtcTrack {
         let mut answer = pc.create_answer().await?;
         crate::media::negotiate::intersect_answer(&sdp, &mut answer);
         self.parse_sdp_payload_types(rustrtc::SdpType::Answer, &answer.to_sdp_string())?;
+        self.apply_remote_opus_fmtp(&sdp);
 
         pc.set_local_description(answer.clone())?;
 
@@ -2274,6 +2304,68 @@ a=rtpmap:101 telephone-event/8000\r\na=rtpmap:120 telephone-event/48000\r\na=sen
         assert!(!answer.contains("telephone-event/8000"));
         assert_eq!(track.get_payload_type(), 114);
         assert_eq!(track.telephone_event_payload_type(48000), Some(120));
+    }
+
+    /// Opus is encoded as the offer's fmtp for it asks, not ours in the
+    /// answer: those are what each side receives.
+    #[tokio::test]
+    async fn opus_encoded_as_the_offers_fmtp_asks() {
+        let offer = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+m=audio 40000 RTP/AVP 109 8\r\na=rtpmap:109 opus/48000/2\r\n\
+a=fmtp:109 maxplaybackrate=16000;stereo=1;useinbandfec=1;maxaveragebitrate=24000\r\n\
+a=rtpmap:8 PCMA/8000\r\na=sendrecv\r\n";
+        let mut track = codecs_track(vec![CodecType::Opus, CodecType::PCMA]);
+        track.handshake(offer.to_string(), None).await.unwrap();
+        assert_eq!(track.get_payload_type(), 109);
+        assert_eq!(
+            track.encoder.opus_params(),
+            OpusParams {
+                max_playback_rate: 16000,
+                max_average_bitrate: Some(24000),
+                inband_fec: true,
+            }
+        );
+    }
+
+    /// Outbound: the answer's fmtp, under the answer's own number for Opus
+    /// (ours is 111) - and a later answer with other parameters replaces it.
+    #[tokio::test]
+    async fn opus_encoded_as_the_answers_fmtp_asks() {
+        let answer = |fmtp: &str| {
+            format!(
+                "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+m=audio 40000 RTP/AVP 109\r\na=rtpmap:109 opus/48000/2\r\n\
+a=fmtp:109 {fmtp}\r\na=sendrecv\r\n"
+            )
+        };
+        let mut track = codecs_track(vec![CodecType::Opus, CodecType::PCMA]);
+        track.create().await.unwrap();
+        track.local_description().await.unwrap();
+        track
+            .update_remote_description(&answer("maxplaybackrate=16000;useinbandfec=1"))
+            .await
+            .unwrap();
+        assert_eq!(track.get_payload_type(), 109);
+        assert_eq!(
+            track.encoder.opus_params(),
+            OpusParams {
+                max_playback_rate: 16000,
+                max_average_bitrate: None,
+                inband_fec: true,
+            }
+        );
+        track
+            .update_remote_description_force(&answer("maxaveragebitrate=20000"))
+            .await
+            .unwrap();
+        assert_eq!(
+            track.encoder.opus_params(),
+            OpusParams {
+                max_playback_rate: 48000,
+                max_average_bitrate: Some(20000),
+                inband_fec: false,
+            }
+        );
     }
 
     /// Voximplant offer (static payload types without rtpmap): our G722 preference wins.
