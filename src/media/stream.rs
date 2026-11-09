@@ -388,7 +388,22 @@ impl MediaStream {
     }
 
     pub async fn update_track(&self, mut track: Box<dyn Track>, play_id: Option<String>) {
-        self.remove_track(track.id(), false).await;
+        // Detach the replaced track WITHOUT closing its transport right away:
+        // the predecessor's PeerConnection teardown races against the
+        // successor's media setup and can leave the successor completely deaf
+        // (inbound RTP never demuxed — INVITE-mode auto-refer transfers hit
+        // exactly this: the transfer leg consumed no media and the session
+        // was hung up by the inactivity watchdog ~50s later). Disarm the old
+        // track's pipeline (inactivity watchdog, workers) now, and close its
+        // transport after a short grace period.
+        let replaced = { self.tracks.lock().await.remove(track.id()) };
+        if let Some((old_track, _)) = replaced {
+            old_track.cancel_pipeline();
+            crate::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                let _ = old_track.stop().await;
+            });
+        }
         self.attach_recorder_tap(&mut track).await;
         match track
             .start(self.event_sender.clone(), self.packet_sender.clone())

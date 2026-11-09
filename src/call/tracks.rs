@@ -426,7 +426,13 @@ impl ActiveCall {
         let processors = match StreamEngine::create_processors(
             self.app_state.stream_engine.clone(),
             track.id().clone(),
-            self.cancel_token.child_token(),
+            // Bind per-track workers (inactivity watchdog, VAD/ASR pipelines)
+            // to the TRACK's own lifecycle token — NOT to the session token.
+            // Bound to the session token, a replaced/retired leg would leave
+            // its watchdog behind with a frozen last-frame timestamp; the
+            // watchdog then fires ~50s later and tears down a healthy call
+            // (INVITE-mode auto-refer transfers hit exactly this).
+            track.cancel_token().child_token(),
             self.event_sender.clone(),
             self.media_stream.packet_sender.clone(),
             option,

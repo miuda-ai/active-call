@@ -44,6 +44,9 @@ impl Track for TestTrack {
     fn ssrc(&self) -> u32 {
         0 // Placeholder, as TestTrack does not use SSRC
     }
+    fn cancel_token(&self) -> tokio_util::sync::CancellationToken {
+        tokio_util::sync::CancellationToken::new()
+    }
     fn id(&self) -> &TrackId {
         &self.id
     }
@@ -123,6 +126,9 @@ impl CollectTrack {
 impl Track for CollectTrack {
     fn ssrc(&self) -> u32 {
         0
+    }
+    fn cancel_token(&self) -> tokio_util::sync::CancellationToken {
+        tokio_util::sync::CancellationToken::new()
     }
     fn id(&self) -> &TrackId {
         &self.id
@@ -550,6 +556,9 @@ impl StoppableTestTrack {
 impl Track for StoppableTestTrack {
     fn ssrc(&self) -> u32 {
         0
+    }
+    fn cancel_token(&self) -> tokio_util::sync::CancellationToken {
+        tokio_util::sync::CancellationToken::new()
     }
     fn id(&self) -> &TrackId {
         &self.id

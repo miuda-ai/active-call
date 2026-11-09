@@ -1,3 +1,7 @@
+//! Integration tests requiring the `offline` feature (bundled VAD/ASR
+//! models). Skipped entirely when the crate is built without it.
+#![cfg(feature = "offline")]
+
 use active_call::offline::sensevoice::{FeaturePipeline, FrontendConfig, language_id_from_code};
 use active_call::offline::{
     OfflineModels,

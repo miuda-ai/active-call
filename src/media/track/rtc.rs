@@ -1257,6 +1257,17 @@ impl Track for RtcTrack {
     fn ssrc(&self) -> u32 {
         self.ssrc
     }
+
+    fn cancel_token(&self) -> CancellationToken {
+        self.cancel_token.clone()
+    }
+
+    fn cancel_pipeline(&self) {
+        // Cancels the event/stats loop and the per-track workers (inactivity
+        // watchdog) while keeping the PeerConnection alive — the successor's
+        // media setup must not race against this PC's teardown.
+        self.cancel_token.cancel();
+    }
     fn id(&self) -> &TrackId {
         &self.track_id
     }
@@ -1656,6 +1667,24 @@ impl RtcTrack {
 mod tests {
     use super::*;
     use crate::media::track::TrackConfig;
+
+    /// Per-track workers (the inactivity watchdog) derive from the token
+    /// passed to `RtcTrack::new`; `stop()` must cancel it so that a replaced
+    /// or retired track leaves no zombie watchdog behind.
+    #[tokio::test]
+    async fn stop_cancels_lifecycle_token() {
+        let token = CancellationToken::new();
+        let track = RtcTrack::new(
+            token.clone(),
+            "test-track-stop".to_string(),
+            TrackConfig::default(),
+            RtcTrackConfig::default(),
+        );
+        assert!(!token.is_cancelled());
+        track.stop().await.expect("stop failed");
+        assert!(token.is_cancelled());
+        assert!(track.cancel_token().is_cancelled());
+    }
 
     #[test]
     fn test_parse_sdp_payload_types() {

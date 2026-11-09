@@ -217,6 +217,11 @@ pub struct ReferOption {
     /// Custom headers blindly forwarded onto the transfer INVITE (e.g.
     /// `User-to-User`, `X-ACC-Bizdata` received on an incoming REFER).
     pub extra_headers: Option<HashMap<String, String>>,
+    /// Inactivity timeout (seconds) for the refer/bridge legs. When the leg
+    /// receives no media frames for this long it fires
+    /// `SessionEvent::Inactivity`, which ends the call. Defaults to
+    /// `CallOption::default()` (50s); `0` disables the watchdog.
+    pub inactivity_timeout: Option<u64>,
 }
 
 #[skip_serializing_none]

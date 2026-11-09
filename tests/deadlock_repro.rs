@@ -16,6 +16,9 @@ impl Track for MockTrack {
     fn ssrc(&self) -> u32 {
         0
     }
+    fn cancel_token(&self) -> tokio_util::sync::CancellationToken {
+        tokio_util::sync::CancellationToken::new()
+    }
     fn id(&self) -> &String {
         &self.id
     }

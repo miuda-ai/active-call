@@ -258,6 +258,9 @@ mod tests {
         fn ssrc(&self) -> u32 {
             0
         }
+        fn cancel_token(&self) -> tokio_util::sync::CancellationToken {
+            tokio_util::sync::CancellationToken::new()
+        }
         fn id(&self) -> &TrackId {
             &self.id
         }
@@ -1352,6 +1355,9 @@ impl ActiveCall {
                     timeout: Some(self.app_state.config.auto_refer_timeout()),
                     denoise: None,
                     agc: None,
+                    // The auto-refer transfer MUST be followed as quickly as
+                    // possible; keep the default watchdog window.
+                    inactivity_timeout: None,
                     moh: None,
                     vad: None,
                     asr: None,
@@ -2399,6 +2405,14 @@ impl ActiveCall {
                 }),
             denoise: refer_option.as_ref().and_then(|o| o.denoise.clone()),
             agc: refer_option.as_ref().and_then(|o| o.agc.clone()),
+            // Refer legs must inherit their inactivity watchdog from the
+            // refer option when given (ops/API override), falling back to the
+            // `CallOption::default()` (50s) so the previous always-armed
+            // behavior is preserved.
+            inactivity_timeout: refer_option
+                .as_ref()
+                .and_then(|o| o.inactivity_timeout)
+                .or_else(|| CallOption::default().inactivity_timeout),
             recorder,
             ..Default::default()
         };

@@ -1108,6 +1108,9 @@ mod tests {
         fn ssrc(&self) -> u32 {
             0
         }
+        fn cancel_token(&self) -> tokio_util::sync::CancellationToken {
+            tokio_util::sync::CancellationToken::new()
+        }
         fn id(&self) -> &TrackId {
             &self.id
         }

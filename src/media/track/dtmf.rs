@@ -74,6 +74,10 @@ impl Track for DtmfTrack {
     fn ssrc(&self) -> u32 {
         self.ssrc
     }
+
+    fn cancel_token(&self) -> CancellationToken {
+        self.cancel_token.clone()
+    }
     fn id(&self) -> &TrackId {
         &self.track_id
     }

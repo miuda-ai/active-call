@@ -167,6 +167,53 @@ fn is_rtp(msg: &[u8]) -> bool {
     msg.len() >= 12 && (msg[0] & 0xC0) == 0x80
 }
 
+/// Stream PCMU RTP towards the media endpoint advertised in a received SDP
+/// body (`offer` = the full SIP message). Real carrier legs always send RTP;
+/// the refer/bridge legs' inactivity watchdog counts on those frames.
+async fn pump_rtp(offer: String, duration: Duration, ssrc: u32) {
+    let body = offer.split("\r\n\r\n").nth(1).unwrap_or(&offer);
+    let mut port: Option<u16> = None;
+    let mut host = "127.0.0.1".to_string();
+    for line in body.lines() {
+        if let Some(rest) = line.strip_prefix("m=audio ") {
+            if let Some(tok) = rest.split_whitespace().next() {
+                port = tok.parse().ok();
+            }
+        } else if let Some(h) = line.strip_prefix("c=IN IP4 ") {
+            host = h.trim().to_string();
+        }
+    }
+    let Some(port) = port else {
+        return;
+    };
+    let Ok(dst) = format!("{host}:{port}").parse::<std::net::SocketAddr>() else {
+        return;
+    };
+    let Ok(socket) = UdpSocket::bind(("127.0.0.1", 0)).await else {
+        return;
+    };
+    println!("PUMP started -> {dst} for {duration:?}");
+    let mut pkt = vec![0u8; 172];
+    pkt[0] = 0x80; // V=2
+    pkt[1] = 0x00; // PT=0 (PCMU)
+    pkt[8..12].copy_from_slice(&ssrc.to_be_bytes());
+    let mut seq: u16 = rand::random();
+    let mut ts: u32 = rand::random();
+    let mut tick = tokio::time::interval(Duration::from_millis(20));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let deadline = tokio::time::Instant::now() + duration;
+    while tokio::time::Instant::now() < deadline {
+        tick.tick().await;
+        pkt[2..4].copy_from_slice(&seq.to_be_bytes());
+        pkt[4..8].copy_from_slice(&ts.to_be_bytes());
+        if socket.send_to(&pkt, dst).await.is_err() {
+            break;
+        }
+        seq = seq.wrapping_add(1);
+        ts = ts.wrapping_add(160);
+    }
+}
+
 /// Raw-UDP SIP helpers shared by the fake carrier (Bot B) and agent (Bot C).
 struct SipSock {
     socket: UdpSocket,
@@ -206,6 +253,7 @@ impl SipSock {
                     }
                     let msg = String::from_utf8_lossy(&buf[..n]).to_string();
                     info!(%src, first = %msg.lines().next().unwrap_or(""), "bot received");
+                    if msg.starts_with("BYE") { println!("CUSTOMER got BYE at {:?}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()); }
                     return Some(msg);
                 }
                 _ => return None,
@@ -372,6 +420,10 @@ async fn run_bridge_bot(mut sock: SipSock, agent_port: u16, events: mpsc::Unboun
     })
     .await;
 
+    // Keep the bridge leg's inactivity watchdog fed with inbound RTP, like a
+    // real carrier leg would.
+    tokio::spawn(pump_rtp(invite.clone(), Duration::from_secs(30), rand::random()));
+
     // Send the in-dialog REFER with Refer-To = agent, plus carrier routing
     // headers that must survive onto the transfer INVITE.
     tokio::time::sleep(Duration::from_millis(700)).await;
@@ -414,8 +466,13 @@ async fn run_bridge_bot(mut sock: SipSock, agent_port: u16, events: mpsc::Unboun
     }
 }
 
-/// Bot C — agent: answers the transfer INVITE, hangs up after a moment.
-async fn run_agent_bot(mut sock: SipSock, events: mpsc::UnboundedSender<String>) {
+/// Bot C — agent: answers the transfer INVITE, streams RTP for `hold`, then
+/// hangs up.
+async fn run_agent_bot(
+    mut sock: SipSock,
+    events: mpsc::UnboundedSender<String>,
+    hold: Duration,
+) {
     let invite = loop {
         match sock.recv_sip(Duration::from_secs(25)).await {
             Some(msg) if msg.starts_with("INVITE") => break msg,
@@ -449,8 +506,10 @@ async fn run_agent_bot(mut sock: SipSock, events: mpsc::UnboundedSender<String>)
     })
     .await;
 
-    // Talk for a moment, then hang up.
-    tokio::time::sleep(Duration::from_millis(1200)).await;
+    // Talk for a while (feeding the transfer leg's inactivity watchdog with
+    // RTP, like a real agent endpoint), then hang up.
+    tokio::spawn(pump_rtp(invite.clone(), hold + Duration::from_secs(4), rand::random()));
+    tokio::time::sleep(hold).await;
     sock.send_in_dialog(&invite, "BYE", &[], 2);
     loop {
         match sock.recv_sip(Duration::from_secs(8)).await {
@@ -468,7 +527,12 @@ async fn run_agent_bot(mut sock: SipSock, events: mpsc::UnboundedSender<String>)
 }
 
 /// Customer — raw UAC: calls in, then waits for the final BYE.
-async fn run_customer(sock: SipSock, pbx: std::net::SocketAddr, events: mpsc::UnboundedSender<String>) {
+async fn run_customer(
+    sock: SipSock,
+    pbx: std::net::SocketAddr,
+    events: mpsc::UnboundedSender<String>,
+    min_alive: Duration,
+) {
     let call_id = "auto-refer-customer-1";
     let invite = format!(
         "INVITE sip:100@{pbx} SIP/2.0\r\n\
@@ -499,7 +563,8 @@ async fn run_customer(sock: SipSock, pbx: std::net::SocketAddr, events: mpsc::Un
             }
         }
     };
-    // ACK the 200 OK.
+    // ACK the 200 OK and stream RTP towards the PBX's answer port, like a
+    // real customer endpoint (keeps the caller leg's inactivity watchdog fed).
     let via = sock.hdr(&ok, "Via").unwrap_or_default();
     let to = sock.hdr(&ok, "To").unwrap_or_default();
     let ack = format!(
@@ -514,13 +579,28 @@ async fn run_customer(sock: SipSock, pbx: std::net::SocketAddr, events: mpsc::Un
     );
     sock.send_raw(&ack, pbx).await;
     let _ = events.send("customer_answered".into());
+    // Stream RTP to the answer's media port for the whole call duration
+    // (feeds the caller leg's inactivity watchdog, like a real endpoint).
+    let answer_body = ok.split("\r\n\r\n").nth(1).unwrap_or_default().to_string();
+    tokio::spawn(pump_rtp(answer_body, Duration::from_secs(120), rand::random()));
 
     // The session must survive the transfer; the final BYE comes only after
-    // the agent hangs up.
+    // the agent hangs up. Stay listening for the whole expected call duration
+    // (`min_alive` covers the agent's hold + teardown) — a plain per-iteration
+    // timeout would end this task long before the final BYE on long holds.
+    let alive_deadline = tokio::time::Instant::now() + min_alive;
     loop {
-        match sock.recv_sip(Duration::from_secs(25)).await {
+        let wait = alive_deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .min(Duration::from_secs(25));
+        if wait.is_zero() {
+            println!("CUSTOMER EXIT: alive window over, no bye");
+            let _ = events.send("TIMEOUT: customer never got BYE".into());
+            return;
+        }
+        match sock.recv_sip(wait).await {
             Some(msg) if msg.starts_with("BYE") => {
-                sock.reply(&msg, "SIP/2.0 200 OK", None);
+                            sock.reply(&msg, "SIP/2.0 200 OK", None);
                 let _ = events.send("customer_got_bye".into());
                 return;
             }
@@ -528,10 +608,7 @@ async fn run_customer(sock: SipSock, pbx: std::net::SocketAddr, events: mpsc::Un
                 sock.reply(&msg, "SIP/2.0 405 Method Not Allowed", None);
             }
             Some(_) => {}
-            None => {
-                let _ = events.send("TIMEOUT: customer never got BYE".into());
-                return;
-            }
+            None => {}
         }
     }
 }
@@ -573,7 +650,7 @@ async fn auto_refer_follows_bridge_leg_refer() {
     let agent_sock = SipSock::bind().await;
     let agent_port = agent_sock.port();
     let (agent_tx, mut agent_rx) = mpsc::unbounded_channel();
-    tokio::spawn(run_agent_bot(agent_sock, agent_tx));
+    tokio::spawn(run_agent_bot(agent_sock, agent_tx, Duration::from_millis(1200)));
 
     // Bridge (Bot B).
     let bridge_sock = SipSock::bind().await;
@@ -584,7 +661,12 @@ async fn auto_refer_follows_bridge_leg_refer() {
     // Customer (Bot A) + PBX + webhook.
     let customer_sock = SipSock::bind().await;
     let (customer_tx, mut customer_rx) = mpsc::unbounded_channel();
-    tokio::spawn(run_customer(customer_sock, pbx, customer_tx));
+    tokio::spawn(run_customer(
+        customer_sock,
+        pbx,
+        customer_tx,
+        Duration::from_secs(30),
+    ));
 
     // Attach the WS bot and accept, then trigger the INVITE-mode refer to the bridge.
     let (mut ws_sink, mut ws_events) = attach_and_accept(&mut node).await;
@@ -684,4 +766,189 @@ async fn auto_refer_follows_bridge_leg_refer() {
         .expect("customer never received the final BYE");
 
     info!("auto-refer bridge test completed successfully");
+}
+
+/// Regression for the production "transfer kills the call ~50s later" bug
+/// (INVITE-mode carriers, e.g. Aliyun CC):
+///
+/// The refer/bridge legs' inactivity watchdog was bound to the SESSION
+/// lifetime instead of the leg track's own. When the auto-refer transfer
+/// succeeded and retired the superseded bridge leg, that leg's watchdog was
+/// left behind with a frozen last-frame timestamp; ~50s later it fired and
+/// `do_hangup` tore down the healthy customer↔agent call.
+///
+/// A short watchdog (3s, via the new `ReferOption::inactivity_timeout`) keeps
+/// this test fast. The transfer must survive well past the watchdog window:
+/// pre-fix the retired leg's zombie watchdog fires ~3s after the transfer and
+/// kills the session; post-fix the session only ends when the agent hangs up.
+#[tokio::test]
+async fn auto_refer_transfer_survives_refer_leg_watchdog() {
+    tracing_subscriber::fmt()
+        .with_max_level(Level::INFO)
+        .with_test_writer()
+        .try_init()
+        .ok();
+
+    let mut node = spawn_node(35272).await;
+    let pbx = format!("127.0.0.1:{}", node.sip_port).parse().unwrap();
+
+    let agent_sock = SipSock::bind().await;
+    let agent_port = agent_sock.port();
+    let (agent_tx, mut agent_rx) = mpsc::unbounded_channel();
+    // The agent holds the call for 8s — well past the 3s watchdog window.
+    tokio::spawn(run_agent_bot(agent_sock, agent_tx, Duration::from_secs(8)));
+
+    let bridge_sock = SipSock::bind().await;
+    let bridge_port = bridge_sock.port();
+    let (bridge_tx, mut bridge_rx) = mpsc::unbounded_channel();
+    tokio::spawn(run_bridge_bot(bridge_sock, agent_port, bridge_tx));
+
+    let customer_sock = SipSock::bind().await;
+    let (customer_tx, mut customer_rx) = mpsc::unbounded_channel();
+    tokio::spawn(run_customer(
+        customer_sock,
+        pbx,
+        customer_tx,
+        Duration::from_secs(30),
+    ));
+
+    let (mut ws_sink, mut ws_events) = attach_and_accept(&mut node).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    ws_sink
+        .send(Message::text(
+            format!(
+                r#"{{"command":"refer","caller":"sip:1001@127.0.0.1","callee":"sip:bridge@127.0.0.1:{bridge_port}","options":{{"inactivityTimeout":3}}}}"#
+            ),
+        ))
+        .await
+        .expect("failed to send refer command");
+
+    wait_event(&mut bridge_rx, "answered", Duration::from_secs(15))
+        .await
+        .expect("bridge leg was never answered");
+    wait_event(&mut bridge_rx, "refer_accepted", Duration::from_secs(10))
+        .await
+        .expect("REFER was not accepted (202 missing)");
+    wait_event(&mut agent_rx, "agent_answered", Duration::from_secs(15))
+        .await
+        .expect("transfer INVITE never reached the agent");
+    wait_event(&mut bridge_rx, "bridge_bye_received", Duration::from_secs(15))
+        .await
+        .expect("superseded bridge leg was never hung up");
+
+    // The transfer is complete and the bridge leg (with its armed watchdog)
+    // is gone. Hold the call past the watchdog window: pre-fix the retired
+    // leg's zombie watchdog fires here and hangs up the session.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+
+    let mut premature = None;
+    while let Ok(ev) = customer_rx.try_recv() {
+        if ev.contains("customer_got_bye") {
+            premature = Some(ev);
+        }
+    }
+    while let Ok(ev) = ws_events.try_recv() {
+        if ev.contains("\"hangup\"") {
+            premature = Some(ev);
+        }
+    }
+    assert!(
+        premature.is_none(),
+        "session was killed during the post-transfer watchdog window (zombie inactivity watchdog on the superseded leg): {premature:?}"
+    );
+
+    // The agent then hangs up and the session tears down normally.
+    wait_event(&mut agent_rx, "agent_bye_acknowledged", Duration::from_secs(10))
+        .await
+        .expect("agent BYE was not acknowledged");
+    wait_event(&mut ws_events, "\"hangup\"", Duration::from_secs(10))
+        .await
+        .expect("session did not tear down after the agent hung up");
+    wait_event(&mut customer_rx, "customer_got_bye", Duration::from_secs(15))
+        .await
+        .expect("customer never received the final BYE");
+
+    info!("auto-refer watchdog regression test completed successfully");
+}
+
+/// Same scenario as `auto_refer_follows_bridge_leg_refer`, but with the
+/// DEFAULT 50s inactivity watchdog (no `ReferOption::inactivity_timeout`
+/// override) and the agent holding the call for 65s: the session must stay
+/// up well past the 50s watchdog window after the transfer ("聊到一半被转接
+/// 后 ~50s 挂断" production bug), and only end when the agent hangs up.
+#[tokio::test]
+async fn auto_refer_transfer_survives_default_50s_watchdog() {
+    tracing_subscriber::fmt()
+        .with_max_level(Level::INFO)
+        .with_test_writer()
+        .try_init()
+        .ok();
+
+    let mut node = spawn_node(35273).await;
+    let pbx = format!("127.0.0.1:{}", node.sip_port).parse().unwrap();
+
+    let agent_sock = SipSock::bind().await;
+    let agent_port = agent_sock.port();
+    let (agent_tx, mut agent_rx) = mpsc::unbounded_channel();
+    tokio::spawn(run_agent_bot(agent_sock, agent_tx, Duration::from_secs(65)));
+
+    let bridge_sock = SipSock::bind().await;
+    let bridge_port = bridge_sock.port();
+    let (bridge_tx, mut bridge_rx) = mpsc::unbounded_channel();
+    tokio::spawn(run_bridge_bot(bridge_sock, agent_port, bridge_tx));
+
+    let customer_sock = SipSock::bind().await;
+    let (customer_tx, mut customer_rx) = mpsc::unbounded_channel();
+    tokio::spawn(run_customer(
+        customer_sock,
+        pbx,
+        customer_tx,
+        Duration::from_secs(85),
+    ));
+
+    let (mut ws_sink, mut ws_events) = attach_and_accept(&mut node).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    ws_sink
+        .send(Message::text(
+            format!(
+                r#"{{"command":"refer","caller":"sip:1001@127.0.0.1","callee":"sip:bridge@127.0.0.1:{bridge_port}"}}"#
+            ),
+        ))
+        .await
+        .expect("failed to send refer command");
+
+    wait_event(&mut bridge_rx, "bridge_bye_received", Duration::from_secs(20))
+        .await
+        .expect("superseded bridge leg was never hung up");
+
+    // The transfer is done; hold past the DEFAULT 50s watchdog window and
+    // assert the session is still alive (customer connected, no hangup).
+    tokio::time::sleep(Duration::from_secs(55)).await;
+    let mut premature = None;
+    while let Ok(ev) = customer_rx.try_recv() {
+        if ev.contains("customer_got_bye") {
+            premature = Some(ev);
+        }
+    }
+    while let Ok(ev) = ws_events.try_recv() {
+        if ev.contains("\"hangup\"") {
+            premature = Some(ev);
+        }
+    }
+    assert!(
+        premature.is_none(),
+        "session was killed within the default 50s watchdog window after the transfer: {premature:?}"
+    );
+
+    wait_event(&mut agent_rx, "agent_bye_acknowledged", Duration::from_secs(15))
+        .await
+        .expect("agent BYE was not acknowledged");
+    wait_event(&mut ws_events, "\"hangup\"", Duration::from_secs(10))
+        .await
+        .expect("session did not tear down after the agent hung up");
+    wait_event(&mut customer_rx, "customer_got_bye", Duration::from_secs(15))
+        .await
+        .expect("customer never received the final BYE");
+
+    info!("auto-refer default-watchdog test completed successfully");
 }

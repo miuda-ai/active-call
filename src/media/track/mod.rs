@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use audio_codec::CodecType;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 pub type TrackPacketSender = mpsc::UnboundedSender<AudioFrame>;
 pub type TrackPacketReceiver = mpsc::UnboundedReceiver<AudioFrame>;
@@ -62,6 +63,19 @@ pub mod websocket;
 pub trait Track: Send + Sync {
     fn ssrc(&self) -> u32;
     fn id(&self) -> &TrackId;
+    /// The track's lifecycle token: cancelled by `stop()`/`stop_graceful()`
+    /// (directly or through the track's own event loop teardown).
+    ///
+    /// Per-track background workers spawned on behalf of this track (e.g. the
+    /// inactivity watchdog created by `setup_track_with_stream`) MUST derive
+    /// their lifetime from this token, so that stopping or replacing the
+    /// track disarms them. Binding those workers to the session token instead
+    /// leaves "zombie" watchdogs behind: a retired leg keeps its frozen
+    /// last-frame timestamp and eventually fires `SessionEvent::Inactivity`
+    /// against a call that is alive and well (seen with INVITE-mode
+    /// auto-refer transfers, where the superseded bridge leg's watchdog
+    /// killed the session ~50s after a successful transfer).
+    fn cancel_token(&self) -> CancellationToken;
     fn config(&self) -> &TrackConfig;
     fn set_paused(&self, _paused: bool) -> bool {
         false
@@ -70,6 +84,14 @@ pub trait Track: Send + Sync {
         false
     }
     fn processor_chain(&mut self) -> &mut ProcessorChain;
+    /// Cancel the track's media pipeline (per-track workers, inactivity
+    /// watchdog) WITHOUT closing the underlying transport. Used when a track
+    /// is replaced by a successor: the successor's media setup must not race
+    /// against the predecessor's transport teardown.
+    /// The full `stop()` (which closes the transport) follows afterwards.
+    fn cancel_pipeline(&self) {
+        // Default: nothing to cancel for tracks without a pipeline.
+    }
     fn insert_processor(&mut self, processor: Box<dyn Processor>) {
         self.processor_chain().insert_processor(processor);
     }
