@@ -463,3 +463,57 @@ fn reset_state_clears_the_recurrent_state() {
     );
     assert_eq!(vad.session.quiet_chunks, 0);
 }
+
+fn probs_with_floor(samples: &[i16], floor: f32) -> Vec<f32> {
+    TinySilero::new(VADOption {
+        samplerate: 16000,
+        min_level_dbfs: Some(floor),
+        ..Default::default()
+    })
+    .unwrap()
+    .process_samples(samples)
+}
+
+/// pcm scaled to an RMS level in dBFS (the TTS clips are stored at ~-73).
+fn at_level(pcm: &[i16], dbfs: f32) -> Vec<i16> {
+    let power = pcm
+        .iter()
+        .map(|&s| (s as f32 / 32768.0).powi(2))
+        .sum::<f32>()
+        / pcm.len() as f32;
+    let gain = 10f32.powf((dbfs - 10.0 * power.log10()) / 20.0);
+    pcm.iter()
+        .map(|&s| (s as f32 * gain).clamp(-32768.0, 32767.0) as i16)
+        .collect()
+}
+
+#[test]
+fn speech_under_level_floor_is_not_voice() {
+    for (name, pcm) in clips() {
+        // faint talk in the background; the model alone calls it speech
+        let quiet = at_level(&pcm, -55.0);
+        assert!(
+            max(&probs(&quiet)) > 0.5,
+            "{name}: model alone doesn't hear it"
+        );
+        let p = probs_with_floor(&quiet, -40.0);
+        assert!(max(&p) == 0.0, "{name}: max = {}", max(&p));
+    }
+}
+
+#[test]
+fn level_floor_keeps_normal_speech() {
+    for (name, pcm) in clips() {
+        // a quiet caller on a phone line
+        let pcm = at_level(&pcm, -30.0);
+        let plain = probs(&pcm);
+        let floored = probs_with_floor(&pcm, -40.0);
+        let voiced = |p: &[f32]| p.iter().filter(|&&x| x > 0.5).count();
+        assert!(
+            voiced(&floored) * 10 >= voiced(&plain) * 9,
+            "{name}: {} of {} voiced chunks kept",
+            voiced(&floored),
+            voiced(&plain)
+        );
+    }
+}
