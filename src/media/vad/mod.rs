@@ -30,6 +30,11 @@ pub struct VADOption {
     pub silence_padding: u64,
     pub ratio: f32,
     pub voice_threshold: f32,
+    /// Audio quieter than this (RMS, dBFS) is never speech, whatever the model
+    /// says; None disables. Faint background talk - the call-centre ambience
+    /// some voice assistants play under themselves - otherwise reads as speech
+    /// once heard for a few seconds.
+    pub min_level_dbfs: Option<f32>,
     pub max_buffer_duration_secs: u64,
     /// Timeout duration for silence (in ms), None means disable this feature
     pub silence_timeout: Option<u64>,
@@ -49,6 +54,7 @@ impl Default for VADOption {
             silence_padding: 100, // min_silence_duration_ms
             ratio: 0.5,
             voice_threshold: 0.5,
+            min_level_dbfs: None,
             max_buffer_duration_secs: 50,
             silence_timeout: None,
             endpoint: None,
