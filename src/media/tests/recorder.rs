@@ -750,3 +750,89 @@ async fn test_recorder_native_wav_header_bytes() -> Result<()> {
 
     Ok(())
 }
+
+/// Record a constant +OWN on the own leg and -OWN on the other leg, returning
+/// the (left, right) samples of the resulting stereo WAV.
+async fn record_constant_legs(
+    native_samplerate: bool,
+    swap_channels: bool,
+) -> Result<(Vec<i16>, Vec<i16>)> {
+    const OWN: Sample = 1000;
+    let rate = if native_samplerate { 8000 } else { 16000 };
+    let temp_dir = tempdir()?;
+    let file_path = temp_dir.path().join("test_swap_channels.wav");
+    let file_path_clone = file_path.clone();
+    let config = RecorderOption {
+        native_samplerate: Some(native_samplerate),
+        swap_channels: Some(swap_channels),
+        ..Default::default()
+    };
+    let recorder = Arc::new(Recorder::new(
+        CancellationToken::new(),
+        "caller".to_string(),
+        config,
+    ));
+    let (tx, rx) = mpsc::unbounded_channel();
+    let recorder_clone = recorder.clone();
+    let recorder_handle =
+        tokio::spawn(async move { recorder_clone.process_recording(&file_path_clone, rx).await });
+
+    // In native mode the other leg runs at 16 kHz and is sent first: the WAV
+    // rate must still latch from the own leg, wherever that leg is mapped.
+    let other_rate = 16000;
+    for i in 0..20 {
+        for (track_id, value, leg_rate) in [("callee", -OWN, other_rate), ("caller", OWN, rate)] {
+            tx.send(AudioFrame {
+                track_id: track_id.to_string(),
+                samples: Samples::PCM {
+                    samples: vec![value; (leg_rate / 50) as usize], // 20ms
+                },
+                timestamp: (i * 20) as u64,
+                sample_rate: leg_rate,
+                channels: 1,
+                ..Default::default()
+            })?;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+    recorder.stop_recording()?;
+    recorder_handle.await??;
+
+    let mut reader = hound::WavReader::open(&file_path)?;
+    assert_eq!(reader.spec().channels, 2);
+    assert_eq!(reader.spec().sample_rate, rate);
+    let samples: Vec<i16> = reader.samples::<i16>().collect::<Result<_, _>>()?;
+    let left = samples.iter().step_by(2).copied().collect();
+    let right = samples.iter().skip(1).step_by(2).copied().collect();
+    Ok((left, right))
+}
+
+/// Assert `channel` carries `expected` audio and nothing near the other leg's
+/// level (`-expected`); the margin tolerates resampler ringing at onset.
+fn assert_channel_carries(channel: &[i16], expected: i16, name: &str) {
+    assert!(
+        channel.contains(&expected),
+        "{name} channel never carries {expected}"
+    );
+    assert!(
+        channel
+            .iter()
+            .all(|&s| (s as i32 + expected as i32).abs() > 500),
+        "{name} channel carries audio from the other leg"
+    );
+}
+
+#[tokio::test]
+async fn test_recorder_channel_layout() -> Result<()> {
+    for native in [false, true] {
+        let (left, right) = record_constant_legs(native, false).await?;
+        assert_channel_carries(&left, 1000, "left");
+        assert_channel_carries(&right, -1000, "right");
+
+        let (left, right) = record_constant_legs(native, true).await?;
+        assert_channel_carries(&left, -1000, "swapped left");
+        assert_channel_carries(&right, 1000, "swapped right");
+    }
+    Ok(())
+}
