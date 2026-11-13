@@ -383,6 +383,9 @@ Commands are sent as JSON messages through the WebSocket connection. All timesta
   - `recorderFile` (string): Path to the recording file
   - `samplerate` (number): Recording sample rate in Hz (default: 16000)
   - `ptime` (number): Packet time in milliseconds (default: 200)
+  - `nativeSamplerate` (boolean, optional): Record at the source's native sample rate instead of 16 kHz
+  - `swapChannels` (boolean, optional): Put the session's own leg on the right channel and everything else (bridged peer, TTS, playback) on the left. Default layout is own leg left.
+  - `followBridge` (boolean, optional): Keep recording after this call ends while it is bridged; see [Recording across a bridge](#recording-across-a-bridge)
 - `earlyMedia` (boolean): Enable early media during ringing
 - `ringtone` (string, optional): Custom ringtone URL
 
@@ -623,6 +626,15 @@ The bridge is a media-only operation. It creates separate internal bridge tracks
 - The target session must still be active and must not be the same session.
 - Re-sending `bridge` for the same pair replaces the existing bridge tracks for that pair.
 - If either call ends, its bridge track stops and the peer bridge task exits; the other call remains active until its own client or SIP peer ends it.
+
+##### Recording across a bridge
+
+A call records its own leg on one channel and everything else (bridged peer, TTS, playback) on the other: own leg left by default, right with `recorder.swapChannels`. By default the recording ends with the call. With `recorder.followBridge: true`, if the call ends while it is still bridged to a live call that is bridged back to it, the recording is handed to that peer and continues:
+
+- the peer's own leg is recorded on the other channel, where the bridged audio was;
+- the peer's TTS and playback are recorded on the own channel, in place of the ended call.
+
+The recording ends when the peer ends, or when the peer is bridged to another call. The ended call's call record is sent only once the recording is complete, so its `recorder` entry points to the full file.
 
 #### Unbridge Command
 **Purpose:** Removes the audio bridge between this active call session and another active call session.
@@ -869,6 +881,9 @@ The `CallOption` object is used in `invite` and `accept` commands and contains t
   - `recorderFile` (string): Path to the recording file
   - `samplerate` (number): Recording sample rate in Hz (default: 16000)
   - `ptime` (number): Packet time in milliseconds (default: 200)
+  - `nativeSamplerate` (boolean, optional): Record at the source's native sample rate instead of 16 kHz
+  - `swapChannels` (boolean, optional): Put the session's own leg on the right channel and everything else (bridged peer, TTS, playback) on the left. Default layout is own leg left.
+  - `followBridge` (boolean, optional): Keep recording after this call ends while it is bridged; see [Recording across a bridge](#recording-across-a-bridge)
 - `asr` (TranscriptionOption, optional): Automatic Speech Recognition configuration
   - `provider` (string): ASR provider ("tencent", "aliyun", "deepgram", "sensevoice")
   - `language` (string, optional): Language code (e.g., "zh-CN", "en-US")

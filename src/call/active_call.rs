@@ -8,7 +8,7 @@ use crate::{
         engine::StreamEngine,
         monitor::MonitorOption,
         recorder::RecorderOption,
-        stream::{MediaStream, MediaStreamBuilder, SERVER_SIDE_TRACK_ID},
+        stream::{BRIDGE_TRACK_PREFIX, MediaStream, MediaStreamBuilder, SERVER_SIDE_TRACK_ID},
         track::{
             Track, TrackConfig,
             dtmf::{DTMF_TRACK_ID, DtmfTrack},
@@ -1603,6 +1603,8 @@ impl ActiveCall {
                     recorder_option.native_samplerate.unwrap_or(false)
                         || self.app_state.config.recorder_native_samplerate(),
                 ),
+                swap_channels: recorder_option.swap_channels,
+                follow_bridge: recorder_option.follow_bridge,
             };
             recorder_config.ensure_path_extension(format);
             Some(recorder_config)
@@ -2722,7 +2724,10 @@ impl ActiveCall {
     }
 
     fn bridge_track_id(source_session_id: &str, target_session_id: &str) -> TrackId {
-        format!("bridge:{}:to:{}", source_session_id, target_session_id)
+        format!(
+            "{}{}:to:{}",
+            BRIDGE_TRACK_PREFIX, source_session_id, target_session_id
+        )
     }
 
     async fn do_bridge(&self, target_session_id: String) -> Result<()> {
@@ -2784,6 +2789,11 @@ impl ActiveCall {
             .media_stream
             .update_track(Box::new(target_forwarding_track), None)
             .await;
+        self.media_stream
+            .set_bridge_peer(Some(&target.media_stream));
+        target
+            .media_stream
+            .set_bridge_peer(Some(&self.media_stream));
 
         info!(
             session_id = self.session_id,
@@ -2805,8 +2815,10 @@ impl ActiveCall {
         self.media_stream
             .remove_track(&self_bridge_track_id, false)
             .await;
+        self.media_stream.clear_bridge_peer(&target_session_id);
 
         if let Some(target) = target {
+            target.media_stream.clear_bridge_peer(&self.session_id);
             let target_bridge_track_id =
                 Self::bridge_track_id(&target.session_id, &self.session_id);
             target

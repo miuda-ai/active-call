@@ -72,6 +72,19 @@ pub struct RecorderOption {
     /// `samplerate` option is only used as a fallback if detection fails.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_samplerate: Option<bool>,
+    /// Swap the stereo channels: put the session's own leg on the right
+    /// channel (1) and everything else (bridged peer, TTS, playback) on the
+    /// left (0). Lets bridged-call recordings taken from either leg share the
+    /// same channel layout. Ignored for RTP passthrough formats (mono).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_channels: Option<bool>,
+    /// Keep recording after this session ends if it is still bridged to a
+    /// live peer that is bridged back to it: the peer's own leg then feeds
+    /// the other channel and its TTS/playback the own channel, until the peer
+    /// ends or is bridged elsewhere. The session's cleanup (and call record)
+    /// waits for the recording to finish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_bridge: Option<bool>,
 }
 
 impl RecorderOption {
@@ -113,6 +126,8 @@ impl Default for RecorderOption {
             ptime: 200,
             format: None,
             native_samplerate: None,
+            swap_channels: None,
+            follow_bridge: None,
         }
     }
 }
@@ -136,8 +151,9 @@ pub struct Recorder {
     stereo_buf: Mutex<PcmBuf>,
     mono_buf: Mutex<PcmBuf>,
     native_samplerate: bool,
+    swap_channels: bool,
     /// Native target sample rate in native mode; 0 until detected from the
-    /// first caller-leg (channel 0) frame.
+    /// first own-leg frame.
     target_rate: AtomicU32,
     /// Stateful resamplers keyed by `(channel, source_rate)` so each leg keeps
     /// a continuous resampling stream.
@@ -153,6 +169,7 @@ impl Recorder {
         option: RecorderOption,
     ) -> Self {
         let native_samplerate = option.native_samplerate.unwrap_or(false);
+        let swap_channels = option.swap_channels.unwrap_or(false);
         Self {
             session_id,
             option,
@@ -161,6 +178,7 @@ impl Recorder {
             stereo_buf: Mutex::new(Vec::new()),
             mono_buf: Mutex::new(Vec::new()),
             native_samplerate,
+            swap_channels,
             target_rate: AtomicU32::new(0),
             resamplers: Mutex::new(HashMap::new()),
             pending: Mutex::new(Vec::new()),
@@ -415,8 +433,12 @@ impl Recorder {
         }
     }
 
+    fn is_own_leg(&self, track_id: &str) -> bool {
+        track_id == self.session_id.as_str()
+    }
+
     fn get_channel_index(&self, track_id: &str) -> usize {
-        if track_id == self.session_id.as_str() {
+        if self.is_own_leg(track_id) != self.swap_channels {
             0
         } else {
             1
@@ -484,6 +506,7 @@ impl Recorder {
             convert_to_mono(&mut samples, 2);
         }
 
+        let own_leg = self.is_own_leg(&frame.track_id);
         let channel_idx = self.get_channel_index(&frame.track_id);
         let src_rate = if frame.sample_rate > 0 {
             frame.sample_rate
@@ -494,12 +517,11 @@ impl Recorder {
         if self.native_samplerate {
             let mut target = self.target_rate.load(Ordering::SeqCst);
             if target == 0 {
-                // Latch the target rate from the first caller-leg frame; if
+                // Latch the target rate from the first own-leg frame; if
                 // only other-leg audio keeps arriving, fall back to the oldest
                 // pending frame's rate to avoid buffering forever.
-                let should_latch = channel_idx == 0 || {
-                    self.pending.lock().unwrap().len() >= NATIVE_PENDING_FRAME_LIMIT
-                };
+                let should_latch =
+                    own_leg || self.pending.lock().unwrap().len() >= NATIVE_PENDING_FRAME_LIMIT;
                 if should_latch {
                     target = src_rate;
                     self.target_rate.store(target, Ordering::SeqCst);
