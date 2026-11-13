@@ -78,6 +78,13 @@ pub struct RecorderOption {
     /// same channel layout. Ignored for RTP passthrough formats (mono).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub swap_channels: Option<bool>,
+    /// Keep recording after this session ends if it is still bridged to a
+    /// live peer that is bridged back to it: the peer's own leg then feeds
+    /// the other channel and its TTS/playback the own channel, until the peer
+    /// ends or is bridged elsewhere. The session's cleanup (and call record)
+    /// waits for the recording to finish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_bridge: Option<bool>,
 }
 
 impl RecorderOption {
@@ -120,6 +127,7 @@ impl Default for RecorderOption {
             format: None,
             native_samplerate: None,
             swap_channels: None,
+            follow_bridge: None,
         }
     }
 }

@@ -308,6 +308,9 @@ pub async fn call_handler_core(
     // Capture final extras (including _hangup_headers) before cleanup
     let final_extras = Some(active_call.extras.load_full().as_ref().clone());
 
+    // Let the client connection close now: cleanup can outlast the call
+    // while a recording handed to a bridged peer is still running.
+    drop(event_sender_to_client);
     active_call.cleanup().await.ok();
     debug!(session_id, "Call handler core completed");
 
