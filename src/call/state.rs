@@ -156,6 +156,12 @@ pub struct LegShared {
     pub is_refer: bool,
     pub progress: Arc<ArcSwap<CallProgress>>,
     pub extras: Extras,
+    /// Signalled (`true`) by `InviteDialogStates::on_terminated` once this
+    /// leg's SIP termination has been recorded. Detached for legs created
+    /// via `new()`; main-leg instances share the ActiveCall-level channel so
+    /// `do_hangup` can wait for the BYE outcome before tearing the session
+    /// down.
+    pub terminated_tx: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 impl LegShared {
@@ -165,6 +171,19 @@ impl LegShared {
             is_refer,
             progress: Arc::new(ArcSwap::from_pointee(progress)),
             extras: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            terminated_tx: Arc::new(tokio::sync::watch::channel(false).0),
+        }
+    }
+
+    /// Resolves once the leg's SIP termination has been recorded, returning
+    /// immediately when it already has. Never rejects: pair with
+    /// `tokio::time::timeout` for a bounded wait.
+    pub async fn terminated(&self) {
+        let mut rx = self.terminated_tx.subscribe();
+        while !*rx.borrow_and_update() {
+            if rx.changed().await.is_err() {
+                return;
+            }
         }
     }
 

@@ -269,6 +269,12 @@ impl InviteDialogStates {
     /// lock-free (ArcSwap rcu/load + broadcast send), so no state or events
     /// can be lost the way a failed `try_write` used to lose them.
     pub(super) fn on_terminated(&mut self) {
+        // Release anyone deterministically waiting for this leg's teardown
+        // (`ActiveCall::do_hangup` waits for the BYE outcome before letting
+        // the session teardown cancel the token). `send_replace` (not
+        // `send`) so the value is recorded even when no receiver is alive
+        // yet — late subscribers must still observe the termination.
+        self.leg.terminated_tx.send_replace(true);
         let term = CallProgress::termination(self.terminated_reason.as_ref());
         let status_code = term.status_code;
         let reason = term.hangup_reason;
@@ -1091,6 +1097,78 @@ mod tests {
         assert_eq!(
             progress.hangup_reason,
             Some(crate::callrecord::CallRecordHangupReason::Canceled)
+        );
+    }
+
+    /// `on_terminated` must signal the leg's termination watch so
+    /// `ActiveCall::do_hangup`'s deterministic-teardown wait is released as
+    /// soon as the dialog task records the termination — and a waiter that
+    /// starts after the fact must resolve immediately.
+    #[tokio::test]
+    async fn test_on_terminated_signals_leg_watch() {
+        let states = make_states(false);
+        let leg = states.leg.clone();
+
+        assert!(
+            !*leg.terminated_tx.borrow(),
+            "watch must start unsignalled"
+        );
+
+        let waiter = crate::spawn({
+            let leg = leg.clone();
+            async move { leg.terminated().await }
+        });
+
+        // Synchronous drop, exactly like the real dialog task teardown.
+        drop(states);
+
+        assert!(
+            *leg.terminated_tx.borrow(),
+            "on_terminated must signal the watch"
+        );
+        tokio::time::timeout(std::time::Duration::from_millis(500), waiter)
+            .await
+            .expect("terminated() waiter must be released by the signal")
+            .expect("waiter task must not panic");
+
+        // A waiter starting after the fact resolves immediately.
+        tokio::time::timeout(std::time::Duration::from_millis(100), leg.terminated())
+            .await
+            .expect("terminated() must resolve immediately once signalled");
+    }
+
+    /// Regression (production 2026-11-11, AI refer transfer): when session
+    /// teardown wins the `process_dialog` select on a leg whose hangup reason
+    /// was already recorded by `do_hangup` (ByRefer), `terminated_reason`
+    /// stays `None` and the answered call's status (200) must NOT be
+    /// overwritten with the unexplained-cancel mapping (487/500) — that
+    /// overwrite flipped the CDR `isCall` to false for fully-connected
+    /// transferred calls.
+    #[tokio::test]
+    async fn test_answered_leg_with_recorded_reason_keeps_status_on_unexplained_cancel() {
+        let mut states = make_states(false);
+        // The call was answered and do_hangup recorded the intent before the
+        // teardown raced the dialog event loop.
+        states.leg.update_progress(|p| {
+            p.on_confirmed("dlg".to_string());
+            p.set_hangup_reason(crate::callrecord::CallRecordHangupReason::ByRefer);
+        });
+        assert_eq!(states.leg.progress.load_full().last_status_code, 200);
+
+        // Cancelled branch won the select: no dialog-level reason recorded.
+        states.terminated_reason = None;
+
+        states.on_terminated();
+
+        let progress = states.leg.progress.load_full();
+        assert_eq!(
+            progress.last_status_code, 200,
+            "answered call must keep the confirmed status"
+        );
+        assert_eq!(
+            progress.hangup_reason,
+            Some(crate::callrecord::CallRecordHangupReason::ByRefer),
+            "the first-recorded hangup reason must be preserved"
         );
     }
 

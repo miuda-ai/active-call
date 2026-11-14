@@ -593,6 +593,10 @@ pub struct ActiveCall {
     pub bridge_paused: Arc<AtomicBool>,
     /// Main-leg lifecycle progress (dialog id, ring/answer times, answer SDP, option...).
     pub progress: Arc<ArcSwap<CallProgress>>,
+    /// Signalled by the main-leg dialog termination (`InviteDialogStates::
+    /// on_terminated`); handed to every main-leg `LegShared` produced by
+    /// `leg()` so `do_hangup` can wait for the BYE outcome.
+    pub leg_terminated_tx: Arc<tokio::sync::watch::Sender<bool>>,
     /// Main-leg variables (playbook set_var, SIP headers, hangup headers).
     pub extras: Extras,
     /// Active music-on-hold path (shared with the spawned refer task).
@@ -646,6 +650,7 @@ impl ActiveCall {
             ssrc: self.ssrc,
             is_refer: false,
             progress: self.progress.clone(),
+            terminated_tx: self.leg_terminated_tx.clone(),
             extras: self.extras.clone(),
         }
     }
@@ -904,6 +909,7 @@ impl ActiveCall {
             ssrc: rand::random::<u32>(),
             bridge_paused: Arc::new(AtomicBool::new(false)),
             progress: Arc::new(ArcSwap::from_pointee(progress)),
+            leg_terminated_tx: Arc::new(tokio::sync::watch::channel(false).0),
             extras: Arc::new(ArcSwap::from_pointee(extras)),
             moh: ArcSwapOption::new(None),
             current_play_id: ArcSwapOption::new(None),
@@ -2291,6 +2297,56 @@ impl ActiveCall {
                 }
                 self.leg()
                     .update_progress(|p| p.set_hangup_reason(hangup_reason.clone()));
+
+                // Deterministic teardown for answered calls: send the BYE for
+                // the main dialog ourselves and wait until the dialog event
+                // loop has recorded the termination, BEFORE any session
+                // teardown can cancel the token. Without this the teardown
+                // race (`process_dialog`'s select resolving on the cancelled
+                // branch drops the event loop before it observes the BYE's
+                // `Terminated`) left the leg's termination unobserved and
+                // answered calls mislabelled as failed — production: AI
+                // auto-hangup (refer transfer) CDRs carried 487 / isCall=false.
+                if self.progress.load_full().answer_time.is_some() {
+                    if let Some(dialog_id) =
+                        self.invitation.find_dialog_id_by_session_id(&self.session_id)
+                    {
+                        match crate::call::sip::remove_dialog(
+                            &self.invitation.dialog_layer,
+                            &dialog_id,
+                        ) {
+                            Some(dialog) => {
+                                let headers = crate::sip_util::hangup_headers_from_extras(
+                                    &self.extras.load_full(),
+                                );
+                                if let Err(e) = dialog.hangup_with_headers(headers).await {
+                                    warn!(
+                                        session_id = self.session_id,
+                                        %dialog_id,
+                                        error = %e,
+                                        "failed to hang up main dialog during deterministic teardown"
+                                    );
+                                }
+                            }
+                            None => {
+                                debug!(
+                                    session_id = self.session_id,
+                                    %dialog_id,
+                                    "main dialog already removed; skipping deterministic hangup"
+                                );
+                            }
+                        }
+                        // Bound the wait: a black-holed BYE must not stall
+                        // the session teardown forever. On timeout the
+                        // legacy teardown path takes over.
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(2),
+                            self.leg().terminated(),
+                        )
+                        .await;
+                    }
+                }
+
                 let refer_token = self.take_refer_call_token();
                 self.media_stream
                     .stop(Some(hangup_reason.to_string()), initiator);
