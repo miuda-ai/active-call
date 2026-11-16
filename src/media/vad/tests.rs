@@ -35,8 +35,11 @@ async fn test_vad_with_noise_denoise() {
         "Loaded {} samples from WAV file for testing",
         all_samples.len()
     );
-    let mut nr = NoiseReducer::new(sample_rate as usize);
     let (event_sender, mut event_receiver) = broadcast::channel(128);
+    let mut nr = NoiseReducer::new(
+        sample_rate as usize,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    );
     let track_id = "test_track".to_string();
 
     let mut option = VADOption::default();

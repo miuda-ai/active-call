@@ -326,8 +326,18 @@ impl ActiveCall {
             pending_dialog.state_receiver,
             hangup_headers,
         );
+        let call_token = self.cancel_token.clone();
         crate::spawn(async move {
+            let is_refer = states.leg.is_refer;
             client_dialog_handler.process_dialog(states).await;
+            // The dialog is gone: the call must end with it. Refer legs are
+            // decoupled from the call lifetime (transfer semantics), so only
+            // main-leg termination ends the call. This reaps headless
+            // sessions whose dialog was torn down while their runner kept
+            // waiting forever on the session event channel.
+            if !is_refer {
+                call_token.cancel();
+            }
         });
 
         info!(
@@ -967,8 +977,18 @@ impl ActiveCall {
             hangup_headers,
         );
 
+        let call_token = self.cancel_token.clone();
         crate::spawn(async move {
+            let is_refer = states.leg.is_refer;
             client_dialog_handler.process_dialog(states).await;
+            // The dialog is gone: the call must end with it. Refer legs are
+            // decoupled from the call lifetime (transfer semantics), so only
+            // main-leg termination ends the call. This reaps headless
+            // sessions whose dialog was torn down while their runner kept
+            // waiting forever on the session event channel.
+            if !is_refer {
+                call_token.cancel();
+            }
         });
 
         let (dialog_id, answer) = self
@@ -1213,8 +1233,18 @@ impl ActiveCall {
             hangup_headers,
         );
 
+        let call_token = self.cancel_token.clone();
         crate::spawn(async move {
+            let is_refer = states.leg.is_refer;
             client_dialog_handler.process_dialog(states).await;
+            // The dialog is gone: the call must end with it. Refer legs are
+            // decoupled from the call lifetime (transfer semantics), so only
+            // main-leg termination ends the call. This reaps headless
+            // sessions whose dialog was torn down while their runner kept
+            // waiting forever on the session event channel.
+            if !is_refer {
+                call_token.cancel();
+            }
         });
         Ok(())
     }

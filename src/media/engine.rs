@@ -2,7 +2,7 @@ use super::{
     INTERNAL_SAMPLERATE,
     agc::AutomaticGainControl,
     asr_processor::AsrProcessor,
-    denoiser::NoiseReducer,
+    denoiser::{NoiseReducer, spawn_answer_watcher},
     processor::Processor,
     track::{
         Track, TrackPacketSender,
@@ -10,6 +10,7 @@ use super::{
     },
     vad::{VADOption, VadProcessor, VadType},
 };
+use std::sync::atomic::AtomicBool;
 use crate::{
     CallOption, EouOption,
     event::EventSender,
@@ -31,7 +32,7 @@ use anyhow::Result;
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
+use tracing::{debug, info};
 #[cfg(feature = "ringback-detection")]
 use tracing::warn;
 
@@ -308,9 +309,12 @@ impl StreamEngine {
             }
 
             match option.denoise {
-                Some(true) => {
+                Some(true) if denoise_enabled() => {
                     debug!(%track_id, "Adding NoiseReducer processor");
-                    let noise_reducer = NoiseReducer::new(INTERNAL_SAMPLERATE as usize);
+                    let answered = Arc::new(AtomicBool::new(false));
+                    spawn_answer_watcher(event_sender.subscribe(), answered.clone());
+                    let noise_reducer =
+                        NoiseReducer::new(INTERNAL_SAMPLERATE as usize, answered);
                     processors.push(Box::new(noise_reducer) as Box<dyn Processor>);
                 }
                 _ => {}
@@ -350,13 +354,19 @@ impl StreamEngine {
                 None => {}
             }
             match option.eou {
-                Some(ref option) => {
+                Some(ref option) if eou_enabled() => {
                     let eou_processor = engine.create_eou_processor(
                         cancel_token.child_token(),
                         event_sender.clone(),
                         option.to_owned(),
                     )?;
                     processors.push(eou_processor);
+                }
+                Some(_) => {
+                    // Defense in depth: even if the playbook still carries an
+                    // `eou` block, ops can disable EOU fleet-wide via the
+                    // toggle file without a restart (EOU_ENABLED=false).
+                    info!(%track_id, "EOU processor skipped: disabled by EOU_ENABLED toggle");
                 }
                 None => {}
             }
@@ -393,5 +403,80 @@ impl StreamEngine {
 
             Ok(processors)
         })
+    }
+}
+
+/// Per-call runtime toggle file. The deploy mounts the ops-managed env
+/// file at `/app/.env` (see run.sh MOUNTS); overridable via the
+/// `PBX_TOGGLE_FILE` env var. Read once per call setup, so toggling
+/// takes effect on the next call without any restart.
+fn toggle_file_path() -> std::path::PathBuf {
+    std::env::var("PBX_TOGGLE_FILE")
+        .unwrap_or_else(|_| "/app/.env".to_string())
+        .into()
+}
+
+fn denoise_enabled() -> bool {
+    toggle_enabled_from(&toggle_file_path(), "DENOISE_ENABLED")
+}
+
+fn eou_enabled() -> bool {
+    toggle_enabled_from(&toggle_file_path(), "EOU_ENABLED")
+}
+
+/// `KEY=false|0|off` disables; missing file/key (or any other value)
+/// enables. Lines starting with `#` are ignored.
+fn toggle_enabled_from(path: &std::path::Path, key: &str) -> bool {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return true;
+    };
+    let prefix = format!("{}=", key);
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(value) = line.strip_prefix(&prefix) {
+            let value = value.trim().trim_matches('"').to_ascii_lowercase();
+            return !(value == "false" || value == "0" || value == "off");
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod denoise_toggle_tests {
+    use super::toggle_enabled_from;
+
+    #[test]
+    fn toggle_file_controls_switch() {
+        let dir = std::env::temp_dir().join(format!("zapbx_denoise_toggle_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("app.env");
+
+        // No file => enabled (default).
+        std::fs::remove_file(&path).ok();
+        assert!(toggle_enabled_from(&path, "DENOISE_ENABLED"));
+        assert!(toggle_enabled_from(&path, "EOU_ENABLED"));
+
+        // Key missing => enabled.
+        std::fs::write(&path, "RUST_LOG=info\nOTHER=1\n").unwrap();
+        assert!(toggle_enabled_from(&path, "DENOISE_ENABLED"));
+        // Explicitly disabled.
+        std::fs::write(&path, "RUST_LOG=info\nDENOISE_ENABLED=false\n").unwrap();
+        assert!(!toggle_enabled_from(&path, "DENOISE_ENABLED"));
+
+        // Quoted and numeric forms.
+        std::fs::write(&path, "DENOISE_ENABLED=\"0\"\n").unwrap();
+        assert!(!toggle_enabled_from(&path, "DENOISE_ENABLED"));
+        std::fs::write(&path, "DENOISE_ENABLED=true\n").unwrap();
+        assert!(toggle_enabled_from(&path, "DENOISE_ENABLED"));
+
+        // Keys are independent: disabling EOU does not touch denoise.
+        std::fs::write(&path, "EOU_ENABLED=false\n").unwrap();
+        assert!(!toggle_enabled_from(&path, "EOU_ENABLED"));
+        assert!(toggle_enabled_from(&path, "DENOISE_ENABLED"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
