@@ -8,6 +8,7 @@ mod perf_analysis;
 mod perf_rtp_recorder;
 mod playout_rtc;
 mod recorder;
+mod recorder_follow_bridge;
 mod recorder_rtp;
 mod stream;
 mod tts_track;

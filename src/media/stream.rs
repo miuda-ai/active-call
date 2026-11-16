@@ -13,7 +13,7 @@ use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{
-    Arc, Mutex as StdMutex,
+    Arc, Mutex as StdMutex, Weak,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Duration;
@@ -41,6 +41,14 @@ pub struct MediaStream {
     recorder_sender: mpsc::UnboundedSender<AudioFrame>,
     recorder_receiver: Mutex<Option<mpsc::UnboundedReceiver<AudioFrame>>>,
     recorder_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Stops the recorder. Independent of `cancel_token`: when the stream
+    /// ends, the recorder supervisor either stops the recorder or hands the
+    /// recording to the bridged peer (`RecorderOption::follow_bridge`).
+    recorder_stop: CancellationToken,
+    /// The stream this one is bridged to, if any.
+    bridge_peer: Arc<StdMutex<Option<BridgePeer>>>,
+    /// Recordings of ended bridged peers that this stream now feeds.
+    adopted_recorders: StdMutex<Vec<AdoptedRecorder>>,
     /// True once a recorder task is actually consuming `recorder_sender`.
     /// The ambiance idle loop mirrors its frames to the recorder only when
     /// this is set, avoiding unbounded buffering when recording starts late.
@@ -55,12 +63,28 @@ pub struct MediaStream {
 }
 
 const CALLEE_TRACK_ID: &str = "callee-track";
+/// Prefix of the forwarding tracks that carry a bridged peer's audio.
+pub const BRIDGE_TRACK_PREFIX: &str = "bridge:";
 const QUEUE_HOLD_TRACK_ID: &str = "queue-hold-track";
 pub const SERVER_SIDE_TRACK_ID: &str = "server-side-track";
 const AMBIANCE_IDLE_TRACK_ID: &str = "ambiance-track";
 const AMBIANCE_IDLE_PTIME: Duration = Duration::from_millis(20);
 // Skip idle fill if server-side audio arrived within this window (TTS ptime is 20ms).
 const AMBIANCE_IDLE_GAP_MS: u64 = 25;
+
+#[derive(Clone)]
+struct BridgePeer {
+    id: String,
+    stream: Weak<MediaStream>,
+}
+
+/// A recording handed over by an ended bridged peer.
+struct AdoptedRecorder {
+    sender: mpsc::UnboundedSender<AudioFrame>,
+    /// The ended peer's session id: the recorder's own-leg channel.
+    own_leg: TrackId,
+    stop: CancellationToken,
+}
 
 pub struct MediaStreamBuilder {
     cancel_token: Option<CancellationToken>,
@@ -113,6 +137,9 @@ impl MediaStreamBuilder {
             recorder_sender,
             recorder_receiver: Mutex::new(Some(recorder_receiver)),
             recorder_handle: Mutex::new(None),
+            recorder_stop: CancellationToken::new(),
+            bridge_peer: Arc::new(StdMutex::new(None)),
+            adopted_recorders: StdMutex::new(Vec::new()),
             recording_active: Arc::new(AtomicBool::new(false)),
             ambiance: Mutex::new(None),
             ambiance_source_id: StdMutex::new(None),
@@ -253,6 +280,10 @@ impl MediaStream {
         self.suppressed_sources.lock().await.clear();
 
         if let Some(recorder_handle) = self.recorder_handle.lock().await.take() {
+            // The supervisor stops the recorder now that the stream is
+            // cancelled, unless it handed the recording to a bridged peer:
+            // then the recording runs until the peer is done with it.
+            self.recorder_stop.cancelled().await;
             if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(30), recorder_handle).await
             {
                 info!(session_id = self.id, "recorder stopped");
@@ -264,6 +295,29 @@ impl MediaStream {
     }
     pub async fn track_count(&self) -> usize {
         self.tracks.lock().await.len()
+    }
+
+    /// Record the stream this one is bridged to (`None` when unbridged). A
+    /// new bridge ends recordings adopted from a previous peer: that call is
+    /// over and this leg now talks to someone else.
+    pub fn set_bridge_peer(&self, peer: Option<&Arc<MediaStream>>) {
+        if peer.is_some() {
+            for recording in self.adopted_recorders.lock().unwrap().drain(..) {
+                recording.stop.cancel();
+            }
+        }
+        *self.bridge_peer.lock().unwrap() = peer.map(|p| BridgePeer {
+            id: p.id.clone(),
+            stream: Arc::downgrade(p),
+        });
+    }
+
+    /// Clear the bridge peer if it is `peer_id`.
+    pub fn clear_bridge_peer(&self, peer_id: &str) {
+        let mut peer = self.bridge_peer.lock().unwrap();
+        if peer.as_ref().is_some_and(|p| p.id == peer_id) {
+            *peer = None;
+        }
     }
 
     pub async fn update_recorder_option(&self, recorder_config: RecorderOption) {
@@ -655,7 +709,7 @@ impl MediaStream {
                     return Ok(());
                 }
             };
-            let cancel_token = self.cancel_token.child_token();
+            let cancel_token = self.recorder_stop.clone();
             let session_id_clone = self.id.clone();
 
             info!(
@@ -667,6 +721,8 @@ impl MediaStream {
             );
 
             let native = recorder_option.native_samplerate.unwrap_or(false);
+            let follow_bridge = recorder_option.follow_bridge.unwrap_or(false);
+            let recorder_stop = self.recorder_stop.clone();
             let recorder_handle = crate::spawn(async move {
                 let recorder_file = recorder_option.recorder_file.clone();
                 let recorder =
@@ -683,8 +739,11 @@ impl MediaStream {
                         );
                     }
                 }
+                // A failed recorder must not keep cleanup waiting.
+                recorder_stop.cancel();
             });
             *self.recorder_handle.lock().await = Some(recorder_handle);
+            self.spawn_recorder_supervisor(follow_bridge);
             self.recording_active.store(true, Ordering::SeqCst);
 
             // Inject the recorder tap into tracks that were added before the
@@ -709,6 +768,80 @@ impl MediaStream {
             }
         }
         Ok(())
+    }
+
+    /// Stop the recorder once the stream ends or, with `follow_bridge`, hand
+    /// the recording to the bridged peer and stop it when the peer is done.
+    fn spawn_recorder_supervisor(&self, follow_bridge: bool) {
+        let stream_cancel = self.cancel_token.clone();
+        let recorder_stop = self.recorder_stop.clone();
+        let bridge_peer = self.bridge_peer.clone();
+        let recording = AdoptedRecorder {
+            sender: self.recorder_sender.clone(),
+            own_leg: self.id.clone(),
+            stop: self.recorder_stop.clone(),
+        };
+        let session_id = self.id.clone();
+        crate::spawn(async move {
+            select! {
+                _ = recorder_stop.cancelled() => return,
+                _ = stream_cancel.cancelled() => {}
+            }
+            let adopted_by = follow_bridge
+                .then(|| bridge_peer.lock().unwrap().clone())
+                .flatten()
+                .and_then(|p| p.stream.upgrade())
+                .and_then(|stream| stream.adopt_recorder(recording));
+            if let Some(peer_cancel) = adopted_by {
+                info!(session_id, "recording handed over to bridged peer");
+                select! {
+                    _ = peer_cancel.cancelled() => {}
+                    _ = recorder_stop.cancelled() => {}
+                }
+            }
+            recorder_stop.cancel();
+        });
+    }
+
+    /// Take over feeding the recording of an ended bridged peer; returns
+    /// this stream's cancel token, which ends the recording at the latest.
+    /// Refused when this stream has ended or is no longer bridged back to
+    /// that peer (e.g. it was already bridged to someone else).
+    fn adopt_recorder(&self, recording: AdoptedRecorder) -> Option<CancellationToken> {
+        let bridged_back = self
+            .bridge_peer
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|p| p.id == recording.own_leg);
+        if self.cancel_token.is_cancelled() || !bridged_back {
+            return None;
+        }
+        self.adopted_recorders.lock().unwrap().push(recording);
+        Some(self.cancel_token.clone())
+    }
+
+    /// Mirror a frame from one of this stream's tracks to the recordings
+    /// adopted from ended bridged peers. This stream's own leg is the far
+    /// side of those recordings; everything else it plays (TTS, files,
+    /// ambiance) takes the ended peer's place on the own channel.
+    fn feed_adopted_recorders(&self, frame: &AudioFrame) {
+        let mut adopted = self.adopted_recorders.lock().unwrap();
+        adopted.retain(|r| !r.stop.is_cancelled());
+        if adopted.is_empty()
+            || !matches!(frame.samples, Samples::PCM { .. })
+            // Bridge tracks carry the ended peer's own audio.
+            || frame.track_id.starts_with(BRIDGE_TRACK_PREFIX)
+        {
+            return;
+        }
+        for recording in adopted.iter() {
+            let mut mirrored = frame.clone();
+            if mirrored.track_id != self.id {
+                mirrored.track_id = recording.own_leg.clone();
+            }
+            let _ = recording.sender.send(mirrored);
+        }
     }
 
     /// Attach the recorder tap to a track according to the recorder mode:
@@ -751,6 +884,7 @@ impl MediaStream {
     async fn handle_forward_track(&self, mut packet_receiver: TrackPacketReceiver) {
         let event_sender = self.event_sender.clone();
         while let Some(packet) = packet_receiver.recv().await {
+            self.feed_adopted_recorders(&packet);
             if self
                 .ambiance_source_id
                 .lock()
