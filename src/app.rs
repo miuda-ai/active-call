@@ -731,6 +731,10 @@ impl AppStateInner {
         let mut count = 0;
         if let Some(register_users) = &self.config.register_users {
             for option in register_users.iter() {
+                if option.disabled.unwrap_or(false) {
+                    info!(user = option.aor(), "registration disabled, skipping");
+                    continue;
+                }
                 match self.register(option.clone()).await {
                     Ok(_) => {
                         count += 1;
