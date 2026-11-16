@@ -385,7 +385,7 @@ impl StreamEngine {
 
             #[cfg(feature = "ringback-detection")]
             if let Some(ref ringback_opt) = option.ringback_detection {
-                if ringback_opt.enabled.unwrap_or(false) {
+                if ringback_opt.enabled.unwrap_or(false) && ringback_detection_enabled() {
                     debug!(%track_id, "Adding RingbackDetectionProcessor");
                     match
                         crate::media::ringback_detection::processor::RingbackDetectionProcessor::new(
@@ -418,6 +418,10 @@ fn toggle_file_path() -> std::path::PathBuf {
 
 fn denoise_enabled() -> bool {
     toggle_enabled_from(&toggle_file_path(), "DENOISE_ENABLED")
+}
+
+fn ringback_detection_enabled() -> bool {
+    toggle_enabled_from(&toggle_file_path(), "RINGBACK_DETECTION_ENABLED")
 }
 
 fn eou_enabled() -> bool {

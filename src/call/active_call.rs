@@ -793,6 +793,25 @@ pub struct ActiveCallGuard {
     pub active_calls: usize,
 }
 
+// ── admission control (MAX_ACTIVE_CALLS / MAX_CALLS_WAIT_MS via env) ──
+pub static ACTIVE_SESSIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub fn admission_conf() -> (usize, u64) {
+    static CONF: std::sync::OnceLock<(usize, u64)> = std::sync::OnceLock::new();
+    *CONF.get_or_init(|| {
+        let max_calls = std::env::var("MAX_ACTIVE_CALLS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0usize); // 0/unset = unlimited (backward compatible)
+        let wait_ms = std::env::var("MAX_CALLS_WAIT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5000u64);
+        (max_calls, wait_ms)
+    })
+}
+
 impl ActiveCallGuard {
     pub fn new(call: ActiveCallRef) -> Self {
         let active_calls = {
@@ -815,6 +834,13 @@ impl Drop for ActiveCallGuard {
             .lock()
             .unwrap()
             .remove(&self.call.session_id);
+        // admission counter: clamp-decrement on guard drop
+        {
+            let cur = ACTIVE_SESSIONS.load(std::sync::atomic::Ordering::SeqCst);
+            if cur > 0 {
+                ACTIVE_SESSIONS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
         // Idempotent cleanup of the incoming-call session-id mapping (no-op
         // for outgoing/websocket sessions that were never registered).
         self.call

@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{
     Arc, Mutex as StdMutex, Weak,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::Duration;
 use tokio::task::JoinHandle;
@@ -25,6 +25,13 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid;
+
+// leak-diagnosis counters (LEAKSTAT)
+pub static STREAMS_LIVE: AtomicUsize = AtomicUsize::new(0);
+pub static RECORDER_LIVE: AtomicUsize = AtomicUsize::new(0);
+pub static RECORDER_SPAWNED: AtomicUsize = AtomicUsize::new(0);
+pub static RECORDER_DETACHED: AtomicUsize = AtomicUsize::new(0);
+pub static TRACKS_LIVE: AtomicUsize = AtomicUsize::new(0);
 
 pub struct MediaStream {
     id: String,
@@ -60,6 +67,12 @@ pub struct MediaStream {
     /// Side-path audio distribution hub (see `media::monitor`). Lazily
     /// created by `enable_monitor` when the call option asks for it.
     monitor_hub: Mutex<Option<MonitorHub>>,
+}
+
+impl Drop for MediaStream {
+    fn drop(&mut self) {
+        STREAMS_LIVE.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 const CALLEE_TRACK_ID: &str = "callee-track";
@@ -124,6 +137,7 @@ impl MediaStreamBuilder {
         let tracks = Mutex::new(HashMap::new());
         let (track_packet_sender, track_packet_receiver) = mpsc::unbounded_channel();
         let (recorder_sender, recorder_receiver) = mpsc::unbounded_channel();
+        STREAMS_LIVE.fetch_add(1, Ordering::Relaxed);
         MediaStream {
             id: self.id.unwrap_or_default(),
             cancel_token,
@@ -271,6 +285,7 @@ impl MediaStream {
         self.cancel_token.cancel();
         {
             let mut tracks = self.tracks.lock().await;
+            TRACKS_LIVE.fetch_sub(tracks.len(), Ordering::Relaxed);
             for (id, (track, _)) in tracks.drain() {
                 if let Err(e) = track.stop().await {
                     warn!(session_id = self.id, track_id = %id, "failed to stop track during cleanup: {}", e);
@@ -289,6 +304,7 @@ impl MediaStream {
                 info!(session_id = self.id, "recorder stopped");
             } else {
                 warn!(session_id = self.id, "recorder timeout");
+                RECORDER_DETACHED.fetch_add(1, Ordering::Relaxed);
             }
         }
         Ok(())
@@ -353,7 +369,13 @@ impl MediaStream {
     }
 
     pub async fn remove_track(&self, id: &TrackId, graceful: bool) {
-        let track_entry = { self.tracks.lock().await.remove(id) };
+        let track_entry = {
+            let removed = self.tracks.lock().await.remove(id);
+            if removed.is_some() {
+                TRACKS_LIVE.fetch_sub(1, Ordering::Relaxed);
+            }
+            removed
+        };
         if let Some((track, _)) = track_entry {
             self.suppressed_sources.lock().await.remove(id);
             let res = if !graceful {
@@ -374,13 +396,20 @@ impl MediaStream {
         track_id: &TrackId,
         answer: &String,
     ) -> Result<()> {
-        let track_entry = { self.tracks.lock().await.remove(track_id) };
+        let track_entry = {
+            let removed = self.tracks.lock().await.remove(track_id);
+            if removed.is_some() {
+                TRACKS_LIVE.fetch_sub(1, Ordering::Relaxed);
+            }
+            removed
+        };
         if let Some((mut track, dtmf)) = track_entry {
             let res = track.update_remote_description(answer).await;
             self.tracks
                 .lock()
                 .await
                 .insert(track_id.clone(), (track, dtmf));
+                TRACKS_LIVE.fetch_add(1, Ordering::Relaxed);
             res?;
         }
         Ok(())
@@ -391,13 +420,20 @@ impl MediaStream {
         track_id: &TrackId,
         answer: &String,
     ) -> Result<()> {
-        let track_entry = { self.tracks.lock().await.remove(track_id) };
+        let track_entry = {
+            let removed = self.tracks.lock().await.remove(track_id);
+            if removed.is_some() {
+                TRACKS_LIVE.fetch_sub(1, Ordering::Relaxed);
+            }
+            removed
+        };
         if let Some((mut track, dtmf)) = track_entry {
             let res = track.update_remote_description_force(answer).await;
             self.tracks
                 .lock()
                 .await
                 .insert(track_id.clone(), (track, dtmf));
+                TRACKS_LIVE.fetch_add(1, Ordering::Relaxed);
             res?;
         }
         Ok(())
@@ -410,13 +446,20 @@ impl MediaStream {
         track_id: &TrackId,
         answer: &String,
     ) -> Result<()> {
-        let track_entry = { self.tracks.lock().await.remove(track_id) };
+        let track_entry = {
+            let removed = self.tracks.lock().await.remove(track_id);
+            if removed.is_some() {
+                TRACKS_LIVE.fetch_sub(1, Ordering::Relaxed);
+            }
+            removed
+        };
         if let Some((mut track, dtmf)) = track_entry {
             let res = track.update_remote_description_provisional(answer).await;
             self.tracks
                 .lock()
                 .await
                 .insert(track_id.clone(), (track, dtmf));
+                TRACKS_LIVE.fetch_add(1, Ordering::Relaxed);
             res?;
         }
         Ok(())
@@ -428,13 +471,20 @@ impl MediaStream {
         offer: String,
         timeout: Option<Duration>,
     ) -> Result<String> {
-        let track_entry = { self.tracks.lock().await.remove(track_id) };
+        let track_entry = {
+            let removed = self.tracks.lock().await.remove(track_id);
+            if removed.is_some() {
+                TRACKS_LIVE.fetch_sub(1, Ordering::Relaxed);
+            }
+            removed
+        };
         if let Some((mut track, dtmf)) = track_entry {
             let res = track.handshake(offer, timeout).await;
             self.tracks
                 .lock()
                 .await
                 .insert(track_id.clone(), (track, dtmf));
+                TRACKS_LIVE.fetch_add(1, Ordering::Relaxed);
             res
         } else {
             anyhow::bail!("track not found: {}", track_id)
@@ -450,7 +500,13 @@ impl MediaStream {
         // was hung up by the inactivity watchdog ~50s later). Disarm the old
         // track's pipeline (inactivity watchdog, workers) now, and close its
         // transport after a short grace period.
-        let replaced = { self.tracks.lock().await.remove(track.id()) };
+        let replaced = {
+            let removed = self.tracks.lock().await.remove(track.id());
+            if removed.is_some() {
+                TRACKS_LIVE.fetch_sub(1, Ordering::Relaxed);
+            }
+            removed
+        };
         if let Some((old_track, _)) = replaced {
             old_track.cancel_pipeline();
             crate::spawn(async move {
@@ -485,6 +541,7 @@ impl MediaStream {
                     .lock()
                     .await
                     .insert(track_id.clone(), (track, DtmfDetector::new()));
+                TRACKS_LIVE.fetch_add(1, Ordering::Relaxed);
                 self.event_sender
                     .send(SessionEvent::TrackStart {
                         track_id,
@@ -721,6 +778,8 @@ impl MediaStream {
             );
 
             let native = recorder_option.native_samplerate.unwrap_or(false);
+            RECORDER_SPAWNED.fetch_add(1, Ordering::Relaxed);
+            RECORDER_LIVE.fetch_add(1, Ordering::Relaxed);
             let follow_bridge = recorder_option.follow_bridge.unwrap_or(false);
             let recorder_stop = self.recorder_stop.clone();
             let recorder_handle = crate::spawn(async move {
@@ -739,6 +798,7 @@ impl MediaStream {
                         );
                     }
                 }
+                RECORDER_LIVE.fetch_sub(1, Ordering::Relaxed);
                 // A failed recorder must not keep cleanup waiting.
                 recorder_stop.cancel();
             });

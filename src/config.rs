@@ -597,12 +597,20 @@ pub enum CallRecordConfig {
         root: String,
         with_media: Option<bool>,
         keep_media_copy: Option<bool>,
+        /// Streaming upload size (MB) per multipart part. Default 5.
+        part_size_mb: Option<u64>,
+        /// Delete local file after a successful upload. Default true.
+        delete_after_upload: Option<bool>,
     },
     Http {
         url: String,
         headers: Option<HashMap<String, String>>,
         with_media: Option<bool>,
         keep_media_copy: Option<bool>,
+        /// Streaming upload size (MB) per multipart part. Default 5.
+        part_size_mb: Option<u64>,
+        /// Delete local file after a successful upload. Default true.
+        delete_after_upload: Option<bool>,
     },
 }
 
