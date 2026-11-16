@@ -383,6 +383,8 @@ Commands are sent as JSON messages through the WebSocket connection. All timesta
   - `recorderFile` (string): Path to the recording file
   - `samplerate` (number): Recording sample rate in Hz (default: 16000)
   - `ptime` (number): Packet time in milliseconds (default: 200)
+  - `nativeSamplerate` (boolean, optional): Record at the source's native sample rate instead of 16 kHz
+  - `swapChannels` (boolean, optional): Put the session's own leg on the right channel and everything else (bridged peer, TTS, playback) on the left. Default layout is own leg left.
 - `earlyMedia` (boolean): Enable early media during ringing
 - `ringtone` (string, optional): Custom ringtone URL
 
@@ -869,6 +871,8 @@ The `CallOption` object is used in `invite` and `accept` commands and contains t
   - `recorderFile` (string): Path to the recording file
   - `samplerate` (number): Recording sample rate in Hz (default: 16000)
   - `ptime` (number): Packet time in milliseconds (default: 200)
+  - `nativeSamplerate` (boolean, optional): Record at the source's native sample rate instead of 16 kHz
+  - `swapChannels` (boolean, optional): Put the session's own leg on the right channel and everything else (bridged peer, TTS, playback) on the left. Default layout is own leg left.
 - `asr` (TranscriptionOption, optional): Automatic Speech Recognition configuration
   - `provider` (string): ASR provider ("tencent", "aliyun", "deepgram", "sensevoice")
   - `language` (string, optional): Language code (e.g., "zh-CN", "en-US")

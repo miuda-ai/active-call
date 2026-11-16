@@ -1603,6 +1603,7 @@ impl ActiveCall {
                     recorder_option.native_samplerate.unwrap_or(false)
                         || self.app_state.config.recorder_native_samplerate(),
                 ),
+                swap_channels: recorder_option.swap_channels,
             };
             recorder_config.ensure_path_extension(format);
             Some(recorder_config)
