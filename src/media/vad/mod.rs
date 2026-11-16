@@ -5,6 +5,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use std::any::Any;
+use std::collections::VecDeque;
 use tokio_util::sync::CancellationToken;
 
 pub(crate) mod simd;
@@ -98,16 +99,81 @@ impl TryFrom<&String> for VadType {
         }
     }
 }
-struct SpeechBuf {
-    samples: PcmBuf,
-    timestamp: u64,
+/// Audio kept while idle, so an utterance can start a little before the
+/// frame that completed its first speech chunk (a chunk spans earlier frames).
+const IDLE_KEEP_MS: u64 = 500;
+
+/// Recent input, contiguous, so an utterance's samples can be cut out by
+/// timestamp. Engines report one decision per chunk of their own size (512
+/// samples for silero), which doesn't line up with the frames (e.g. 320
+/// samples at 20 ms ptime) - so audio is kept per sample, not per decision.
+struct SampleBuf {
+    samples: VecDeque<i16>,
+    /// absolute index (samples since the first frame) of `samples[0]`
+    start: u64,
+    /// timestamp of the first frame, which engine timestamps count from
+    base_ts: Option<u64>,
+    sample_rate: u64,
+}
+
+impl SampleBuf {
+    fn new() -> Self {
+        Self {
+            samples: VecDeque::new(),
+            start: 0,
+            base_ts: None,
+            sample_rate: 16000,
+        }
+    }
+
+    fn push(&mut self, frame_ts: u64, sample_rate: u32, samples: &[i16]) {
+        self.base_ts.get_or_insert(frame_ts);
+        if sample_rate > 0 {
+            self.sample_rate = sample_rate as u64;
+        }
+        self.samples.extend(samples);
+    }
+
+    /// Absolute sample index of an engine timestamp.
+    fn index(&self, ts: u64) -> u64 {
+        ts.saturating_sub(self.base_ts.unwrap_or(ts)) * self.sample_rate / 1000
+    }
+
+    /// Samples in [from_ts, to_ts), clamped to what is still buffered.
+    fn slice(&self, from_ts: u64, to_ts: u64) -> PcmBuf {
+        let end = self.start + self.samples.len() as u64;
+        let from = self.index(from_ts).clamp(self.start, end);
+        let to = self.index(to_ts).clamp(from, end);
+        self.samples
+            .range((from - self.start) as usize..(to - self.start) as usize)
+            .copied()
+            .collect()
+    }
+
+    /// Drops everything before `ts`.
+    fn trim_before(&mut self, ts: u64) {
+        let drop = self
+            .index(ts)
+            .saturating_sub(self.start)
+            .min(self.samples.len() as u64);
+        self.samples.drain(..drop as usize);
+        self.start += drop;
+    }
+
+    /// Drops all but the last `ms`.
+    fn keep_last(&mut self, ms: u64) {
+        let keep = (ms * self.sample_rate / 1000) as usize;
+        let drop = self.samples.len().saturating_sub(keep);
+        self.samples.drain(..drop);
+        self.start += drop as u64;
+    }
 }
 
 struct VadProcessorInner {
     vad: Box<dyn VadEngine>,
     event_sender: EventSender,
     option: VADOption,
-    window_bufs: Vec<SpeechBuf>,
+    buf: SampleBuf,
     triggered: bool,
     triggered_event_sent: bool,
     current_speech_start: Option<u64>,
@@ -135,28 +201,23 @@ impl VadProcessorInner {
             _ => return Ok(()),
         };
 
-        let samples_cloned = samples.to_owned();
+        // every frame is kept, not just those completing an engine chunk:
+        // decisions are cut back out of this by timestamp
+        self.buf.push(frame.timestamp, frame.sample_rate, samples);
         let results = self.vad.process(frame);
         frame.speech_probability = self.vad.last_probability();
         for (is_speaking, timestamp) in results {
-            if is_speaking || self.triggered {
-                let current_buf = SpeechBuf {
-                    samples: samples_cloned.clone(),
-                    timestamp,
-                };
-                self.window_bufs.push(current_buf);
-            }
             self.process_vad_logic(is_speaking, timestamp, &frame.track_id)?;
+        }
 
-            // Clean up old buffers periodically
-            if self.window_bufs.len() > 1000 || !self.triggered {
-                let cutoff = if self.triggered {
-                    timestamp.saturating_sub(5000)
-                } else {
-                    timestamp.saturating_sub(self.option.silence_padding)
-                };
-                self.window_bufs.retain(|buf| buf.timestamp > cutoff);
+        if self.triggered {
+            let max_ms = self.option.max_buffer_duration_secs.max(1) * 1000;
+            if self.buf.samples.len() as u64 > max_ms * self.buf.sample_rate / 1000 {
+                // an utterance this long loses its beginning, not the whole buffer
+                self.buf.keep_last(max_ms);
             }
+        } else {
+            self.buf.keep_last(IDLE_KEEP_MS);
         }
 
         Ok(())
@@ -206,16 +267,9 @@ impl VadProcessorInner {
                         // Use safe duration calculation
                         let duration = temp_end.saturating_sub(start_time);
                         if duration >= self.option.speech_padding {
-                            let samples_vec = self
-                                .window_bufs
-                                .iter()
-                                .filter(|buf| {
-                                    buf.timestamp >= start_time && buf.timestamp <= temp_end
-                                })
-                                .flat_map(|buf| buf.samples.iter())
-                                .cloned()
-                                .collect();
-                            self.window_bufs.clear();
+                            // temp_end is the first non-speech chunk's start
+                            let samples_vec = self.buf.slice(start_time, temp_end);
+                            self.buf.trim_before(temp_end);
 
                             let event = SessionEvent::Silence {
                                 track_id: track_id.to_string(),
@@ -297,7 +351,7 @@ impl VadProcessor {
             vad: engine,
             event_sender,
             option,
-            window_bufs: Vec::new(),
+            buf: SampleBuf::new(),
             triggered_event_sent: false,
             triggered: false,
             current_speech_start: None,

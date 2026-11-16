@@ -282,3 +282,57 @@ async fn test_silence_timeout() {
         }
     }
 }
+
+/// Live tracks deliver 20 ms frames (320 samples), which don't line up with
+/// silero's 512-sample chunks; an utterance must still be exactly the input
+/// audio of its [start_time, start_time + duration) span, nothing dropped.
+#[tokio::test]
+async fn test_silence_samples_match_input_with_20ms_frames() {
+    let (all_samples, sample_rate) =
+        crate::media::track::file::read_wav_file("fixtures/1843344-user.wav").unwrap();
+    assert_eq!(sample_rate, 16000);
+
+    let (event_sender, mut event_receiver) = broadcast::channel(1024);
+    let token = CancellationToken::new();
+    let mut vad = VadProcessor::create(token, event_sender, VADOption::default()).unwrap();
+
+    let frame_size = 320;
+    for (i, chunk) in all_samples.chunks_exact(frame_size).enumerate() {
+        let mut frame = AudioFrame {
+            track_id: "test".to_string(),
+            samples: Samples::PCM {
+                samples: chunk.to_vec(),
+            },
+            sample_rate,
+            timestamp: 1_000 + i as u64 * 20,
+            channels: 1,
+            ..Default::default()
+        };
+        vad.process_frame(&mut frame).unwrap();
+    }
+
+    let mut utterances = 0;
+    while let Ok(event) = event_receiver.try_recv() {
+        let SessionEvent::Silence {
+            start_time,
+            duration,
+            samples: Some(samples),
+            ..
+        } = event
+        else {
+            continue;
+        };
+        let from = ((start_time - 1_000) * 16) as usize;
+        let to = from + (duration * 16) as usize;
+        assert_eq!(samples.len(), to - from, "utterance at {start_time}ms");
+        assert!(
+            samples[..] == all_samples[from..to],
+            "utterance at {start_time}ms isn't the input audio of its span"
+        );
+        utterances += 1;
+    }
+    assert!(
+        utterances >= 3,
+        "expected several utterances, got {utterances}"
+    );
+}
