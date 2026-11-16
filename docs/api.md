@@ -796,6 +796,7 @@ The `CallOption` object is used in `invite` and `accept` commands and contains t
     "silencePadding": 100,
     "ratio": 0.5,
     "voiceThreshold": 0.5,
+    "minLevelDbfs": null,
     "maxBufferDurationSecs": 50,
     "silenceTimeout": null,
     "endpoint": null,
@@ -900,6 +901,7 @@ The `CallOption` object is used in `invite` and `accept` commands and contains t
   - `silencePadding` (number): Padding after silence detection in milliseconds (default: 100)
   - `ratio` (number): Voice detection ratio threshold (default: 0.5)
   - `voiceThreshold` (number): Voice energy threshold (default: 0.5)
+  - `minLevelDbfs` (number, optional): Minimum RMS audio level in dBFS (e.g., `-40`) below which audio is never treated as speech; held over the last ~320 ms so quiet word endings are kept (`"silero"` only, disabled by default)
   - `maxBufferDurationSecs` (number): Maximum buffer duration in seconds (default: 50)
   - `silenceTimeout` (number, optional): Timeout for silence detection in milliseconds
   - `endpoint` (string, optional): Custom VAD service endpoint

@@ -20,6 +20,9 @@ const RESET_AFTER_QUIET_CHUNKS: usize = 10 * 16000 / CHUNK_SIZE; // 10 s
 /// A chunk is quiet below the voice threshold less this, as silero-vad's
 /// `neg_threshold` is.
 const QUIET_MARGIN: f32 = 0.15;
+/// `min_level_dbfs` is held against the loudest of this many chunks (~320 ms):
+/// a word's quiet tail is still speech, a steady murmur never gets this loud.
+const LEVEL_HOLD_CHUNKS: usize = 10;
 const MAX_CONV_ROWS: usize = 129 * 3; // largest in_channels * kernel_size (enc0)
 const MAX_CONV_STEPS: usize = 4; // largest conv output length (enc0)
 
@@ -295,6 +298,9 @@ pub struct SileroSession {
     last_score: Option<f32>,
     /// Quiet chunks in a row, up to `RESET_AFTER_QUIET_CHUNKS`.
     quiet_chunks: usize,
+    /// RMS levels (dBFS) of the latest LEVEL_HOLD_CHUNKS chunks, a ring buffer.
+    recent_levels: [f32; LEVEL_HOLD_CHUNKS],
+    processed_chunks: usize,
 }
 
 impl SileroSession {
@@ -329,6 +335,8 @@ impl SileroSession {
             initialized_timestamp: false,
             last_score: None,
             quiet_chunks: 0,
+            recent_levels: [f32::NEG_INFINITY; LEVEL_HOLD_CHUNKS],
+            processed_chunks: 0,
         }
     }
 }
@@ -540,6 +548,12 @@ impl Conv1dLayer {
     }
 }
 
+/// RMS level of samples in -1..1, in dBFS.
+fn level_dbfs(samples: &[f32]) -> f32 {
+    let power = samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32;
+    10.0 * (power + 1e-12).log10()
+}
+
 impl TinySilero {
     pub fn new(config: VADOption) -> Result<Self> {
         let model = Arc::clone(&SILERO_MODEL);
@@ -596,7 +610,17 @@ impl TinySilero {
             }
 
             self.session.buffer.drain(..CHUNK_SIZE);
-            let score = self.predict(&chunk_f32);
+            let mut score = self.predict(&chunk_f32);
+            let session = &mut self.session;
+            session.recent_levels[session.processed_chunks % LEVEL_HOLD_CHUNKS] =
+                level_dbfs(&chunk_f32);
+            session.processed_chunks += 1;
+            // the model still runs, so its state and context stay continuous
+            if let Some(floor) = self.config.min_level_dbfs
+                && session.recent_levels.iter().all(|&level| level < floor)
+            {
+                score = 0.0;
+            }
 
             self.session.buf_chunk_f32 = chunk_f32;
             self.session.last_score = Some(score);
