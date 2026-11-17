@@ -8,4 +8,4 @@
 mod telcoclassifier {
     include!("telcoclassifier_body.rs");
 }
-pub use telcoclassifier::TelcoClassifier;
+pub use telcoclassifier::{TelcoClassifier, TelcoClassifierWorkspace};

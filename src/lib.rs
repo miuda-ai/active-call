@@ -257,6 +257,9 @@ pub struct RingbackDetectionOption {
     pub sliding_window_size: Option<usize>,
     /// Confidence threshold for immediate finalization (default: 0.9)
     pub final_confidence_threshold: Option<f32>,
+    /// Upper bound for inference worker threads (process-wide, first
+    /// initialization wins).
+    pub inference_threads: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Hash, Eq, PartialEq)]

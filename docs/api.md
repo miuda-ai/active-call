@@ -956,8 +956,14 @@ The `CallOption` object is used in `invite` and `accept` commands and contains t
   - `transitionSpeed` (number, optional): Speed of volume transition (default: 0.01)
 - `ringbackDetection` (RingbackDetectionOption, optional): Ringback tone detection configuration
   - `enabled` (boolean): Enable ringback detection
-  - `modelWeightsPath` (string, optional): Path to classifier weights (default: "./telcoclassifier_weights.bin")
+  - `modelWeightsPath` (string, optional): Path to classifier weights (default: "./telcoclassifier_weights.bin"). The file is loaded and shared process-wide once per path, not per call.
   - `confidenceThreshold` (number, optional): Detection confidence threshold (default: 0.5)
+  - `minBufferSecs` (number, optional): Audio to accumulate before the first inference (default: 6.0). Detection only starts once the call reports early media; the model input is a fixed 6 s window, so values below 6 s behave like 6 s.
+  - `detectionIntervalSecs` (number, optional): Seconds between two inferences (default: 2.0)
+  - `onStateChangeOnly` (boolean, optional): Only emit `ringbackState` when the state changes (default: true)
+  - `slidingWindowSize` (number, optional): Results kept for majority voting (default: 6)
+  - `finalConfidenceThreshold` (number, optional): Confidence that finalizes the detection immediately (default: 0.9)
+  - `inferenceThreads` (number, optional): Upper bound for inference worker threads (process-wide, first initialization wins; default half the available cores, also settable with `RINGBACK_INFERENCE_THREADS`). All calls share this pool: lanes are spawned on demand and retired after ~30 s idle, so this caps ringback detection at that many cores; when the pool is saturated, older detection intervals are skipped instead of queueing.
 - `realtime` (RealtimeOption, optional): Realtime API configuration for full-duplex streaming
   - `provider` (string): Realtime provider ("openai", "azure")
   - `model` (string, optional): Model name
