@@ -25,7 +25,7 @@ use tokio_tungstenite::{
     tungstenite::Message,
     MaybeTlsStream, WebSocketStream,
 };
-use tracing::{info, warn, Level};
+use tracing::{info, Level};
 
 #[derive(Debug, Deserialize)]
 struct WebhookPayload {
@@ -532,7 +532,10 @@ async fn run_bridge_bot(
     sock.answer_ok(&invite);
     // Report active-call's media address for this leg (before "answered", so
     // a test waiting for both reads them in order).
-    let _ = events.send(format!("bridge_leg_media={:?}", sdp_media_addr(&invite)));
+    let _ = events.send(format!(
+        "bridge_leg_media={}",
+        sdp_media_addr(&invite).map(|a| a.to_string()).unwrap_or_default()
+    ));
     let _ = events.send("answered".into());
 
     // Wait for ACK, skipping any stray packets.
@@ -619,7 +622,10 @@ async fn run_agent_bot(
     };
     sock.reply(&invite, "SIP/2.0 100 Trying", None);
     sock.answer_ok(&invite);
-    let _ = events.send(format!("transfer_leg_media={:?}", sdp_media_addr(&invite)));
+    let _ = events.send(format!(
+        "transfer_leg_media={}",
+        sdp_media_addr(&invite).map(|a| a.to_string()).unwrap_or_default()
+    ));
     let _ = events.send("agent_answered".into());
     // Report whether the REFER's custom headers made it onto the transfer
     // INVITE (blind header forwarding).
@@ -1117,23 +1123,21 @@ async fn auto_refer_transfer_survives_default_50s_watchdog() {
 ///   attribution works);
 /// - after the transfer, the customer hears the agent (the new leg's inbound
 ///   RTP is demuxed: the leg is not deaf) and the agent hears the customer;
-/// - after the bridge leg's BYE, none of its audio reaches the customer.
+/// - after the bridge leg's BYE, none of its audio reaches the customer;
+/// - when the transfer INVITE goes out, the bridge leg still holds its RTP
+///   port and the transfer leg picked a different one.
 ///
-/// Known issue — the last two checks are skipped (with a KNOWN ISSUE warning)
-/// on iterations that hit it, so the test does not flake: `do_refer` starts
-/// with `do_interrupt`, which closes the bridge leg's PeerConnection (freeing
-/// its RTP port) *before* the transfer leg's PeerConnection picks its port.
-/// The transfer leg can randomly land on the bridge's freed port; the
-/// carrier's RTP, still flowing until its BYE at agent answer, then reaches
-/// the transfer leg: it interleaves with the agent's audio, and the leg may
-/// latch onto the carrier ("preserving latched RTP remote ... instead of
-/// selected-pair remote") and send the customer's audio there, leaving the
-/// agent with one-way audio for the whole call. Hit rate is
-/// 1 / (even ports in the RTP range): ~1 in 11 iterations with this node's
-/// 20-port range, ~1 in 5000 transfers with a 10000-port range. Fix: keep the
-/// superseded bridge track (and its port) until the transfer leg is set up,
-/// e.g. skip `do_interrupt` for it and let `MediaStream::update_track`'s
-/// deferred stop retire it; then drop the `port_reused` escape hatch.
+/// Regression guard for RTP port reuse: `do_refer` used to start with
+/// `do_interrupt`, closing the bridge leg's PeerConnection (freeing its RTP
+/// port) *before* the transfer leg's PeerConnection picked its port. The
+/// transfer leg could randomly land on the freed port; the carrier's RTP,
+/// still flowing until its BYE at agent answer, then reached the transfer
+/// leg: interleaved with the agent's audio, and the leg could latch onto the
+/// carrier ("preserving latched RTP remote ... instead of selected-pair
+/// remote"), sending the customer's audio there — one-way audio for the whole
+/// call. The media checks only caught it when the port actually collided
+/// (~1 in 11 iterations with this node's 20-port range); the port probe
+/// catches the early release on every iteration.
 ///
 /// Repeated `AUTO_REFER_MEDIA_ITERATIONS` times (default 3), each on a fresh
 /// node, to catch intermittent races.
@@ -1211,6 +1215,27 @@ async fn auto_refer_media_iteration(sip_port: u16, iteration: u16) {
         wait_event(&mut agent_rx, "transfer_leg_media=", Duration::from_secs(15))
             .await
             .expect("transfer INVITE never reached the agent");
+    // The transfer leg picked its RTP port while the bridge leg must still
+    // hold its own: had the bridge's port been released first, the transfer
+    // leg could reuse it and receive the carrier's RTP. Probe right now (the
+    // superseded track is stopped only after a grace period): binding the
+    // bridge leg's address must still fail.
+    let media_addr = |ev: &str| -> std::net::SocketAddr {
+        ev.split('=')
+            .nth(1)
+            .and_then(|a| a.parse().ok())
+            .unwrap_or_else(|| panic!("no media address in {ev:?}"))
+    };
+    let (bridge_addr, transfer_addr) =
+        (media_addr(&bridge_leg_media), media_addr(&transfer_leg_media));
+    assert_ne!(
+        transfer_addr, bridge_addr,
+        "iteration {iteration}: transfer leg reused the bridge leg's RTP port"
+    );
+    assert!(
+        std::net::UdpSocket::bind(bridge_addr).is_err(),
+        "iteration {iteration}: bridge leg's RTP port {bridge_addr} was already released when the transfer leg was set up"
+    );
     wait_event(&mut agent_rx, "agent_answered", Duration::from_secs(15))
         .await
         .expect("transfer INVITE was never answered");
@@ -1219,9 +1244,6 @@ async fn auto_refer_media_iteration(sip_port: u16, iteration: u16) {
         .await
         .expect("superseded bridge leg was never hung up");
     let t_bye = Instant::now();
-    // The known issue (see the doc comment) only bites when the transfer leg
-    // reused the bridge leg's freed RTP port.
-    let port_reused = bridge_leg_media.split('=').nth(1) == transfer_leg_media.split('=').nth(1);
     wait_event(&mut agent_rx, "agent_bye_acknowledged", HOLD + Duration::from_secs(10))
         .await
         .expect("agent BYE was not acknowledged");
@@ -1251,37 +1273,22 @@ async fn auto_refer_media_iteration(sip_port: u16, iteration: u16) {
         ctx(&customer_media, from, to)
     );
     let heard_customer = agent_media.count(CUSTOMER_FILL, from, to);
+    assert!(
+        heard_customer >= expected / 2,
+        "agent barely heard the customer after the transfer ({heard_customer}/{expected} frames) — {}",
+        ctx(&agent_media, from, to)
+    );
     let bridge_after_bye =
         customer_media.count(BRIDGE_FILL, t_bye + Duration::from_millis(300), t_end);
-    if port_reused {
-        // Known issue (see `auto_refer_transfer_media_flows_both_ways`): the
-        // transfer leg sits on the bridge's old port, so the carrier's RTP
-        // leaks in and the leg may latch onto the carrier, sending the
-        // customer's audio there instead of to the agent. Don't assert the
-        // two directions it breaks.
-        warn!(
-            iteration,
-            %transfer_leg_media,
-            heard_customer,
-            bridge_after_bye,
-            "KNOWN ISSUE: transfer leg reused the bridge leg's RTP port; skipping agent-hears-customer and no-bridge-bleed checks"
-        );
-    } else {
-        assert!(
-            heard_customer >= expected / 2,
-            "agent barely heard the customer after the transfer ({heard_customer}/{expected} frames) — {}",
-            ctx(&agent_media, from, to)
-        );
-        assert_eq!(
-            bridge_after_bye,
-            0,
-            "customer still heard the retired bridge leg after its BYE — {}",
-            ctx(&customer_media, t_bye, t_end)
-        );
-    }
+    assert_eq!(
+        bridge_after_bye,
+        0,
+        "customer still heard the retired bridge leg after its BYE — {}",
+        ctx(&customer_media, t_bye, t_end)
+    );
     info!(
         iteration,
-        pre, heard_agent, heard_customer, expected, port_reused, "auto-refer media iteration ok"
+        pre, heard_agent, heard_customer, expected, "auto-refer media iteration ok"
     );
 
     wait_event(&mut ws_events, "\"hangup\"", Duration::from_secs(10))
