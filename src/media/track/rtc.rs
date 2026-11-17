@@ -1330,12 +1330,6 @@ impl Track for RtcTrack {
         self.cancel_token.clone()
     }
 
-    fn cancel_pipeline(&self) {
-        // Cancels the event/stats loop and the per-track workers (inactivity
-        // watchdog) while keeping the PeerConnection alive — the successor's
-        // media setup must not race against this PC's teardown.
-        self.cancel_token.cancel();
-    }
     fn id(&self) -> &TrackId {
         &self.track_id
     }
