@@ -112,50 +112,19 @@ pub async fn call_handler_core(
     extras: Option<HashMap<String, serde_json::Value>>,
     playbook_name: Option<String>,
 ) -> Option<HashMap<String, serde_json::Value>> {
-    // ── admission control: MAX_ACTIVE_CALLS bounds concurrent sessions ──
-    // Placed before call construction so queued/rejected calls hold no
-    // media resources. Over-limit calls wait MAX_CALLS_WAIT_MS for a slot;
-    // on timeout the call is cancelled (OOM protection, 2026-11-16).
-    {
-        let (max_calls, wait_ms) = crate::call::active_call::admission_conf();
-        if max_calls > 0 {
-            use std::sync::atomic::Ordering;
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
-            let mut admitted = false;
-            let mut queued = false;
-            loop {
-                let cur = crate::call::active_call::ACTIVE_SESSIONS.load(Ordering::SeqCst);
-                if cur < max_calls
-                    && crate::call::active_call::ACTIVE_SESSIONS
-                        .compare_exchange(cur, cur + 1, Ordering::SeqCst, Ordering::Relaxed)
-                        .is_ok()
-                {
-                    admitted = true;
-                    break;
-                }
-                if std::time::Instant::now() >= deadline {
-                    break;
-                }
-                if !queued {
-                    queued = true;
-                    warn!(
-                        session_id,
-                        active_calls = cur,
-                        max_calls,
-                        wait_ms,
-                        "max active calls reached; queuing call"
-                    );
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-            if !admitted {
-                warn!(session_id, max_calls, wait_ms, "admission timeout; rejecting call");
-                cancel_token.cancel();
-                return None;
-            }
-        }
-    }
+    // ── admission control: [admission] bounds concurrent sessions ──
+    // Placed before call construction so queued/rejected calls hold no media
+    // resources. Reads the live config snapshot, so a reload that lowers
+    // `max_active_calls` drains gracefully: in-flight calls keep their slot,
+    // new calls queue for `wait_ms` and are then rejected. The ticket owns the
+    // counter (single decrement on drop).
+    let Some(_admission) =
+        crate::call::active_call::AdmissionTicket::acquire(&app_state.config(), &session_id).await
+    else {
+        warn!(session_id, "admission timeout; rejecting call");
+        cancel_token.cancel();
+        return None;
+    };
     let _cancel_guard = cancel_token.clone().drop_guard();
     let track_config = TrackConfig::default();
 
@@ -299,14 +268,6 @@ pub async fn call_handler_core(
     let send_ping_loop = async {
         if ping_interval == 0 {
             active_call.cancel_token.cancelled().await;
-            {
-                let cur = crate::call::active_call::ACTIVE_SESSIONS
-                    .load(std::sync::atomic::Ordering::SeqCst);
-                if cur > 0 {
-                    crate::call::active_call::ACTIVE_SESSIONS
-                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                }
-            }
             return;
         }
         let mut ticker = tokio::time::interval(Duration::from_secs(ping_interval));
@@ -528,7 +489,7 @@ pub async fn call_handler(
 }
 
 pub(crate) async fn get_iceservers(State(state): State<AppState>) -> Response {
-    if let Some(ice_servers) = state.config.ice_servers.as_ref() {
+    if let Some(ice_servers) = state.config().ice_servers.as_ref() {
         return Json(ice_servers).into_response();
     }
     Json(vec![IceServer {

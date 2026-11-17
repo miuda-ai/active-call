@@ -1,6 +1,5 @@
 use audio_codec::samples_to_bytes;
 
-use crate::event::SessionEvent;
 use crate::media::{AudioFrame, Samples, denoiser::NoiseReducer, processor::Processor};
 use std::{fs::File, io::Write};
 

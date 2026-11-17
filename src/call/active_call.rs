@@ -582,6 +582,10 @@ pub struct ActiveCall {
     pub track_config: TrackConfig,
     pub event_sender: EventSender,
     pub app_state: AppState,
+    /// Config snapshot taken when the call was created. Kept for the lifetime
+    /// of the call, so a hot reload never changes a running call's behavior;
+    /// new calls pick up the new snapshot.
+    pub config: Arc<crate::config::Config>,
     pub invitation: Invitation,
     pub cmd_sender: CommandSender,
     pub dump_events: bool,
@@ -793,23 +797,74 @@ pub struct ActiveCallGuard {
     pub active_calls: usize,
 }
 
-// ── admission control (MAX_ACTIVE_CALLS / MAX_CALLS_WAIT_MS via env) ──
+// ── admission control ([admission] config section) ─────────────────────
+/// Number of sessions currently holding an admission slot. Exposed for
+/// diagnostics (health endpoint / LEAKSTAT-style sampling).
 pub static ACTIVE_SESSIONS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-pub fn admission_conf() -> (usize, u64) {
-    static CONF: std::sync::OnceLock<(usize, u64)> = std::sync::OnceLock::new();
-    *CONF.get_or_init(|| {
-        let max_calls = std::env::var("MAX_ACTIVE_CALLS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0usize); // 0/unset = unlimited (backward compatible)
-        let wait_ms = std::env::var("MAX_CALLS_WAIT_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(5000u64);
-        (max_calls, wait_ms)
-    })
+/// A RAII admission slot. Exactly one owner: the session that acquired it
+/// decrements the counter when dropped, so the counter can neither leak nor be
+/// double-decremented.
+pub struct AdmissionTicket {
+    _private: (),
+}
+
+impl AdmissionTicket {
+    /// Wait for a slot, honouring the live `[admission]` config.
+    ///
+    /// `max_active_calls == 0` means unlimited (a ticket is still returned so
+    /// the counting stays accurate for diagnostics). Over-limit calls wait up
+    /// to `wait_ms` for a slot and are then rejected with `None`.
+    pub async fn acquire(
+        config: &crate::config::Config,
+        session_id: &str,
+    ) -> Option<AdmissionTicket> {
+        use std::sync::atomic::Ordering;
+        let max_calls = config.admission_max_calls();
+        let wait_ms = config.admission_wait_ms();
+
+        if max_calls == 0 {
+            ACTIVE_SESSIONS.fetch_add(1, Ordering::SeqCst);
+            return Some(AdmissionTicket { _private: () });
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+        let mut queued = false;
+        loop {
+            let cur = ACTIVE_SESSIONS.load(Ordering::SeqCst);
+            if cur < max_calls
+                && ACTIVE_SESSIONS
+                    .compare_exchange(cur, cur + 1, Ordering::SeqCst, Ordering::Relaxed)
+                    .is_ok()
+            {
+                return Some(AdmissionTicket { _private: () });
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            if !queued {
+                queued = true;
+                tracing::warn!(
+                    session_id,
+                    active_calls = cur,
+                    max_calls,
+                    wait_ms,
+                    "max active calls reached; queuing call"
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+}
+
+impl Drop for AdmissionTicket {
+    fn drop(&mut self) {
+        let cur = ACTIVE_SESSIONS.load(std::sync::atomic::Ordering::SeqCst);
+        if cur > 0 {
+            ACTIVE_SESSIONS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
 }
 
 impl ActiveCallGuard {
@@ -834,13 +889,8 @@ impl Drop for ActiveCallGuard {
             .lock()
             .unwrap()
             .remove(&self.call.session_id);
-        // admission counter: clamp-decrement on guard drop
-        {
-            let cur = ACTIVE_SESSIONS.load(std::sync::atomic::Ordering::SeqCst);
-            if cur > 0 {
-                ACTIVE_SESSIONS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            }
-        }
+        // The admission counter is owned by `AdmissionTicket`; nothing to do
+        // here (a second decrement used to under-count and over-admit).
         // Idempotent cleanup of the incoming-call session-id mapping (no-op
         // for outgoing/websocket sessions that were never registered).
         self.call
@@ -919,6 +969,10 @@ impl ActiveCall {
             ..Default::default()
         };
 
+        // The call's config snapshot: taken once, kept for the call's
+        // lifetime so a hot reload cannot change a running call.
+        let config = app_state.config();
+
         Self {
             cancel_token,
             call_type,
@@ -928,6 +982,7 @@ impl ActiveCall {
             track_config,
             event_sender,
             app_state,
+            config,
             invitation,
             cmd_sender,
             dump_events,
@@ -1339,7 +1394,7 @@ impl ActiveCall {
                 // Remember the notifier so ReferDone can report the final
                 // status to the referrer whatever we decide below.
                 self.set_refer_notifier(Some(notifier.clone()));
-                if !self.app_state.config.auto_refer() {
+                if !self.config.auto_refer() {
                     info!(
                         session_id = self.session_id,
                         %refer_to,
@@ -1384,7 +1439,7 @@ impl ActiveCall {
                 let refer_option = ReferOption {
                     auto_hangup: Some(true),
                     forward_dtmf: Some(true),
-                    timeout: Some(self.app_state.config.auto_refer_timeout()),
+                    timeout: Some(self.config.auto_refer_timeout()),
                     denoise: None,
                     agc: None,
                     // The auto-refer transfer MUST be followed as quickly as
@@ -1617,7 +1672,7 @@ impl ActiveCall {
             };
             let requested_format = recorder_option
                 .format
-                .unwrap_or(self.app_state.config.recorder_format());
+                .unwrap_or(self.config.recorder_format());
             let format = requested_format.effective();
             if requested_format != format {
                 warn!(
@@ -1633,7 +1688,7 @@ impl ActiveCall {
                 format: Some(format),
                 native_samplerate: Some(
                     recorder_option.native_samplerate.unwrap_or(false)
-                        || self.app_state.config.recorder_native_samplerate(),
+                        || self.config.recorder_native_samplerate(),
                 ),
                 swap_channels: recorder_option.swap_channels,
                 follow_bridge: recorder_option.follow_bridge,

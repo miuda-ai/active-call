@@ -406,51 +406,38 @@ impl StreamEngine {
     }
 }
 
-/// Per-call runtime toggle file. The deploy mounts the ops-managed env
-/// file at `/app/.env` (see run.sh MOUNTS); overridable via the
-/// `PBX_TOGGLE_FILE` env var. Read once per call setup, so toggling
-/// takes effect on the next call without any restart.
-fn toggle_file_path() -> std::path::PathBuf {
-    std::env::var("PBX_TOGGLE_FILE")
-        .unwrap_or_else(|_| "/app/.env".to_string())
-        .into()
+/// Module switches for the current config snapshot, with the ops toggle file
+/// (`PBX_TOGGLE_FILE`) taking precedence per key. Both are consulted at call
+/// setup, so a config reload or a toggle-file edit applies to the next call.
+fn module_enabled(module: crate::config::RuntimeModule, configured: bool) -> bool {
+    match module.toggle_key() {
+        Some(key) => crate::runtime::module_override(key, configured),
+        None => configured,
+    }
 }
 
 fn denoise_enabled() -> bool {
-    toggle_enabled_from(&toggle_file_path(), "DENOISE_ENABLED")
+    let switches = crate::runtime::module_switches();
+    module_enabled(crate::config::RuntimeModule::Denoise, switches.denoise)
 }
 
 fn ringback_detection_enabled() -> bool {
-    toggle_enabled_from(&toggle_file_path(), "RINGBACK_DETECTION_ENABLED")
+    let switches = crate::runtime::module_switches();
+    module_enabled(
+        crate::config::RuntimeModule::RingbackDetection,
+        switches.ringback_detection,
+    )
 }
 
 fn eou_enabled() -> bool {
-    toggle_enabled_from(&toggle_file_path(), "EOU_ENABLED")
-}
-
-/// `KEY=false|0|off` disables; missing file/key (or any other value)
-/// enables. Lines starting with `#` are ignored.
-fn toggle_enabled_from(path: &std::path::Path, key: &str) -> bool {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return true;
-    };
-    let prefix = format!("{}=", key);
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some(value) = line.strip_prefix(&prefix) {
-            let value = value.trim().trim_matches('"').to_ascii_lowercase();
-            return !(value == "false" || value == "0" || value == "off");
-        }
-    }
-    true
+    let switches = crate::runtime::module_switches();
+    module_enabled(crate::config::RuntimeModule::Eou, switches.eou)
 }
 
 #[cfg(test)]
-mod denoise_toggle_tests {
-    use super::toggle_enabled_from;
+mod module_toggle_tests {
+    use crate::config::{Config, ModulesConfig, ModuleToggle, RuntimeModule};
+    use crate::runtime::{ModuleSwitches, toggle_value_from};
 
     #[test]
     fn toggle_file_controls_switch() {
@@ -458,29 +445,45 @@ mod denoise_toggle_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("app.env");
 
-        // No file => enabled (default).
+        // No file => unspecified, so the configured value applies.
         std::fs::remove_file(&path).ok();
-        assert!(toggle_enabled_from(&path, "DENOISE_ENABLED"));
-        assert!(toggle_enabled_from(&path, "EOU_ENABLED"));
+        assert_eq!(toggle_value_from(&path, "DENOISE_ENABLED"), None);
+        assert_eq!(toggle_value_from(&path, "EOU_ENABLED"), None);
 
-        // Key missing => enabled.
+        // Key missing => unspecified.
         std::fs::write(&path, "RUST_LOG=info\nOTHER=1\n").unwrap();
-        assert!(toggle_enabled_from(&path, "DENOISE_ENABLED"));
+        assert_eq!(toggle_value_from(&path, "DENOISE_ENABLED"), None);
         // Explicitly disabled.
         std::fs::write(&path, "RUST_LOG=info\nDENOISE_ENABLED=false\n").unwrap();
-        assert!(!toggle_enabled_from(&path, "DENOISE_ENABLED"));
+        assert_eq!(toggle_value_from(&path, "DENOISE_ENABLED"), Some(false));
 
         // Quoted and numeric forms.
         std::fs::write(&path, "DENOISE_ENABLED=\"0\"\n").unwrap();
-        assert!(!toggle_enabled_from(&path, "DENOISE_ENABLED"));
+        assert_eq!(toggle_value_from(&path, "DENOISE_ENABLED"), Some(false));
         std::fs::write(&path, "DENOISE_ENABLED=true\n").unwrap();
-        assert!(toggle_enabled_from(&path, "DENOISE_ENABLED"));
+        assert_eq!(toggle_value_from(&path, "DENOISE_ENABLED"), Some(true));
 
         // Keys are independent: disabling EOU does not touch denoise.
         std::fs::write(&path, "EOU_ENABLED=false\n").unwrap();
-        assert!(!toggle_enabled_from(&path, "EOU_ENABLED"));
-        assert!(toggle_enabled_from(&path, "DENOISE_ENABLED"));
+        assert_eq!(toggle_value_from(&path, "EOU_ENABLED"), Some(false));
+        assert_eq!(toggle_value_from(&path, "DENOISE_ENABLED"), None);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A config-file switch alone is enough to disable a module (this is the
+    /// part that hot reload drives).
+    #[test]
+    fn config_module_switch_is_honoured() {
+        let mut config = Config::default();
+        config.modules = Some(ModulesConfig {
+            denoise: Some(ModuleToggle { enabled: false }),
+            eou: Some(ModuleToggle { enabled: false }),
+            ..Default::default()
+        });
+        let switches = ModuleSwitches::from_config(&config);
+        assert!(!switches.denoise);
+        assert!(!config.module_enabled(RuntimeModule::Eou));
+        assert!(config.module_enabled(RuntimeModule::RingbackDetection));
     }
 }

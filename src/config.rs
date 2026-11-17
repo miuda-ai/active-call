@@ -123,6 +123,18 @@ fn default_options_learn_ttl() -> Option<String> {
     Some("7d".to_string())
 }
 
+/// Parsed env var; unset/blank/unparsable yields `None` so the file value or
+/// the default stays in effect.
+fn env_number<T: std::str::FromStr>(key: &str) -> Option<T> {
+    let raw = std::env::var(key).ok()?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    raw.parse::<T>().ok()
+}
+
+
 fn default_codecs() -> Option<Vec<String>> {
     let codecs = vec![
         "pcmu".to_string(),
@@ -144,6 +156,110 @@ pub struct JitterBufferConfig {
     /// would only add delay; turn it on per call for softphones instead,
     /// or here if all SIP peers are on the open internet.
     pub sip: Option<bool>,
+}
+
+/// Hot-reloadable admission control: bounds concurrent sessions so a leak or
+/// a traffic surge cannot exhaust memory before ops can intervene.
+///
+/// Lowering `max_active_calls` at runtime drains gracefully — in-flight calls
+/// keep running, new calls queue for `wait_ms` and are then rejected. Raising
+/// it (or setting `0`) admits immediately. Applies on the next admission
+/// check, no restart required.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AdmissionConfig {
+    /// Maximum concurrent sessions. `0` or unset = unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_active_calls: Option<usize>,
+    /// How long an over-limit call waits for a slot before being rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_ms: Option<u64>,
+}
+
+/// A runtime module switch. `enabled` is read when a call/track is set up, so
+/// a change takes effect from the next call onwards; in-flight calls keep the
+/// processors they were built with.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ModuleToggle {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl Default for ModuleToggle {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// Runtime module switches (hot-reloadable).
+///
+/// These gate *compiled-in* features at runtime: the cargo features decide
+/// what can be built, these decide what this process actually runs. The
+/// ops-managed toggle file (`PBX_TOGGLE_FILE`, default `/app/.env`) still
+/// wins per key (`DENOISE_ENABLED=false` etc.) so the emergency switch keeps
+/// working without touching the config file.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ModulesConfig {
+    pub denoise: Option<ModuleToggle>,
+    pub vad: Option<ModuleToggle>,
+    pub eou: Option<ModuleToggle>,
+    pub ringback_detection: Option<ModuleToggle>,
+    pub sipflow: Option<ModuleToggle>,
+    pub playbooks: Option<ModuleToggle>,
+}
+
+/// The modules that can be switched at runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RuntimeModule {
+    Denoise,
+    Vad,
+    Eou,
+    RingbackDetection,
+    Sipflow,
+    Playbooks,
+}
+
+impl RuntimeModule {
+    /// Key in the ops toggle file that overrides this module.
+    pub fn toggle_key(self) -> Option<&'static str> {
+        match self {
+            RuntimeModule::Denoise => Some("DENOISE_ENABLED"),
+            RuntimeModule::Eou => Some("EOU_ENABLED"),
+            RuntimeModule::RingbackDetection => Some("RINGBACK_DETECTION_ENABLED"),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RuntimeModule::Denoise => "denoise",
+            RuntimeModule::Vad => "vad",
+            RuntimeModule::Eou => "eou",
+            RuntimeModule::RingbackDetection => "ringback_detection",
+            RuntimeModule::Sipflow => "sipflow",
+            RuntimeModule::Playbooks => "playbooks",
+        }
+    }
+}
+
+/// Settings for the `POST /reload` endpoint and the optional config watcher.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ReloadConfig {
+    /// Shared secret required in the `X-Reload-Token` header. Unset = the
+    /// endpoint is unauthenticated (bind the HTTP listener behind the ops
+    /// firewall, as rustpbx's `/reload/*` routes likewise assume).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// Watch the config file and apply changes automatically. Off by default;
+    /// deploys should use `mode=check` then `mode=apply`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<bool>,
+    /// Watcher poll interval in milliseconds (mtime/size polling).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch_interval_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -529,6 +645,16 @@ pub struct Config {
     /// (rustpbx-style "sipflow", lightweight in-memory flavour).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sipflow: Option<crate::sipflow::SipFlowConfig>,
+
+    /// Concurrent-session cap (hot-reloadable).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission: Option<AdmissionConfig>,
+    /// Runtime module switches (hot-reloadable).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modules: Option<ModulesConfig>,
+    /// Reload endpoint / watcher settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reload: Option<ReloadConfig>,
 }
 
 impl Config {
@@ -667,6 +793,9 @@ impl Default for Config {
             auto_refer: None,
             auto_refer_timeout: None,
             sipflow: None,
+            admission: None,
+            modules: None,
+            reload: None,
         }
     }
 }
@@ -682,10 +811,105 @@ impl Clone for Config {
 
 impl Config {
     pub fn load(path: &str) -> Result<Self, Error> {
-        let config: Self = toml::from_str(
+        let mut config: Self = toml::from_str(
             &std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("{}: {}", e, path))?,
         )?;
+        config.apply_env_overrides();
         Ok(config)
+    }
+
+    /// Environment overrides win over the mounted config file, so a knob can
+    /// be pinned per deployment (or flipped on the fly by restarting nothing
+    /// but the reload path) without editing `active-call.toml`.
+    ///
+    /// Recognised: `MAX_ACTIVE_CALLS`, `MAX_CALLS_WAIT_MS`, `PBX_RELOAD_TOKEN`.
+    pub fn apply_env_overrides(&mut self) {
+        if let Some(v) = env_number::<usize>("MAX_ACTIVE_CALLS") {
+            self.admission
+                .get_or_insert_with(AdmissionConfig::default)
+                .max_active_calls = Some(v);
+            tracing::info!(max_active_calls = v, "MAX_ACTIVE_CALLS override applied from env");
+        }
+        if let Some(v) = env_number::<u64>("MAX_CALLS_WAIT_MS") {
+            self.admission
+                .get_or_insert_with(AdmissionConfig::default)
+                .wait_ms = Some(v);
+            tracing::info!(wait_ms = v, "MAX_CALLS_WAIT_MS override applied from env");
+        }
+        if let Ok(token) = std::env::var("PBX_RELOAD_TOKEN")
+            && !token.trim().is_empty()
+        {
+            self.reload
+                .get_or_insert_with(ReloadConfig::default)
+                .token = Some(token.trim().to_string());
+        }
+    }
+
+    /// Maximum concurrent sessions; `0` means unlimited (default).
+    pub fn admission_max_calls(&self) -> usize {
+        self.admission
+            .as_ref()
+            .and_then(|a| a.max_active_calls)
+            .unwrap_or(0)
+    }
+
+    /// How long an over-limit call waits for a slot before being rejected.
+    pub fn admission_wait_ms(&self) -> u64 {
+        self.admission
+            .as_ref()
+            .and_then(|a| a.wait_ms)
+            .unwrap_or(5_000)
+    }
+
+    /// Whether a runtime module is enabled in this snapshot.
+    ///
+    /// The ops toggle file (`PBX_TOGGLE_FILE`, default `/app/.env`) is
+    /// consulted per key and wins over the config file, preserving the
+    /// emergency switch operators already rely on.
+    pub fn module_enabled(&self, module: RuntimeModule) -> bool {
+        let configured = match module {
+            RuntimeModule::Denoise => self.modules.as_ref().and_then(|m| m.denoise),
+            RuntimeModule::Vad => self.modules.as_ref().and_then(|m| m.vad),
+            RuntimeModule::Eou => self.modules.as_ref().and_then(|m| m.eou),
+            RuntimeModule::RingbackDetection => {
+                self.modules.as_ref().and_then(|m| m.ringback_detection)
+            }
+            RuntimeModule::Sipflow => self.modules.as_ref().and_then(|m| m.sipflow),
+            RuntimeModule::Playbooks => self.modules.as_ref().and_then(|m| m.playbooks),
+        }
+        .unwrap_or_default()
+        .enabled;
+
+        match module.toggle_key() {
+            Some(key) => crate::runtime::toggle_value(key).unwrap_or(configured),
+            None => configured,
+        }
+    }
+
+    /// Shared secret for `POST /reload`; `None` leaves it unauthenticated.
+    pub fn reload_token(&self) -> Option<&str> {
+        self.reload
+            .as_ref()
+            .and_then(|r| r.token.as_deref())
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+    }
+
+    pub fn reload_watch(&self) -> bool {
+        self.reload
+            .as_ref()
+            .and_then(|r| r.watch)
+            .unwrap_or(false)
+    }
+
+    pub fn reload_watch_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.reload
+                .as_ref()
+                .and_then(|r| r.watch_interval_ms)
+                .unwrap_or(2_000)
+                .clamp(200, 60_000),
+        )
     }
 
     /// Parsed `ice_disconnect_grace`; None keeps rustrtc's default.
