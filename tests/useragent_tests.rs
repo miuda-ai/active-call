@@ -596,3 +596,39 @@ async fn test_webhook_unavailable_immediate_reject() -> Result<()> {
     bob_token.cancel();
     test_result
 }
+
+#[tokio::test]
+async fn test_start_registration_skips_disabled_users() -> Result<()> {
+    use active_call::useragent::RegisterOption;
+
+    let user = |username: &str, disabled: Option<bool>| RegisterOption {
+        server: "127.0.0.1:5060".to_string(),
+        username: username.to_string(),
+        display_name: None,
+        disabled,
+        credential: None,
+    };
+
+    let mut config = Config::default();
+    config.http_addr = "127.0.0.1:0".to_string();
+    config.addr = "127.0.0.1".to_string();
+    config.udp_port = 0;
+    config.register_users = Some(vec![
+        user("1001", None),
+        user("1002", Some(false)),
+        user("1003", Some(true)),
+    ]);
+
+    let token = CancellationToken::new();
+    let ua = AppStateBuilder::new()
+        .with_config(config)
+        .with_cancel_token(token.clone())
+        .build()
+        .await?;
+
+    let count = ua.start_registration().await?;
+    token.cancel();
+
+    assert_eq!(count, 2, "disabled register_users entry must not register");
+    Ok(())
+}
