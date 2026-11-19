@@ -44,6 +44,8 @@ async fn test_save_with_http_without_media() {
         &headers,
         &with_media,
         &None, // keep_media_copy is irrelevant here
+        &None, // part_size_mb
+        &None, // delete_after_upload
         &record,
     )
     .await;
@@ -106,6 +108,8 @@ async fn test_save_with_http_with_media() {
         &headers,
         &with_media,
         &None, // keep_media_copy is irrelevant here
+        &None, // part_size_mb
+        &None, // delete_after_upload
         &record,
     )
     .await;
@@ -155,6 +159,8 @@ async fn test_save_with_http_with_custom_headers() {
         &Some(headers),
         &with_media,
         &None, // keep_media_copy is irrelevant here
+        &None, // part_size_mb
+        &None, // delete_after_upload
         &record,
     )
     .await;
@@ -204,6 +210,8 @@ async fn test_save_with_s3_like_with_custom_headers() {
         &Some(headers),
         &with_media,
         &None,
+        &None, // part_size_mb
+        &None, // delete_after_upload
         &record,
     )
     .await;
@@ -262,6 +270,8 @@ async fn test_save_with_s3_like_memory_store() {
         &endpoint,
         &with_media,
         &keep_media_copy,
+        &None, // part_size_mb
+        &None, // delete_after_upload
         &record,
     )
     .await;
@@ -338,6 +348,8 @@ async fn test_save_with_s3_like_with_media() {
             &endpoint,
             &with_media,
             &keep_media_copy,
+            &None, // part_size_mb
+            &None, // delete_after_upload
             &record,
         )
         .await;

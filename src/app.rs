@@ -90,7 +90,14 @@ fn extract_via_source(request: &rsipstack::rsip::Request) -> (Option<std::net::I
 }
 
 pub struct AppStateInner {
-    pub config: Arc<Config>,
+    /// Live configuration snapshot, hot-swappable via
+    /// [`AppStateInner::apply_config`]. Reads go through
+    /// [`AppStateInner::config`]: a call captures one snapshot at construction
+    /// and keeps it for its lifetime, so a reload never changes a call that is
+    /// already running.
+    config: ArcSwap<Config>,
+    /// Path recorded at startup; used by the reload endpoint and the watcher.
+    pub config_path: Option<Arc<str>>,
     pub token: CancellationToken,
     pub stream_engine: Arc<StreamEngine>,
     pub callrecord_sender: Option<CallRecordSender>,
@@ -143,7 +150,7 @@ pub struct AppStateBuilder {
 
 impl AppStateInner {
     pub fn auto_learn_public_address_enabled(&self) -> bool {
-        self.config.auto_learn_public_address.unwrap_or(false)
+        self.config().auto_learn_public_address.unwrap_or(false)
     }
 
     /// Whether an OPTIONS probe from `source_ip`/`source_host` (as extracted
@@ -155,13 +162,13 @@ impl AppStateInner {
         source_ip: Option<std::net::IpAddr>,
         source_host: &str,
     ) -> bool {
-        if self.config.options_matches_static(source_ip, source_host) {
+        if self.config().options_matches_static(source_ip, source_host) {
             return true;
         }
-        if !self.config.options_auto_learn() {
+        if !self.config().options_auto_learn() {
             return false;
         }
-        let ttl = self.config.options_learn_ttl();
+        let ttl = self.config().options_learn_ttl();
         match source_ip {
             Some(ip) => self.learned_peers.contains_within(&ip, ttl),
             None => false,
@@ -169,7 +176,7 @@ impl AppStateInner {
     }
 
     pub fn get_dump_events_file(&self, session_id: &String) -> String {
-        let recorder_root = self.config.recorder_path();
+        let recorder_root = self.config().recorder_path();
         let root = Path::new(&recorder_root);
         if !root.exists() {
             match std::fs::create_dir_all(root) {
@@ -191,7 +198,7 @@ impl AppStateInner {
     }
 
     pub fn get_recorder_file(&self, session_id: &String) -> String {
-        let recorder_root = self.config.recorder_path();
+        let recorder_root = self.config().recorder_path();
         let root = Path::new(&recorder_root);
         if !root.exists() {
             match std::fs::create_dir_all(root) {
@@ -207,7 +214,7 @@ impl AppStateInner {
                 }
             }
         }
-        let desired_ext = self.config.recorder_format().extension();
+        let desired_ext = self.config().recorder_format().extension();
         let mut filename = session_id.clone();
         if !filename
             .to_lowercase()
@@ -271,9 +278,8 @@ impl AppStateInner {
             },
         }
 
-        let total_secs = self.config.graceful_shutdown_timeout.unwrap_or(30);
-        let timeout = self
-            .config
+        let total_secs = self.config().graceful_shutdown_timeout.unwrap_or(30);
+        let timeout = self.config()
             .graceful_shutdown
             .map(|_| Duration::from_secs(total_secs));
 
@@ -353,10 +359,10 @@ impl AppStateInner {
 
                     let invitation_handler = match self.create_invitation_handler {
                         Some(ref create_invitation_handler) => {
-                            create_invitation_handler(self.config.handler.as_ref()).ok()
+                            create_invitation_handler(self.config().handler.as_ref()).ok()
                         }
                         _ => default_create_invite_handler(
-                            self.config.handler.as_ref(),
+                            self.config().handler.as_ref(),
                             Some(self.clone()),
                         ),
                     };
@@ -448,7 +454,7 @@ impl AppStateInner {
                     ));
 
                     let accept_timeout = self
-                        .config
+                        .config()
                         .accept_timeout
                         .as_ref()
                         .and_then(|t| parse_duration(t).ok())
@@ -615,7 +621,7 @@ impl AppStateInner {
                     });
                 }
                 rsipstack::rsip::Method::Options => {
-                    if self.config.options_response_enabled() {
+                    if self.config().options_response_enabled() {
                         let (source_ip, source_host) = extract_via_source(&tx.original);
                         if self.options_source_allowed(source_ip, &source_host) {
                             info!(?key, %source_host, "responding to out-of-dialog OPTIONS request");
@@ -627,7 +633,7 @@ impl AppStateInner {
                                 },
                                 rsipstack::rsip::Header::Accept(Accept::new("application/sdp")),
                             ];
-                            let extra_headers = self.config.options_extra_headers();
+                            let extra_headers = self.config().options_extra_headers();
                             if !extra_headers.is_empty() {
                                 headers.extend(crate::sip_util::sip_headers_from_map(
                                     &extra_headers.into_iter().collect::<HashMap<_, _>>(),
@@ -729,7 +735,8 @@ impl AppStateInner {
 
     pub async fn start_registration(&self) -> Result<usize> {
         let mut count = 0;
-        if let Some(register_users) = &self.config.register_users {
+        let config = self.config();
+        if let Some(register_users) = &config.register_users {
             for option in register_users.iter() {
                 if option.disabled.unwrap_or(false) {
                     info!(user = option.aor(), "registration disabled, skipping");
@@ -787,7 +794,8 @@ impl AppStateInner {
         match_type: &str,
         pred: impl Fn(&rsipstack::rsip::Host) -> bool,
     ) -> Option<UserCredential> {
-        let register_users = self.config.register_users.as_ref()?;
+        let config = self.config();
+        let register_users = config.register_users.as_ref()?;
         for option in register_users.iter() {
             let server = crate::sip_util::ensure_sip_scheme(option.server.clone());
 
@@ -981,6 +989,181 @@ impl AppStateInner {
     }
 }
 
+impl AppStateInner {
+    /// Current config snapshot. Cheap (`Arc` clone); call sites that make
+    /// several decisions from one consistent view should bind it first.
+    #[inline]
+    pub fn config(&self) -> Arc<Config> {
+        self.config.load_full()
+    }
+
+    /// Path of the config file this process was started with, if any.
+    pub fn config_path(&self) -> Option<&str> {
+        self.config_path.as_deref()
+    }
+
+    /// Re-read the config file recorded at startup and apply it.
+    pub async fn reload_from_disk(&self) -> Result<ReloadReport, ReloadError> {
+        let Some(path) = self.config_path() else {
+            return Err(ReloadError::NoPath);
+        };
+        // `Config::load` also re-applies env overrides, so the precedence
+        // (env > file > default) is identical to startup.
+        let proposed = Config::load(path)
+            .map_err(|e| ReloadError::Invalid(format!("{path}: {e}")))?;
+        Ok(self.apply_config(proposed))
+    }
+
+    /// Validate a proposed snapshot without installing it (`mode=check`).
+    pub fn preview_config(&self, proposed: Config) -> ReloadReport {
+        self.diff_report(&proposed)
+    }
+
+    /// Validate and install a new config snapshot.
+    ///
+    /// Applying is atomic: the snapshot is swapped in one store, after which
+    /// the module switches and the media cache directory are re-derived. The
+    /// report classifies every changed top-level section so the caller can see
+    /// which changes are live (`applied`), which wait for the next call
+    /// (`deferred`) and which need a restart (`requires_restart`).
+    pub fn apply_config(&self, proposed: Config) -> ReloadReport {
+        let report = self.diff_report(&proposed);
+        if report.status == "error" {
+            return report;
+        }
+
+        // Swap first, then derive the side effects from the new snapshot so a
+        // concurrent call sees either the old or the new world, never a mix.
+        self.config.store(Arc::new(proposed));
+        let current = self.config.load_full();
+        apply_side_effects(&current);
+        report
+    }
+
+    fn diff_report(&self, proposed: &Config) -> ReloadReport {
+        diff_configs(&self.config.load_full(), proposed)
+    }
+}
+
+/// Classify the differences between two snapshots into the reload report.
+fn diff_configs(old: &Config, proposed: &Config) -> ReloadReport {
+    let old_json = serde_json::to_value(old).unwrap_or_default();
+    let new_json = serde_json::to_value(proposed).unwrap_or_default();
+
+    let mut applied = Vec::new();
+    let mut deferred = Vec::new();
+    let mut requires_restart = Vec::new();
+    let (Some(old_map), Some(new_map)) = (old_json.as_object(), new_json.as_object()) else {
+        return ReloadReport {
+            status: "error",
+            revision: String::new(),
+            applied,
+            deferred,
+            requires_restart,
+        };
+    };
+
+    let mut keys: Vec<&String> = old_map.keys().chain(new_map.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    for key in keys {
+        let before = old_map.get(key).unwrap_or(&serde_json::Value::Null);
+        let after = new_map.get(key).unwrap_or(&serde_json::Value::Null);
+        if before == after {
+            continue;
+        }
+        match classify_field(key) {
+            FieldClass::Hot => applied.push(key.clone()),
+            FieldClass::Deferred => deferred.push(key.clone()),
+            FieldClass::Restart => requires_restart.push(key.clone()),
+        }
+    }
+
+    ReloadReport {
+        status: if applied.is_empty() && deferred.is_empty() && requires_restart.is_empty() {
+            "unchanged"
+        } else {
+            "ok"
+        },
+        revision: chrono::Utc::now().to_rfc3339(),
+        applied,
+        deferred,
+        requires_restart,
+    }
+}
+
+/// How a changed top-level config section takes effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FieldClass {
+    /// Read live from the snapshot (per request / per admission check).
+    Hot,
+    /// Read when a call, track or upload is set up.
+    Deferred,
+    /// Captured at build time; only a process restart applies it.
+    Restart,
+}
+
+fn classify_field(key: &str) -> FieldClass {
+    match key {
+        // Live per request/admission check.
+        "admission" | "modules" | "reload" | "auto_learn_public_address"
+        | "enable_options_response" | "options_response" | "peers" | "rewrites"
+        | "trunk_rules" | "http_access_skip_paths" => FieldClass::Hot,
+        // Read when a call/track/upload is set up.
+        "callrecord" | "recording" | "media_cache_path" | "codecs" | "ice_servers"
+        | "ambiance" | "jitter_buffer" | "enable_rtp_latching" | "enable_ice_lite"
+        | "ice_disconnect_grace" | "enable_srtp" | "external_ip" | "rtp_bind_ip"
+        | "auto_refer" | "auto_refer_timeout" | "accept_timeout" => FieldClass::Deferred,
+        // Listener/UA/allocator/engine wiring built at startup.
+        _ => FieldClass::Restart,
+    }
+}
+
+/// Re-derive the process-wide state that mirrors the config snapshot.
+fn apply_side_effects(config: &Config) {
+    crate::runtime::apply_config(config);
+    if let Err(e) = crate::media::cache::set_cache_dir(&config.media_cache_path) {
+        tracing::warn!(error = %e, "failed to update media cache dir on reload");
+    }
+}
+
+/// Outcome of one reload attempt.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReloadReport {
+    /// `ok` (changed), `unchanged`, or `error`.
+    pub status: &'static str,
+    /// RFC 3339 timestamp of the snapshot this report describes.
+    pub revision: String,
+    /// Live immediately.
+    pub applied: Vec<String>,
+    /// Applies from the next call onwards.
+    pub deferred: Vec<String>,
+    /// Requires a process restart.
+    pub requires_restart: Vec<String>,
+}
+
+#[derive(Debug)]
+pub enum ReloadError {
+    /// The process was started without a config file path.
+    NoPath,
+    /// The file could not be read or parsed; the old snapshot stays live.
+    Invalid(String),
+}
+
+impl std::fmt::Display for ReloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReloadError::NoPath => write!(
+                f,
+                "no config path recorded at startup; start with --conf or with_config_metadata"
+            ),
+            ReloadError::Invalid(e) => write!(f, "invalid configuration: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ReloadError {}
+
 impl Drop for AppStateInner {
     fn drop(&mut self) {
         self.stop();
@@ -1104,6 +1287,8 @@ impl AppStateBuilder {
 
     pub async fn build(mut self) -> Result<AppState> {
         let config: Arc<Config> = Arc::new(self.config.unwrap_or_default());
+        // Publish the module switches before the first call can be set up.
+        crate::runtime::apply_config(&config);
         let token = self
             .cancel_token
             .unwrap_or_else(|| CancellationToken::new());
@@ -1358,7 +1543,8 @@ impl AppStateBuilder {
         };
 
         let app_state = Arc::new(AppStateInner {
-            config,
+            config: ArcSwap::from(config),
+            config_path: self.config_path.map(Arc::from),
             token,
             stream_engine,
             callrecord_sender,
@@ -1381,6 +1567,112 @@ impl AppStateBuilder {
             shutting_down: Arc::new(AtomicBool::new(false)),
         });
 
+        if app_state.config().reload_watch() {
+            crate::spawn(watch_config_file(app_state.clone()));
+        }
+
         Ok(app_state)
+    }
+}
+
+/// Poll the config file (mtime + size) and apply changes.
+///
+/// Off unless `[reload] watch = true`: deploys should use the explicit
+/// `mode=check` → `mode=apply` flow. The watcher exists for ops convenience;
+/// write the file atomically (`.tmp` + rename) to avoid parsing a half-written
+/// config — a parse failure keeps the previous snapshot live and the next
+/// change re-triggers it anyway.
+async fn watch_config_file(state: AppState) {
+    fn stamp(path: &str) -> Option<(std::time::SystemTime, u64)> {
+        let meta = std::fs::metadata(path).ok()?;
+        Some((meta.modified().ok()?, meta.len()))
+    }
+
+    let Some(path) = state.config_path().map(str::to_string) else {
+        return;
+    };
+    let mut last = stamp(&path);
+    loop {
+        tokio::time::sleep(state.config().reload_watch_interval()).await;
+        if state.token.is_cancelled() {
+            return;
+        }
+        let now = stamp(&path);
+        if now == last {
+            continue;
+        }
+        last = now;
+        // Let an in-progress write settle before parsing.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        match state.reload_from_disk().await {
+            Ok(report) => info!(
+                status = report.status,
+                applied = ?report.applied,
+                deferred = ?report.deferred,
+                requires_restart = ?report.requires_restart,
+                "config reloaded by file watcher"
+            ),
+            Err(e) => warn!(error = %e, "config reload failed; keeping previous snapshot"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod reload_tests {
+    use super::diff_configs;
+    use crate::config::{AdmissionConfig, Config, ModuleToggle, ModulesConfig};
+
+    #[test]
+    fn identical_config_is_unchanged() {
+        let old = Config::default();
+        let report = diff_configs(&old, &old);
+        assert_eq!(report.status, "unchanged");
+        assert!(report.applied.is_empty());
+        assert!(report.deferred.is_empty());
+        assert!(report.requires_restart.is_empty());
+    }
+
+    #[test]
+    fn hot_sections_are_live_and_listener_changes_need_restart() {
+        let old = Config::default();
+        let mut new = Config::default();
+        new.admission = Some(AdmissionConfig {
+            max_active_calls: Some(10),
+            wait_ms: Some(250),
+        });
+        new.modules = Some(ModulesConfig {
+            denoise: Some(ModuleToggle { enabled: false }),
+            ..Default::default()
+        });
+        new.udp_port = old.udp_port + 1;
+
+        let report = diff_configs(&old, &new);
+        assert_eq!(report.status, "ok");
+        assert!(report.applied.contains(&"admission".to_string()));
+        assert!(report.applied.contains(&"modules".to_string()));
+        assert!(report.requires_restart.contains(&"udp_port".to_string()));
+        assert!(report.deferred.is_empty());
+    }
+
+    #[test]
+    fn per_call_sections_are_deferred() {
+        let old = Config::default();
+        let mut new = Config::default();
+        new.codecs = Some(vec!["pcmu".to_string()]);
+        let report = diff_configs(&old, &new);
+        assert_eq!(report.deferred, vec!["codecs".to_string()]);
+        assert!(report.applied.is_empty());
+    }
+
+    #[test]
+    fn removing_a_section_is_reported() {
+        let mut old = Config::default();
+        old.admission = Some(AdmissionConfig {
+            max_active_calls: Some(10),
+            wait_ms: None,
+        });
+        let new = Config::default();
+        let report = diff_configs(&old, &new);
+        assert!(report.applied.contains(&"admission".to_string()));
     }
 }

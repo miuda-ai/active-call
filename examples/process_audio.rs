@@ -53,7 +53,12 @@ async fn main() -> Result<()> {
         audio_duration_secs
     );
 
-    let mut nr = NoiseReducer::new(sample_rate as usize);
+    // The denoiser only runs after the call is answered; a batch file has no
+    // signaling, so treat it as answered from the first frame.
+    let mut nr = NoiseReducer::new(
+        sample_rate as usize,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    );
     let (event_sender, mut event_receiver) = broadcast::channel(128);
 
     let mut option = VADOption::default();

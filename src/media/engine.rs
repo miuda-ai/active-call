@@ -2,7 +2,7 @@ use super::{
     INTERNAL_SAMPLERATE,
     agc::AutomaticGainControl,
     asr_processor::AsrProcessor,
-    denoiser::NoiseReducer,
+    denoiser::{NoiseReducer, spawn_answer_watcher},
     processor::Processor,
     track::{
         Track, TrackPacketSender,
@@ -10,6 +10,7 @@ use super::{
     },
     vad::{VADOption, VadProcessor, VadType},
 };
+use std::sync::atomic::AtomicBool;
 use crate::{
     CallOption, EouOption,
     event::EventSender,
@@ -31,7 +32,7 @@ use anyhow::Result;
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
+use tracing::{debug, info};
 #[cfg(feature = "ringback-detection")]
 use tracing::warn;
 
@@ -308,9 +309,12 @@ impl StreamEngine {
             }
 
             match option.denoise {
-                Some(true) => {
+                Some(true) if denoise_enabled() => {
                     debug!(%track_id, "Adding NoiseReducer processor");
-                    let noise_reducer = NoiseReducer::new(INTERNAL_SAMPLERATE as usize);
+                    let answered = Arc::new(AtomicBool::new(false));
+                    spawn_answer_watcher(event_sender.subscribe(), answered.clone());
+                    let noise_reducer =
+                        NoiseReducer::new(INTERNAL_SAMPLERATE as usize, answered);
                     processors.push(Box::new(noise_reducer) as Box<dyn Processor>);
                 }
                 _ => {}
@@ -350,13 +354,19 @@ impl StreamEngine {
                 None => {}
             }
             match option.eou {
-                Some(ref option) => {
+                Some(ref option) if eou_enabled() => {
                     let eou_processor = engine.create_eou_processor(
                         cancel_token.child_token(),
                         event_sender.clone(),
                         option.to_owned(),
                     )?;
                     processors.push(eou_processor);
+                }
+                Some(_) => {
+                    // Defense in depth: even if the playbook still carries an
+                    // `eou` block, ops can disable EOU fleet-wide via the
+                    // toggle file without a restart (EOU_ENABLED=false).
+                    info!(%track_id, "EOU processor skipped: disabled by EOU_ENABLED toggle");
                 }
                 None => {}
             }
@@ -375,7 +385,7 @@ impl StreamEngine {
 
             #[cfg(feature = "ringback-detection")]
             if let Some(ref ringback_opt) = option.ringback_detection {
-                if ringback_opt.enabled.unwrap_or(false) {
+                if ringback_opt.enabled.unwrap_or(false) && ringback_detection_enabled() {
                     debug!(%track_id, "Adding RingbackDetectionProcessor");
                     match
                         crate::media::ringback_detection::processor::RingbackDetectionProcessor::new(
@@ -393,5 +403,87 @@ impl StreamEngine {
 
             Ok(processors)
         })
+    }
+}
+
+/// Module switches for the current config snapshot, with the ops toggle file
+/// (`PBX_TOGGLE_FILE`) taking precedence per key. Both are consulted at call
+/// setup, so a config reload or a toggle-file edit applies to the next call.
+fn module_enabled(module: crate::config::RuntimeModule, configured: bool) -> bool {
+    match module.toggle_key() {
+        Some(key) => crate::runtime::module_override(key, configured),
+        None => configured,
+    }
+}
+
+fn denoise_enabled() -> bool {
+    let switches = crate::runtime::module_switches();
+    module_enabled(crate::config::RuntimeModule::Denoise, switches.denoise)
+}
+
+fn ringback_detection_enabled() -> bool {
+    let switches = crate::runtime::module_switches();
+    module_enabled(
+        crate::config::RuntimeModule::RingbackDetection,
+        switches.ringback_detection,
+    )
+}
+
+fn eou_enabled() -> bool {
+    let switches = crate::runtime::module_switches();
+    module_enabled(crate::config::RuntimeModule::Eou, switches.eou)
+}
+
+#[cfg(test)]
+mod module_toggle_tests {
+    use crate::config::{Config, ModulesConfig, ModuleToggle, RuntimeModule};
+    use crate::runtime::{ModuleSwitches, toggle_value_from};
+
+    #[test]
+    fn toggle_file_controls_switch() {
+        let dir = std::env::temp_dir().join(format!("zapbx_denoise_toggle_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("app.env");
+
+        // No file => unspecified, so the configured value applies.
+        std::fs::remove_file(&path).ok();
+        assert_eq!(toggle_value_from(&path, "DENOISE_ENABLED"), None);
+        assert_eq!(toggle_value_from(&path, "EOU_ENABLED"), None);
+
+        // Key missing => unspecified.
+        std::fs::write(&path, "RUST_LOG=info\nOTHER=1\n").unwrap();
+        assert_eq!(toggle_value_from(&path, "DENOISE_ENABLED"), None);
+        // Explicitly disabled.
+        std::fs::write(&path, "RUST_LOG=info\nDENOISE_ENABLED=false\n").unwrap();
+        assert_eq!(toggle_value_from(&path, "DENOISE_ENABLED"), Some(false));
+
+        // Quoted and numeric forms.
+        std::fs::write(&path, "DENOISE_ENABLED=\"0\"\n").unwrap();
+        assert_eq!(toggle_value_from(&path, "DENOISE_ENABLED"), Some(false));
+        std::fs::write(&path, "DENOISE_ENABLED=true\n").unwrap();
+        assert_eq!(toggle_value_from(&path, "DENOISE_ENABLED"), Some(true));
+
+        // Keys are independent: disabling EOU does not touch denoise.
+        std::fs::write(&path, "EOU_ENABLED=false\n").unwrap();
+        assert_eq!(toggle_value_from(&path, "EOU_ENABLED"), Some(false));
+        assert_eq!(toggle_value_from(&path, "DENOISE_ENABLED"), None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A config-file switch alone is enough to disable a module (this is the
+    /// part that hot reload drives).
+    #[test]
+    fn config_module_switch_is_honoured() {
+        let mut config = Config::default();
+        config.modules = Some(ModulesConfig {
+            denoise: Some(ModuleToggle { enabled: false }),
+            eou: Some(ModuleToggle { enabled: false }),
+            ..Default::default()
+        });
+        let switches = ModuleSwitches::from_config(&config);
+        assert!(!switches.denoise);
+        assert!(!config.module_enabled(RuntimeModule::Eou));
+        assert!(config.module_enabled(RuntimeModule::RingbackDetection));
     }
 }

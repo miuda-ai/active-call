@@ -107,7 +107,7 @@ pub async fn save_playbook(Path(name): Path<String>, body: String) -> impl IntoR
 
 pub async fn list_records(State(state): State<AppState>) -> impl IntoResponse {
     let mut records = Vec::new();
-    let path = PathBuf::from(state.config.recorder_path());
+    let path = PathBuf::from(state.config().recorder_path());
 
     if let Ok(entries) = fs::read_dir(path) {
         for entry in entries.flatten() {

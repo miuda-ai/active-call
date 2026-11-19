@@ -40,12 +40,12 @@ pub async fn try_forward(
         );
         return None;
     }
-    if app_state.config.peers.is_empty() {
+    if app_state.config().peers.is_empty() {
         return None;
     }
 
     let query = params.to_forward_query();
-    for peer in &app_state.config.peers {
+    for peer in &app_state.config().peers {
         let Some(base) = Config::peer_ws_endpoint(peer) else {
             warn!(peer, "skipping invalid peer address");
             continue;

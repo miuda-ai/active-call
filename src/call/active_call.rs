@@ -582,6 +582,10 @@ pub struct ActiveCall {
     pub track_config: TrackConfig,
     pub event_sender: EventSender,
     pub app_state: AppState,
+    /// Config snapshot taken when the call was created. Kept for the lifetime
+    /// of the call, so a hot reload never changes a running call's behavior;
+    /// new calls pick up the new snapshot.
+    pub config: Arc<crate::config::Config>,
     pub invitation: Invitation,
     pub cmd_sender: CommandSender,
     pub dump_events: bool,
@@ -593,6 +597,10 @@ pub struct ActiveCall {
     pub bridge_paused: Arc<AtomicBool>,
     /// Main-leg lifecycle progress (dialog id, ring/answer times, answer SDP, option...).
     pub progress: Arc<ArcSwap<CallProgress>>,
+    /// Signalled by the main-leg dialog termination (`InviteDialogStates::
+    /// on_terminated`); handed to every main-leg `LegShared` produced by
+    /// `leg()` so `do_hangup` can wait for the BYE outcome.
+    pub leg_terminated_tx: Arc<tokio::sync::watch::Sender<bool>>,
     /// Main-leg variables (playbook set_var, SIP headers, hangup headers).
     pub extras: Extras,
     /// Active music-on-hold path (shared with the spawned refer task).
@@ -646,6 +654,7 @@ impl ActiveCall {
             ssrc: self.ssrc,
             is_refer: false,
             progress: self.progress.clone(),
+            terminated_tx: self.leg_terminated_tx.clone(),
             extras: self.extras.clone(),
         }
     }
@@ -788,6 +797,76 @@ pub struct ActiveCallGuard {
     pub active_calls: usize,
 }
 
+// ── admission control ([admission] config section) ─────────────────────
+/// Number of sessions currently holding an admission slot. Exposed for
+/// diagnostics (health endpoint / LEAKSTAT-style sampling).
+pub static ACTIVE_SESSIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// A RAII admission slot. Exactly one owner: the session that acquired it
+/// decrements the counter when dropped, so the counter can neither leak nor be
+/// double-decremented.
+pub struct AdmissionTicket {
+    _private: (),
+}
+
+impl AdmissionTicket {
+    /// Wait for a slot, honouring the live `[admission]` config.
+    ///
+    /// `max_active_calls == 0` means unlimited (a ticket is still returned so
+    /// the counting stays accurate for diagnostics). Over-limit calls wait up
+    /// to `wait_ms` for a slot and are then rejected with `None`.
+    pub async fn acquire(
+        config: &crate::config::Config,
+        session_id: &str,
+    ) -> Option<AdmissionTicket> {
+        use std::sync::atomic::Ordering;
+        let max_calls = config.admission_max_calls();
+        let wait_ms = config.admission_wait_ms();
+
+        if max_calls == 0 {
+            ACTIVE_SESSIONS.fetch_add(1, Ordering::SeqCst);
+            return Some(AdmissionTicket { _private: () });
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+        let mut queued = false;
+        loop {
+            let cur = ACTIVE_SESSIONS.load(Ordering::SeqCst);
+            if cur < max_calls
+                && ACTIVE_SESSIONS
+                    .compare_exchange(cur, cur + 1, Ordering::SeqCst, Ordering::Relaxed)
+                    .is_ok()
+            {
+                return Some(AdmissionTicket { _private: () });
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            if !queued {
+                queued = true;
+                tracing::warn!(
+                    session_id,
+                    active_calls = cur,
+                    max_calls,
+                    wait_ms,
+                    "max active calls reached; queuing call"
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+}
+
+impl Drop for AdmissionTicket {
+    fn drop(&mut self) {
+        let cur = ACTIVE_SESSIONS.load(std::sync::atomic::Ordering::SeqCst);
+        if cur > 0 {
+            ACTIVE_SESSIONS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
 impl ActiveCallGuard {
     pub fn new(call: ActiveCallRef) -> Self {
         let active_calls = {
@@ -810,6 +889,8 @@ impl Drop for ActiveCallGuard {
             .lock()
             .unwrap()
             .remove(&self.call.session_id);
+        // The admission counter is owned by `AdmissionTicket`; nothing to do
+        // here (a second decrement used to under-count and over-admit).
         // Idempotent cleanup of the incoming-call session-id mapping (no-op
         // for outgoing/websocket sessions that were never registered).
         self.call
@@ -888,6 +969,10 @@ impl ActiveCall {
             ..Default::default()
         };
 
+        // The call's config snapshot: taken once, kept for the call's
+        // lifetime so a hot reload cannot change a running call.
+        let config = app_state.config();
+
         Self {
             cancel_token,
             call_type,
@@ -897,6 +982,7 @@ impl ActiveCall {
             track_config,
             event_sender,
             app_state,
+            config,
             invitation,
             cmd_sender,
             dump_events,
@@ -904,6 +990,7 @@ impl ActiveCall {
             ssrc: rand::random::<u32>(),
             bridge_paused: Arc::new(AtomicBool::new(false)),
             progress: Arc::new(ArcSwap::from_pointee(progress)),
+            leg_terminated_tx: Arc::new(tokio::sync::watch::channel(false).0),
             extras: Arc::new(ArcSwap::from_pointee(extras)),
             moh: ArcSwapOption::new(None),
             current_play_id: ArcSwapOption::new(None),
@@ -1307,7 +1394,7 @@ impl ActiveCall {
                 // Remember the notifier so ReferDone can report the final
                 // status to the referrer whatever we decide below.
                 self.set_refer_notifier(Some(notifier.clone()));
-                if !self.app_state.config.auto_refer() {
+                if !self.config.auto_refer() {
                     info!(
                         session_id = self.session_id,
                         %refer_to,
@@ -1352,7 +1439,7 @@ impl ActiveCall {
                 let refer_option = ReferOption {
                     auto_hangup: Some(true),
                     forward_dtmf: Some(true),
-                    timeout: Some(self.app_state.config.auto_refer_timeout()),
+                    timeout: Some(self.config.auto_refer_timeout()),
                     denoise: None,
                     agc: None,
                     // The auto-refer transfer MUST be followed as quickly as
@@ -1585,7 +1672,7 @@ impl ActiveCall {
             };
             let requested_format = recorder_option
                 .format
-                .unwrap_or(self.app_state.config.recorder_format());
+                .unwrap_or(self.config.recorder_format());
             let format = requested_format.effective();
             if requested_format != format {
                 warn!(
@@ -1601,7 +1688,7 @@ impl ActiveCall {
                 format: Some(format),
                 native_samplerate: Some(
                     recorder_option.native_samplerate.unwrap_or(false)
-                        || self.app_state.config.recorder_native_samplerate(),
+                        || self.config.recorder_native_samplerate(),
                 ),
                 swap_channels: recorder_option.swap_channels,
                 follow_bridge: recorder_option.follow_bridge,
@@ -2291,6 +2378,56 @@ impl ActiveCall {
                 }
                 self.leg()
                     .update_progress(|p| p.set_hangup_reason(hangup_reason.clone()));
+
+                // Deterministic teardown for answered calls: send the BYE for
+                // the main dialog ourselves and wait until the dialog event
+                // loop has recorded the termination, BEFORE any session
+                // teardown can cancel the token. Without this the teardown
+                // race (`process_dialog`'s select resolving on the cancelled
+                // branch drops the event loop before it observes the BYE's
+                // `Terminated`) left the leg's termination unobserved and
+                // answered calls mislabelled as failed — production: AI
+                // auto-hangup (refer transfer) CDRs carried 487 / isCall=false.
+                if self.progress.load_full().answer_time.is_some() {
+                    if let Some(dialog_id) =
+                        self.invitation.find_dialog_id_by_session_id(&self.session_id)
+                    {
+                        match crate::call::sip::remove_dialog(
+                            &self.invitation.dialog_layer,
+                            &dialog_id,
+                        ) {
+                            Some(dialog) => {
+                                let headers = crate::sip_util::hangup_headers_from_extras(
+                                    &self.extras.load_full(),
+                                );
+                                if let Err(e) = dialog.hangup_with_headers(headers).await {
+                                    warn!(
+                                        session_id = self.session_id,
+                                        %dialog_id,
+                                        error = %e,
+                                        "failed to hang up main dialog during deterministic teardown"
+                                    );
+                                }
+                            }
+                            None => {
+                                debug!(
+                                    session_id = self.session_id,
+                                    %dialog_id,
+                                    "main dialog already removed; skipping deterministic hangup"
+                                );
+                            }
+                        }
+                        // Bound the wait: a black-holed BYE must not stall
+                        // the session teardown forever. On timeout the
+                        // legacy teardown path takes over.
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(2),
+                            self.leg().terminated(),
+                        )
+                        .await;
+                    }
+                }
+
                 let refer_token = self.take_refer_call_token();
                 self.media_stream
                     .stop(Some(hangup_reason.to_string()), initiator);

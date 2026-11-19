@@ -1,6 +1,6 @@
 [package]
 name = "active-call"
-version = "0.3.118"
+version = "0.3.119"
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 description = "A SIP/WebRTC voice agent"
@@ -56,7 +56,7 @@ tokio-stream = { version = "0.1.19", features = ["net", "sync"] }
 tokio-tungstenite = { version = "0.30.0", features = [
     "rustls-tls-native-roots",
 ] }
-tokio-util = "0.7.19"
+tokio-util = { version = "0.7.19", features = ["io"] }
 tracing = "0.1.43"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "local-time"] }
 tracing-appender = "0.2.5"

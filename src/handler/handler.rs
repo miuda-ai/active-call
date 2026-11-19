@@ -112,6 +112,19 @@ pub async fn call_handler_core(
     extras: Option<HashMap<String, serde_json::Value>>,
     playbook_name: Option<String>,
 ) -> Option<HashMap<String, serde_json::Value>> {
+    // ── admission control: [admission] bounds concurrent sessions ──
+    // Placed before call construction so queued/rejected calls hold no media
+    // resources. Reads the live config snapshot, so a reload that lowers
+    // `max_active_calls` drains gracefully: in-flight calls keep their slot,
+    // new calls queue for `wait_ms` and are then rejected. The ticket owns the
+    // counter (single decrement on drop).
+    let Some(_admission) =
+        crate::call::active_call::AdmissionTicket::acquire(&app_state.config(), &session_id).await
+    else {
+        warn!(session_id, "admission timeout; rejecting call");
+        cancel_token.cancel();
+        return None;
+    };
     let _cancel_guard = cancel_token.clone().drop_guard();
     let track_config = TrackConfig::default();
 
@@ -476,7 +489,7 @@ pub async fn call_handler(
 }
 
 pub(crate) async fn get_iceservers(State(state): State<AppState>) -> Response {
-    if let Some(ice_servers) = state.config.ice_servers.as_ref() {
+    if let Some(ice_servers) = state.config().ice_servers.as_ref() {
         return Json(ice_servers).into_response();
     }
     Json(vec![IceServer {

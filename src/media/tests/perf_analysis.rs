@@ -46,7 +46,10 @@ mod tests {
 
         // --- Common Components ---
         let mut resampler_8k_to_16k = BoxedResampler::new(8000, 16000).unwrap();
-        let mut noise_reducer = NoiseReducer::new(16000);
+        let mut noise_reducer = NoiseReducer::new(
+            16000,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        );
         let vad_config = VADOption {
             samplerate: 16000,
             ..Default::default()

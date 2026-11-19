@@ -3,9 +3,16 @@ use audio_codec::samples_to_bytes;
 use crate::media::{AudioFrame, Samples, denoiser::NoiseReducer, processor::Processor};
 use std::{fs::File, io::Write};
 
+/// A reducer pre-armed with the Answer event: these tests exercise the
+/// post-answer denoising behavior.
+fn answered_reducer(sample_rate: usize) -> NoiseReducer {
+    use std::sync::{Arc, atomic::AtomicBool};
+    NoiseReducer::new(sample_rate, Arc::new(AtomicBool::new(true)))
+}
+
 #[test]
 fn test_basic_processing() {
-    let mut reducer = NoiseReducer::new(16000);
+    let mut reducer = answered_reducer(16000);
     let (all_samples, sample_rate) =
         crate::media::track::file::read_wav_file("fixtures/noise_gating_zh_16k.wav").unwrap();
     let mut out_file = File::create("fixtures/noise_gating_zh_16k_denoised.pcm.decoded").unwrap();
@@ -40,7 +47,7 @@ fn test_denoiser_performance() {
     use std::time::Instant;
     let sample_rate = 16000;
     let frame_size = 320; // 20ms at 16kHz
-    let mut reducer = NoiseReducer::new(sample_rate);
+    let mut reducer = answered_reducer(sample_rate);
 
     // Create a dummy frame with noise
     let mut samples = Vec::with_capacity(frame_size);

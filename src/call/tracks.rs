@@ -132,7 +132,7 @@ pub(super) struct OutgoingLeg {
 impl ActiveCall {
     /// Apply the configured codec list to an RTC track config.
     fn rtc_apply_codecs(&self, rtc_config: &mut RtcTrackConfig) {
-        if let Some(codecs) = &self.app_state.config.codecs {
+        if let Some(codecs) = &self.config.codecs {
             let mut codec_types = Vec::new();
             for c in codecs {
                 match c.to_lowercase().as_str() {
@@ -157,25 +157,25 @@ impl ActiveCall {
     /// Apply external/bind addresses and the ICE disconnect grace from the
     /// global config.
     fn rtc_apply_network(&self, rtc_config: &mut RtcTrackConfig) {
-        rtc_config.ice_disconnect_grace = self.app_state.config.ice_disconnect_grace();
-        if let Some(ref external_ip) = self.app_state.config.external_ip {
+        rtc_config.ice_disconnect_grace = self.config.ice_disconnect_grace();
+        if let Some(ref external_ip) = self.config.external_ip {
             rtc_config.external_ip = Some(external_ip.clone());
         }
-        if let Some(ref bind_ip) = self.app_state.config.rtp_bind_ip {
+        if let Some(ref bind_ip) = self.config.rtp_bind_ip {
             rtc_config.bind_ip = Some(bind_ip.clone());
         }
     }
 
     /// Apply RTP latching and ICE-lite flags (per-call option overrides config).
     fn rtc_apply_latching(&self, rtc_config: &mut RtcTrackConfig) {
-        rtc_config.enable_latching = self.app_state.config.enable_rtp_latching;
+        rtc_config.enable_latching = self.config.enable_rtp_latching;
         rtc_config.enable_ice_lite = self
             .progress
             .load()
             .option
             .as_ref()
             .and_then(|o| o.enable_ice_lite)
-            .or(self.app_state.config.enable_ice_lite);
+            .or(self.config.enable_ice_lite);
     }
 
     /// Build a looping file track on the server-side track.
@@ -269,7 +269,7 @@ impl ActiveCall {
             .sip
             .as_ref()
             .and_then(|s| s.enable_srtp)
-            .or(self.app_state.config.enable_srtp)
+            .or(self.config.enable_srtp)
             .unwrap_or(false);
         rtc_config.mode = if use_srtp {
             TransportMode::Srtp
@@ -281,10 +281,9 @@ impl ActiveCall {
             rtc_config.preferred_codec = Some(self.track_config.codec);
         }
         rtc_config.rtp_port_range = self
-            .app_state
             .config
             .rtp_start_port
-            .zip(self.app_state.config.rtp_end_port);
+            .zip(self.config.rtp_end_port);
         self.rtc_apply_network(&mut rtc_config);
         self.rtc_apply_latching(&mut rtc_config);
         restrict_codecs_to_offer(&mut rtc_config, &offer);
@@ -326,8 +325,18 @@ impl ActiveCall {
             pending_dialog.state_receiver,
             hangup_headers,
         );
+        let call_token = self.cancel_token.clone();
         crate::spawn(async move {
+            let is_refer = states.leg.is_refer;
             client_dialog_handler.process_dialog(states).await;
+            // The dialog is gone: the call must end with it. Refer legs are
+            // decoupled from the call lifetime (transfer semantics), so only
+            // main-leg termination ends the call. This reaps headless
+            // sessions whose dialog was torn down while their runner kept
+            // waiting forever on the session event channel.
+            if !is_refer {
+                call_token.cancel();
+            }
         });
 
         info!(
@@ -348,7 +357,7 @@ impl ActiveCall {
     /// RtcTrack default (WebRTC on, SIP off).
     fn jitter_buffer(&self, per_call: Option<bool>, webrtc: bool) -> Option<bool> {
         per_call.or_else(|| {
-            let config = self.app_state.config.jitter_buffer.as_ref()?;
+            let config = self.config.jitter_buffer.as_ref()?;
             if webrtc { config.webrtc } else { config.sip }
         })
     }
@@ -359,7 +368,7 @@ impl ActiveCall {
         call_ambiance: Option<&crate::media::ambiance::AmbianceOption>,
     ) -> crate::media::ambiance::AmbianceOption {
         let mut opt = call_ambiance.cloned().unwrap_or_default();
-        if let Some(global) = &self.app_state.config.ambiance {
+        if let Some(global) = &self.config.ambiance {
             opt.merge(global);
         }
         opt
@@ -379,7 +388,7 @@ impl ActiveCall {
         rtc_config.jitter_buffer = self.jitter_buffer(jitter_buffer, false);
         // Per-call flag takes precedence over global config.
         let use_srtp = enable_srtp
-            .or(self.app_state.config.enable_srtp)
+            .or(self.config.enable_srtp)
             .unwrap_or(false);
         rtc_config.mode = if use_srtp {
             TransportMode::Srtp
@@ -397,10 +406,9 @@ impl ActiveCall {
         }
 
         rtc_config.rtp_port_range = self
-            .app_state
             .config
             .rtp_start_port
-            .zip(self.app_state.config.rtp_end_port);
+            .zip(self.config.rtp_end_port);
 
         self.rtc_apply_network(&mut rtc_config);
         self.rtc_apply_latching(&mut rtc_config);
@@ -779,7 +787,7 @@ impl ActiveCall {
         let mut rtc_config = RtcTrackConfig::default();
         rtc_config.rtp_timeout = option.rtp_timeout.map(Duration::from_secs);
         rtc_config.mode = TransportMode::WebRtc; // WebRTC
-        rtc_config.ice_servers = self.app_state.config.ice_servers.clone();
+        rtc_config.ice_servers = self.config.ice_servers.clone();
         rtc_config.jitter_buffer = self.jitter_buffer(option.jitter_buffer, true);
 
         self.rtc_apply_codecs(&mut rtc_config);
@@ -830,9 +838,7 @@ impl ActiveCall {
         // Apply trunk rules (match + rewrite caller/callee/contact) to the
         // outgoing INVITE/REFER before it is sent. Covers both normal invite
         // calls and refer legs since both flow through this function.
-        self.app_state
-            .config
-            .apply_trunk_rules(&mut out.invite_option);
+        self.config.apply_trunk_rules(&mut out.invite_option);
 
         let track_id = &out.track_id;
         let ssrc = out.leg.ssrc;
@@ -967,8 +973,18 @@ impl ActiveCall {
             hangup_headers,
         );
 
+        let call_token = self.cancel_token.clone();
         crate::spawn(async move {
+            let is_refer = states.leg.is_refer;
             client_dialog_handler.process_dialog(states).await;
+            // The dialog is gone: the call must end with it. Refer legs are
+            // decoupled from the call lifetime (transfer semantics), so only
+            // main-leg termination ends the call. This reaps headless
+            // sessions whose dialog was torn down while their runner kept
+            // waiting forever on the session event channel.
+            if !is_refer {
+                call_token.cancel();
+            }
         });
 
         let (dialog_id, answer) = self
@@ -1085,7 +1101,7 @@ impl ActiveCall {
             let mut rtc_config = RtcTrackConfig::default();
             rtc_config.rtp_timeout = option.rtp_timeout.map(Duration::from_secs);
             rtc_config.mode = TransportMode::WebRtc;
-            rtc_config.ice_servers = self.app_state.config.ice_servers.clone();
+            rtc_config.ice_servers = self.config.ice_servers.clone();
             rtc_config.jitter_buffer = self.jitter_buffer(option.jitter_buffer, true);
             self.rtc_apply_network(&mut rtc_config);
             self.rtc_apply_latching(&mut rtc_config);
@@ -1213,8 +1229,18 @@ impl ActiveCall {
             hangup_headers,
         );
 
+        let call_token = self.cancel_token.clone();
         crate::spawn(async move {
+            let is_refer = states.leg.is_refer;
             client_dialog_handler.process_dialog(states).await;
+            // The dialog is gone: the call must end with it. Refer legs are
+            // decoupled from the call lifetime (transfer semantics), so only
+            // main-leg termination ends the call. This reaps headless
+            // sessions whose dialog was torn down while their runner kept
+            // waiting forever on the session event channel.
+            if !is_refer {
+                call_token.cancel();
+            }
         });
         Ok(())
     }

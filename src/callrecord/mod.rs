@@ -471,6 +471,8 @@ impl CallRecordManager {
                     endpoint,
                     with_media,
                     keep_media_copy,
+                    part_size_mb,
+                    delete_after_upload,
                     ..
                 } => {
                     Self::save_with_s3_like(
@@ -483,6 +485,8 @@ impl CallRecordManager {
                         endpoint,
                         with_media,
                         keep_media_copy,
+                        part_size_mb,
+                        delete_after_upload,
                         &record,
                     )
                     .await
@@ -492,6 +496,8 @@ impl CallRecordManager {
                     headers,
                     with_media,
                     keep_media_copy,
+                    part_size_mb,
+                    delete_after_upload,
                 } => {
                     Self::save_with_http(
                         formatter.clone(),
@@ -499,6 +505,8 @@ impl CallRecordManager {
                         headers,
                         with_media,
                         keep_media_copy,
+                        part_size_mb,
+                        delete_after_upload,
                         &record,
                     )
                     .await
@@ -544,14 +552,45 @@ impl CallRecordManager {
         Ok(file_name.to_string())
     }
 
-    pub async fn save_with_http(
+    /// Stream a local file into the object store without reading the whole file
+/// into memory. `part_size` bounds the in-memory buffer; the buffered writer
+/// spills full parts as multipart uploads (files smaller than the buffer are
+/// still a single PUT). Returns the file size in bytes.
+async fn upload_file_streaming(
+    store: std::sync::Arc<dyn object_store::ObjectStore>,
+    local_path: &std::path::Path,
+    key: &ObjectPath,
+    part_size: usize,
+) -> Result<u64> {
+    use tokio::io::AsyncReadExt;
+    let size = tokio::fs::metadata(local_path).await?.len();
+    let mut file = tokio::fs::File::open(local_path).await?;
+    let mut writer = object_store::buffered::BufWriter::with_capacity(store, key.clone(), part_size);
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        writer.write_all(&buf[..n]).await?;
+    }
+    // flush + complete the multipart upload
+    tokio::io::AsyncWriteExt::shutdown(&mut writer).await?;
+    Ok(size)
+}
+
+pub async fn save_with_http(
         formatter: Arc<dyn CallRecordFormatter>,
         url: &String,
         headers: &Option<HashMap<String, String>>,
         with_media: &Option<bool>,
         keep_media_copy: &Option<bool>,
+        part_size_mb: &Option<u64>,
+        delete_after_upload: &Option<bool>,
         record: &CallRecord,
     ) -> Result<String> {
+        let _ = part_size_mb; // HTTP path streams by file length; part size is S3-only
+        let mut uploaded_paths: Vec<String> = Vec::new();
         let client = reqwest::Client::new();
         // Serialize call record to JSON
         let call_log_json = formatter.format(record)?;
@@ -562,32 +601,32 @@ impl CallRecordManager {
         if with_media.unwrap_or(false) {
             for media in &record.recorder {
                 if std::path::Path::new(&media.path).exists() {
-                    match tokio::fs::read(&media.path).await {
-                        Ok(file_content) => {
-                            let file_name = std::path::Path::new(&media.path)
-                                .file_name()
-                                .unwrap_or_else(|| std::ffi::OsStr::new("unknown"))
-                                .to_string_lossy()
-                                .to_string();
-
-                            let part = match reqwest::multipart::Part::bytes(file_content)
-                                .file_name(file_name.clone())
-                                .mime_str("application/octet-stream")
+                    let file_name = std::path::Path::new(&media.path)
+                        .file_name()
+                        .unwrap_or_else(|| std::ffi::OsStr::new("unknown"))
+                        .to_string_lossy()
+                        .to_string();
+                    match tokio::fs::File::open(&media.path).await {
+                        Ok(file) => {
+                            let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+                            let part = match reqwest::multipart::Part::stream_with_length(
+                                reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file)),
+                                len,
+                            )
+                            .file_name(file_name)
+                            .mime_str("application/octet-stream")
                             {
-                                Ok(part) => part,
-                                Err(_) => {
-                                    // Fallback to default MIME type if parsing fails
-                                    reqwest::multipart::Part::bytes(
-                                        tokio::fs::read(&media.path).await?,
-                                    )
-                                    .file_name(file_name)
+                                Ok(p) => p,
+                                Err(e) => {
+                                    warn!("failed to set mime on media part: {}", e);
+                                    continue;
                                 }
                             };
-
                             form = form.part(format!("media_{}", media.track_id), part);
+                            uploaded_paths.push(media.path.clone());
                         }
                         Err(e) => {
-                            warn!("Failed to read media file {}: {}", media.path, e);
+                            warn!("Failed to open media file {}: {}", media.path, e);
                         }
                     }
                 }
@@ -599,15 +638,24 @@ impl CallRecordManager {
                         .unwrap_or_else(|| std::ffi::OsStr::new("unknown"))
                         .to_string_lossy()
                         .to_string();
-                    match reqwest::multipart::Part::bytes(tokio::fs::read(&dump_events_file).await?)
-                        .file_name(file_name.clone())
-                        .mime_str("application/octet-stream")
-                    {
-                        Ok(part) => {
-                            form = form.part(format!("dump_events_{}", file_name), part);
+                    match tokio::fs::File::open(&dump_events_file).await {
+                        Ok(file) => {
+                            let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+                            if let Ok(part) = reqwest::multipart::Part::stream_with_length(
+                                reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file)),
+                                len,
+                            )
+                            .file_name(file_name.clone())
+                            .mime_str("application/octet-stream")
+                            {
+                                form = form.part(format!("dump_events_{}", file_name), part);
+                                uploaded_paths.push(dump_events_file.clone());
+                            }
                         }
-                        Err(_) => {}
-                    };
+                        Err(e) => {
+                            warn!("Failed to open events file {}: {}", dump_events_file, e);
+                        }
+                    }
                 }
             }
         }
@@ -621,11 +669,15 @@ impl CallRecordManager {
         if response.status().is_success() {
             let response_text = response.text().await.unwrap_or_default();
 
-            if keep_media_copy.unwrap_or(false) {
-                for media in &record.recorder {
-                    let p = Path::new(&media.path);
-                    if p.exists() {
-                        tokio::fs::remove_file(p).await.ok();
+            // Delete local copies only after a successful upload.
+            let delete_local = delete_after_upload.unwrap_or(true) && !keep_media_copy.unwrap_or(false);
+            if delete_local {
+                for p in &uploaded_paths {
+                    let path = Path::new(p);
+                    if path.exists() {
+                        if let Err(e) = tokio::fs::remove_file(path).await {
+                            warn!(path = %p, "failed to delete local file after HTTP upload: {}", e);
+                        }
                     }
                 }
             }
@@ -649,9 +701,12 @@ impl CallRecordManager {
         endpoint: &String,
         with_media: &Option<bool>,
         keep_media_copy: &Option<bool>,
+        part_size_mb: &Option<u64>,
+        delete_after_upload: &Option<bool>,
         record: &CallRecord,
     ) -> Result<String> {
         let start_time = Instant::now();
+        let part_size = part_size_mb.map(|m| (m * 1024 * 1024) as usize).unwrap_or(5 * 1024 * 1024);
         let object_store =
             build_object_store_from_s3(vendor, bucket, region, access_key, secret_key, endpoint)?;
 
@@ -659,10 +714,9 @@ impl CallRecordManager {
         let call_log_json = formatter.format(record)?;
         // Upload call log JSON
         let filename = formatter.format_file_name(record);
-        let local_files = vec![filename.clone()];
-        let json_path = ObjectPath::from(filename);
+        let json_path = ObjectPath::from(filename.clone());
         let buf_size = call_log_json.len();
-        match object_store
+        let json_uploaded = match object_store
             .put(&json_path, PutPayload::from(call_log_json))
             .await
         {
@@ -673,15 +727,18 @@ impl CallRecordManager {
                     buf_size,
                     "upload call record"
                 );
+                true
             }
             Err(e) => {
                 warn!(
                    %json_path,
                     "failed to upload call record: {}", e
                 );
+                false
             }
-        }
+        };
         // Upload media files if with_media is true
+        let mut uploaded_paths: Vec<String> = Vec::new();
         if with_media.unwrap_or(false) {
             let mut media_files = vec![];
             for media in &record.recorder {
@@ -699,25 +756,22 @@ impl CallRecordManager {
             }
             for (path, media_path) in &media_files {
                 let start_time = Instant::now();
-                let file_content = match tokio::fs::read(path).await {
-                    Ok(file_content) => file_content,
-                    Err(e) => {
-                        warn!("failed to read media file {}: {}", path, e);
-                        continue;
-                    }
-                };
-                let buf_size = file_content.len();
-                match object_store
-                    .put(media_path, PutPayload::from(file_content))
-                    .await
+                match Self::upload_file_streaming(
+                    object_store.clone(),
+                    std::path::Path::new(path),
+                    media_path,
+                    part_size,
+                )
+                .await
                 {
-                    Ok(_) => {
+                    Ok(buf_size) => {
                         info!(
                             elapsed = start_time.elapsed().as_secs_f64(),
                             %media_path,
                             buf_size,
                             "upload media file"
                         );
+                        uploaded_paths.push(path.clone());
                     }
                     Err(e) => {
                         warn!(%media_path,"failed to upload media file: {}", e);
@@ -725,18 +779,23 @@ impl CallRecordManager {
                 }
             }
         }
-        // Optionally delete local media files if keep_media_copy is false
-        if !keep_media_copy.unwrap_or(false) {
-            for media in &record.recorder {
-                let p = Path::new(&media.path);
-                if p.exists() {
-                    tokio::fs::remove_file(p).await.ok();
+        // Delete local copies only for files whose upload succeeded.
+        let delete_local = delete_after_upload.unwrap_or(true) && !keep_media_copy.unwrap_or(false);
+        if delete_local {
+            for p in &uploaded_paths {
+                let path = Path::new(p);
+                if path.exists() {
+                    if let Err(e) = tokio::fs::remove_file(path).await {
+                        warn!(path = %p, "failed to delete local media after upload: {}", e);
+                    }
                 }
             }
-            for file_name in &local_files {
-                let p = Path::new(file_name);
-                if p.exists() {
-                    tokio::fs::remove_file(p).await.ok();
+            if json_uploaded {
+                let path = Path::new(&filename);
+                if path.exists() {
+                    if let Err(e) = tokio::fs::remove_file(path).await {
+                        warn!(path = %filename, "failed to delete local record after upload: {}", e);
+                    }
                 }
             }
         }
