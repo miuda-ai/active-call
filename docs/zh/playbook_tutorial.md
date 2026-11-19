@@ -264,14 +264,15 @@ dtmfCollectors:
 ## 6. 进阶功能
 
 ### 6.1 Realtime 模式配置
-如果模型支持 Realtime API (如 OpenAI gpt-4o-realtime)，可跳过序列化 pipeline 以获得超低延迟：
+如果模型支持 Realtime API (如 OpenAI gpt-realtime-2.1)，可跳过序列化 pipeline 以获得超低延迟：
 
 ```yaml
 realtime:
   provider: "openai"
-  model: "gpt-4o-realtime-preview"
-  voice: "alloy"
-  turn_detection:
+  model: "gpt-realtime-2.1"
+  extra:
+    voice: "alloy"
+  turnDetection:
     type: "server_vad"
     threshold: 0.5
 ```

@@ -264,14 +264,15 @@ For input errors, guide the user kindly to re-enter. If multiple failures occur,
 ## 6. Advanced Features
 
 ### 6.1 Realtime Mode
-If using a model that supports the Realtime API (e.g., OpenAI gpt-4o-realtime), you can enable ultra-low latency mode:
+If using a model that supports the Realtime API (e.g., OpenAI gpt-realtime-2.1), you can enable ultra-low latency mode:
 
 ```yaml
 realtime:
   provider: "openai"
-  model: "gpt-4o-realtime-preview"
-  voice: "alloy"
-  turn_detection:
+  model: "gpt-realtime-2.1"
+  extra:
+    voice: "alloy"
+  turnDetection:
     type: "server_vad"
     threshold: 0.5
 ```

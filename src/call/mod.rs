@@ -217,6 +217,22 @@ mod tests {
     }
 
     #[test]
+    fn realtime_invite_debug_redacts_api_key() {
+        let command: Command = serde_json::from_value(serde_json::json!({
+            "command": "invite",
+            "option": {"realtime": {"provider": "openai", "apiKey": "dummy-realtime-key"}},
+        }))
+        .unwrap();
+
+        let debug = format!("{command:?}");
+        assert!(debug.contains(r#"secret_key: Some("***")"#));
+        assert!(!debug.contains("dummy-realtime-key"));
+
+        let serialized = serde_json::to_value(&command).unwrap();
+        assert_eq!(serialized["option"]["realtime"]["secretKey"], "dummy-realtime-key");
+    }
+
+    #[test]
     fn message_command_deserializes_body() {
         let command: Command = serde_json::from_value(serde_json::json!({
             "command": "message",

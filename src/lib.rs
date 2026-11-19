@@ -287,7 +287,7 @@ impl<'de> Deserialize<'de> for RealtimeType {
 }
 
 #[skip_serializing_none]
-#[derive(Clone, Debug, Deserialize, Serialize, Default)]
+#[derive(Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct RealtimeOption {
     pub provider: Option<RealtimeType>,
@@ -299,6 +299,21 @@ pub struct RealtimeOption {
     pub turn_detection: Option<serde_json::Value>,
     pub tools: Option<Vec<serde_json::Value>>,
     pub extra: Option<HashMap<String, String>>,
+}
+
+impl std::fmt::Debug for RealtimeOption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RealtimeOption")
+            .field("provider", &self.provider)
+            .field("model", &self.model)
+            .field("secret_key", &self.secret_key.as_ref().map(|_| "***"))
+            .field("secret_id", &self.secret_id)
+            .field("endpoint", &self.endpoint)
+            .field("turn_detection", &self.turn_detection)
+            .field("tools", &self.tools)
+            .field("extra", &self.extra)
+            .finish()
+    }
 }
 
 impl RealtimeOption {
