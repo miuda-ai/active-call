@@ -8,31 +8,33 @@ In your Playbook YAML or Markdown Front Matter, you can specify the `realtime` c
 
 ```yaml
 title: "Realtime Voice Agent"
-voice: "alloy"
-prompt: |
-  You are a helpful assistant. You speak in a natural, conversational tone.
-  If the user asks for a transfer, call the `transfer_call` tool.
 
 realtime:
   provider: "openai"
-  model: "gpt-4o-realtime-preview-2024-10-01"
-  # Optional: API key can be set here or via environment variable OPENAI_API_KEY
-  api_key: "${OPENAI_API_KEY}"
-  # Advanced settings
-  turn_detection:
+  model: "gpt-realtime-2.1"
+  # The server reads OPENAI_API_KEY from its environment.
+  extra:
+    voice: "alloy"
+    instructions: |
+      You are a helpful assistant. You speak in a natural, conversational tone.
+      If the user asks for a transfer, call the `transfer_call` tool.
+  turnDetection:
     type: "server_vad"
     threshold: 0.5
     prefix_padding_ms: 300
     silence_duration_ms: 500
   tools:
-    - name: "transfer_call"
+    - type: "function"
+      name: "transfer_call"
       description: "Transfer the call to another department"
       parameters:
         type: "object"
         properties:
-          department:
+          callee:
             type: "string"
-            enum: ["sales", "support"]
+            description: "SIP URI for the destination department"
+            enum: ["sip:sales@example.com", "sip:support@example.com"]
+        required: ["callee"]
 ```
 
 ## 2. Architecture Comparison

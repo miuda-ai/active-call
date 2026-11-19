@@ -115,11 +115,14 @@ async fn run_realtime_loop(
         .await?;
 
     let mut event_rx = event_sender.subscribe();
-    // Realtime PCM16 is 24 kHz; processor-chain audio is normalized to 16 kHz.
-    let mut input_resampler =
-        BoxedResampler::new(INTERNAL_SAMPLERATE as usize, REALTIME_SAMPLE_RATE as usize)?;
-    let mut output_resampler =
-        BoxedResampler::new(REALTIME_SAMPLE_RATE as usize, INTERNAL_SAMPLERATE as usize)?;
+    // OpenAI and Azure use 24 kHz PCM16. Custom endpoints use the existing 16 kHz audio.
+    let mut resamplers = match provider {
+        RealtimeType::OpenAI | RealtimeType::Azure => Some((
+            BoxedResampler::new(INTERNAL_SAMPLERATE as usize, REALTIME_SAMPLE_RATE as usize)?,
+            BoxedResampler::new(REALTIME_SAMPLE_RATE as usize, INTERNAL_SAMPLERATE as usize)?,
+        )),
+        RealtimeType::Other(_) => None,
+    };
 
     loop {
         tokio::select! {
@@ -136,8 +139,10 @@ async fn run_realtime_loop(
                     _ => {}
                 }
             }
-            Some(samples) = audio_rx.recv() => {
-                let samples = input_resampler.resample(&samples);
+            Some(mut samples) = audio_rx.recv() => {
+                if let Some((input_resampler, _)) = &mut resamplers {
+                    samples = input_resampler.resample(&samples);
+                }
                 if samples.is_empty() {
                     continue;
                 }
@@ -158,11 +163,13 @@ async fn run_realtime_loop(
                         Some("response.output_audio.delta") | Some("response.audio.delta") => {
                             if let Some(delta_base64) = v["delta"].as_str() {
                                 if let Ok(data) = general_purpose::STANDARD.decode(delta_base64) {
-                                    let samples: Vec<i16> = data.chunks_exact(2)
+                                    let mut samples: Vec<i16> = data.chunks_exact(2)
                                         .map(|c| i16::from_le_bytes([c[0], c[1]]))
                                         .collect();
 
-                                    let samples = output_resampler.resample(&samples);
+                                    if let Some((_, output_resampler)) = &mut resamplers {
+                                        samples = output_resampler.resample(&samples);
+                                    }
                                     if samples.is_empty() {
                                         continue;
                                     }
@@ -419,92 +426,112 @@ mod tests {
     #[tokio::test]
     async fn realtime_pcm_matches_api_rate_and_preserves_transcript_events() {
         use tokio::time::{Duration, timeout};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (socket, _) = listener.accept().await.unwrap();
-            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
-            ws.next().await.unwrap().unwrap();
-            let append = ws.next().await.unwrap().unwrap();
-            let append: Value = serde_json::from_str(append.to_text().unwrap()).unwrap();
-            assert_eq!(append["type"], "input_audio_buffer.append");
-            let input = general_purpose::STANDARD
-                .decode(append["audio"].as_str().unwrap())
+        for custom_endpoint in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+            let (provider, wire_sample_count, audio_delta, transcript_delta) = if custom_endpoint {
+                (
+                    RealtimeType::Other(endpoint.clone()),
+                    1600,
+                    "response.audio.delta",
+                    "response.audio_transcript.delta",
+                )
+            } else {
+                (
+                    RealtimeType::Azure,
+                    2400,
+                    "response.output_audio.delta",
+                    "response.output_audio_transcript.delta",
+                )
+            };
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+                ws.next().await.unwrap().unwrap();
+                let append = ws.next().await.unwrap().unwrap();
+                let append: Value = serde_json::from_str(append.to_text().unwrap()).unwrap();
+                assert_eq!(append["type"], "input_audio_buffer.append");
+                let input = general_purpose::STANDARD
+                    .decode(append["audio"].as_str().unwrap())
+                    .unwrap();
+                assert_eq!(
+                    input.len(),
+                    wire_sample_count * 2,
+                    "100 ms of input must be {wire_sample_count} PCM16 samples"
+                );
+                let output: Vec<u8> = (0..wire_sample_count as i16)
+                    .flat_map(i16::to_le_bytes)
+                    .collect();
+                ws.send(Message::Text(
+                    json!({
+                        "type": audio_delta,
+                        "delta": general_purpose::STANDARD.encode(output)
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
                 .unwrap();
-            assert_eq!(
-                input.len(),
-                2400 * 2,
-                "100 ms of input must be 2400 PCM16 samples"
-            );
-            let output: Vec<u8> = (0..2400_i16).flat_map(i16::to_le_bytes).collect();
-            ws.send(Message::Text(
-                json!({
-                    "type": "response.output_audio.delta",
-                    "delta": general_purpose::STANDARD.encode(output)
-                })
-                .to_string()
-                .into(),
-            ))
-            .await
-            .unwrap();
-            ws.send(Message::Text(
-                json!({
-                    "type": "response.output_audio_transcript.delta",
-                    "delta": "Hello.", "content_index": 0, "item_id": "test-item"
-                })
-                .to_string()
-                .into(),
-            ))
-            .await
-            .unwrap();
-            let _ = ws.next().await;
-        });
-        let option = RealtimeOption {
-            provider: Some(RealtimeType::Other(format!("ws://{address}"))),
-            secret_key: Some("test-key".to_string()),
-            ..Default::default()
-        };
-        let (events, mut event_rx) = tokio::sync::broadcast::channel(16);
-        let (packet_tx, mut packet_rx) = mpsc::unbounded_channel();
-        let cancel = CancellationToken::new();
-        let mut processor = RealtimeProcessor::new(
-            "caller".to_string(),
-            cancel.clone(),
-            events,
-            packet_tx,
-            option,
-        )
-        .unwrap();
-        processor
-            .process_frame(&mut AudioFrame {
-                samples: Samples::PCM {
-                    samples: vec![100; 1600],
-                },
+                ws.send(Message::Text(
+                    json!({
+                        "type": transcript_delta,
+                        "delta": "Hello.", "content_index": 0, "item_id": "test-item"
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+                let _ = ws.next().await;
+            });
+            let option = RealtimeOption {
+                provider: Some(provider),
+                endpoint: Some(endpoint),
+                secret_key: Some("test-key".to_string()),
                 ..Default::default()
-            })
+            };
+            let (events, mut event_rx) = tokio::sync::broadcast::channel(16);
+            let (packet_tx, mut packet_rx) = mpsc::unbounded_channel();
+            let cancel = CancellationToken::new();
+            let mut processor = RealtimeProcessor::new(
+                "caller".to_string(),
+                cancel.clone(),
+                events,
+                packet_tx,
+                option,
+            )
             .unwrap();
-        let packet = timeout(Duration::from_secs(3), packet_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(packet.sample_rate, INTERNAL_SAMPLERATE);
-        let Samples::PCM { samples } = packet.samples else {
-            panic!("expected PCM")
-        };
-        assert_eq!(
-            samples.len(),
-            1600,
-            "100 ms of output must be 1600 internal samples"
-        );
-        let transcript = timeout(Duration::from_secs(3), event_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            matches!(transcript, SessionEvent::AsrDelta { text, task_id, .. }
-            if text == "Hello." && task_id.as_deref() == Some("test-item"))
-        );
-        cancel.cancel();
-        server.await.unwrap();
+            processor
+                .process_frame(&mut AudioFrame {
+                    samples: Samples::PCM {
+                        samples: vec![100; 1600],
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            let packet = timeout(Duration::from_secs(3), packet_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(packet.sample_rate, INTERNAL_SAMPLERATE);
+            let Samples::PCM { samples } = packet.samples else {
+                panic!("expected PCM")
+            };
+            assert_eq!(
+                samples.len(),
+                1600,
+                "100 ms of output must be 1600 internal samples"
+            );
+            let transcript = timeout(Duration::from_secs(3), event_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(transcript, SessionEvent::AsrDelta { text, task_id, .. }
+                if text == "Hello." && task_id.as_deref() == Some("test-item"))
+            );
+            cancel.cancel();
+            server.await.unwrap();
+        }
     }
 }
