@@ -25,6 +25,7 @@ Welcome to the Active Call documentation hub. Documentation is organized into tw
 
 - **[Twilio Elastic SIP Trunking](./twilio_integration.md)** — Connect active-call to Twilio (TLS + SRTP)
 - **[Telnyx SIP Trunking](./telnyx_integration.md)** — Connect active-call to Telnyx
+- **[DIDWW SIP Trunking](./didww_integration.md)** — Connect active-call to DIDWW for inbound and outbound calls
 
 ### Other Technical Docs
 
