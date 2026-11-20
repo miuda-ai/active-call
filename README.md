@@ -13,7 +13,7 @@
 
 ### 1. Multi-Protocol Audio Gateway
 
-- **SIP (Telephony)**: UDP, TCP, TLS (SIPS), WebSocket. Register as extension to FreeSWITCH / Asterisk / [RustPBX](https://github.com/restsend/rustpbx), or handle direct SIP calls. PSTN via [Twilio](./docs/twilio_integration.md) and [Telnyx](./docs/telnyx_integration.md).
+- **SIP (Telephony)**: UDP, TCP, TLS (SIPS), WebSocket. Register as extension to FreeSWITCH / Asterisk / [RustPBX](https://github.com/restsend/rustpbx), or handle direct SIP calls. PSTN via [Twilio](./docs/twilio_integration.md), [Telnyx](./docs/telnyx_integration.md) and [DIDWW](./docs/didww_integration.md).
 - **WebRTC**: Browser-to-agent SRTP. *(Requires HTTPS or 127.0.0.1)*
 - **Voice over WebSocket**: Push raw PCM/encoded audio, receive real-time events.
 
@@ -185,6 +185,7 @@ enable_srtp   = true
 
 - [Twilio Elastic SIP Trunking Guide](./docs/twilio_integration.md)
 - [Telnyx SIP Trunking Guide](./docs/telnyx_integration.md)
+- [DIDWW SIP Trunking Guide](./docs/didww_integration.md)
 
 ## Feature Flags
 

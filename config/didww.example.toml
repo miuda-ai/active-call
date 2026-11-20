@@ -1,0 +1,35 @@
+# DIDWW SIP trunk configuration
+# Guide: docs/didww_integration.md
+
+addr = "0.0.0.0"
+http_addr = "0.0.0.0:8080"
+udp_port = 5060
+
+# Your server's public IP
+external_ip = "YOUR_PUBLIC_IP"
+
+# RTP ports; open this UDP range in your firewall
+rtp_start_port = 35000
+rtp_end_port = 35100
+
+# Playbook for inbound calls
+[handler]
+type = "playbook"
+default = "didww_inbound.md"
+
+# Outbound trunk credentials. active-call uses them for calls to this host.
+# DIDWW does not require registration for outbound calls.
+[[register_users]]
+server = "fra.eu.out.didww.com"
+username = "YOUR_DIDWW_USERNAME"
+disabled = true
+
+[register_users.credential]
+username = "YOUR_DIDWW_USERNAME"
+password = "YOUR_DIDWW_PASSWORD"
+
+# DIDWW requires your DID as the caller ID; the host replaces the default 127.0.0.1
+[[trunk_rules]]
+rule.match.to.host = "^fra\\.eu\\.out\\.didww\\.com$"
+rule.rewrite.from.user = "YOUR_DID"
+rule.rewrite.from.host = "fra.eu.out.didww.com"
