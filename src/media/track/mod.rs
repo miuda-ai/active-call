@@ -89,8 +89,15 @@ pub trait Track: Send + Sync {
     /// is replaced by a successor: the successor's media setup must not race
     /// against the predecessor's transport teardown.
     /// The full `stop()` (which closes the transport) follows afterwards.
+    ///
+    /// Default: cancel the track's own token, so a replaced track stops
+    /// producing frames at once — otherwise it keeps feeding the shared packet
+    /// sender during the deferred-stop grace period and its audio interleaves
+    /// with the successor's (e.g. a ringtone bleeding into the first Play/TTS).
+    /// The transport-sparing part lives in `stop()`, not here: e.g. `RtcTrack`
+    /// closes its PeerConnection only in `stop()`, which `MediaStream` defers.
     fn cancel_pipeline(&self) {
-        // Default: nothing to cancel for tracks without a pipeline.
+        self.cancel_token().cancel();
     }
     fn insert_processor(&mut self, processor: Box<dyn Processor>) {
         self.processor_chain().insert_processor(processor);

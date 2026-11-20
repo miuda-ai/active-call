@@ -279,3 +279,40 @@ async fn test_file_track_pause_resume() -> Result<()> {
     file_track.stop().await?;
     Ok(())
 }
+
+/// Replacing a playing FileTrack (e.g. an early-media ringtone superseded by
+/// the first Play/TTS) must silence it immediately. MediaStream defers the old
+/// track's `stop()` by a grace period, so without `cancel_pipeline` stopping
+/// playback both tracks feed the shared packet sender and interleave.
+#[tokio::test]
+async fn test_replaced_file_track_stops_immediately() -> Result<()> {
+    let (test_file, _temp_dir) = create_test_wav_file()?;
+    let event_sender = crate::event::create_event_sender();
+    let stream = crate::media::stream::MediaStreamBuilder::new(event_sender).build();
+    let track_id = "server-side-track".to_string();
+    let config = crate::media::track::TrackConfig::default()
+        .with_sample_rate(16000)
+        .with_ptime(Duration::from_millis(20));
+
+    let old = FileTrack::new(track_id.clone())
+        .with_path(test_file.clone())
+        .with_config(config.clone())
+        .with_ssrc(1);
+    let old_token = old.cancel_token();
+    stream.update_track(Box::new(old), None).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!old_token.is_cancelled(), "old track should be playing");
+
+    let new = FileTrack::new(track_id.clone())
+        .with_path(test_file)
+        .with_config(config)
+        .with_ssrc(2);
+    stream.update_track(Box::new(new), None).await;
+
+    assert!(
+        old_token.is_cancelled(),
+        "replaced file track must stop at once, not after the deferred-stop grace period"
+    );
+    stream.remove_track(&track_id, false).await;
+    Ok(())
+}
