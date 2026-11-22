@@ -24,6 +24,7 @@ use rustrtc::{
         JitterBuffer, MediaSample, MediaStreamTrack, Playout, SampleStreamSource,
         frame::AudioFrame as RtcAudioFrame, sample_track, track::SampleStreamTrack,
     },
+    rtp::{RtpHeader, RtpPacket},
 };
 use std::{
     net::IpAddr,
@@ -1678,13 +1679,27 @@ impl RtcTrack {
 
         let copies = if end { DTMF_END_PACKET_COUNT } else { 1 };
         for i in 0..copies {
+            let sequence_number = self.next_sequence_number();
+            // rustrtc 0.6.5+ rewrites generated frames onto its own RTP
+            // timeline (ts += ptime per packet), which would break RFC 4733:
+            // every packet of one telephone-event must share one timestamp.
+            // A raw packet marks this as relayed media, so the timeline uses
+            // `write_peer` and preserves our timestamp while mapping it onto
+            // the sender's SSRC. The zero source SSRC keeps it a local source
+            // for keyframe/NACK bookkeeping.
+            let raw_packet = RtpPacket {
+                header: RtpHeader::new(payload_type, sequence_number, rtp_timestamp, 0),
+                payload: Bytes::new(),
+                padding_len: 0,
+            };
             let frame = RtcAudioFrame {
                 data: payload.clone(),
                 clock_rate,
                 payload_type: Some(payload_type),
-                sequence_number: Some(self.next_sequence_number()),
+                sequence_number: Some(sequence_number),
                 rtp_timestamp,
                 marker: marker && i == 0,
+                raw_packet: Some(raw_packet),
                 ..Default::default()
             };
             source.try_send_audio(frame).ok();
