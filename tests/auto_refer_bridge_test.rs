@@ -214,11 +214,127 @@ async fn pump_rtp(offer: String, duration: Duration, ssrc: u32) {
     }
 }
 
+/// Media address (`c=` + `m=audio` port) of an SDP body or a full SIP message.
+fn sdp_media_addr(msg: &str) -> Option<std::net::SocketAddr> {
+    let body = msg.split("\r\n\r\n").nth(1).unwrap_or(msg);
+    let mut port: Option<u16> = None;
+    let mut host = "127.0.0.1".to_string();
+    for line in body.lines() {
+        if let Some(rest) = line.strip_prefix("m=audio ") {
+            port = rest.split_whitespace().next().and_then(|t| t.parse().ok());
+        } else if let Some(h) = line.strip_prefix("c=IN IP4 ") {
+            host = h.trim().to_string();
+        }
+    }
+    format!("{host}:{}", port?).parse().ok()
+}
+
+/// PCMU fill bytes identifying each party's audio. Every sample of a party's
+/// frames carries its byte, so a received frame can be attributed to its
+/// source after active-call's decode/re-encode.
+const CUSTOMER_FILL: u8 = 0x11;
+const BRIDGE_FILL: u8 = 0x33;
+const AGENT_FILL: u8 = 0x55;
+
+/// A party's RTP endpoint: advertised in its SDP, sent from (symmetric RTP)
+/// and recording every PCMU frame it receives as (arrival, median byte).
+struct MediaSock {
+    socket: std::sync::Arc<UdpSocket>,
+    received: std::sync::Arc<std::sync::Mutex<Vec<(tokio::time::Instant, u8)>>>,
+}
+
+impl MediaSock {
+    async fn bind() -> std::sync::Arc<Self> {
+        let socket = std::sync::Arc::new(UdpSocket::bind(("127.0.0.1", 0)).await.unwrap());
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (sock, rec) = (socket.clone(), received.clone());
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            while let Ok((n, _)) = sock.recv_from(&mut buf).await {
+                let pkt = &buf[..n];
+                if !is_rtp(pkt) || pkt[1] & 0x7F != 0 {
+                    continue; // only PCMU audio (skip telephone-event etc.)
+                }
+                let mut off = 12 + 4 * (pkt[0] & 0x0F) as usize;
+                if pkt[0] & 0x10 != 0 && n >= off + 4 {
+                    off += 4 + 4 * u16::from_be_bytes([pkt[off + 2], pkt[off + 3]]) as usize;
+                }
+                if n <= off {
+                    continue;
+                }
+                let mut payload = pkt[off..].to_vec();
+                payload.sort_unstable();
+                let median = payload[payload.len() / 2];
+                rec.lock().unwrap().push((tokio::time::Instant::now(), median));
+            }
+        });
+        std::sync::Arc::new(Self { socket, received })
+    }
+
+    fn port(&self) -> u16 {
+        self.socket.local_addr().unwrap().port()
+    }
+
+    /// Stream 20ms PCMU frames filled with `fill` to the media address in
+    /// `sdp`, from this endpoint's socket.
+    fn pump(self: &std::sync::Arc<Self>, sdp: &str, duration: Duration, fill: u8) {
+        let Some(dst) = sdp_media_addr(sdp) else {
+            panic!("no media address in SDP:\n{sdp}");
+        };
+        let me = self.clone();
+        tokio::spawn(async move {
+            let mut pkt = vec![fill; 172];
+            pkt[0] = 0x80;
+            pkt[1] = 0x00;
+            pkt[8..12].copy_from_slice(&rand::random::<u32>().to_be_bytes());
+            let mut seq: u16 = rand::random();
+            let mut ts: u32 = rand::random();
+            let mut tick = tokio::time::interval(Duration::from_millis(20));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let deadline = tokio::time::Instant::now() + duration;
+            while tokio::time::Instant::now() < deadline {
+                tick.tick().await;
+                pkt[2..4].copy_from_slice(&seq.to_be_bytes());
+                pkt[4..8].copy_from_slice(&ts.to_be_bytes());
+                if me.socket.send_to(&pkt, dst).await.is_err() {
+                    break;
+                }
+                seq = seq.wrapping_add(1);
+                ts = ts.wrapping_add(160);
+            }
+        });
+    }
+
+    /// Frames received in `[from, to)` carrying `fill`'s audio (±2 codes, to
+    /// tolerate resampling of the constant signal).
+    fn count(&self, fill: u8, from: tokio::time::Instant, to: tokio::time::Instant) -> usize {
+        self.received
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(at, b)| *at >= from && *at < to && b.abs_diff(fill) <= 2)
+            .count()
+    }
+
+    /// Histogram of received median bytes in `[from, to)`, for diagnostics.
+    fn histogram(&self, from: tokio::time::Instant, to: tokio::time::Instant) -> Vec<(u8, usize)> {
+        let mut h = std::collections::BTreeMap::new();
+        for (at, b) in self.received.lock().unwrap().iter() {
+            if *at >= from && *at < to {
+                *h.entry(*b).or_insert(0) += 1;
+            }
+        }
+        h.into_iter().collect()
+    }
+}
+
 /// Raw-UDP SIP helpers shared by the fake carrier (Bot B) and agent (Bot C).
 struct SipSock {
     socket: UdpSocket,
     /// Tag we generated in our 200 OK (needed to build in-dialog requests).
     to_tag: Option<String>,
+    /// RTP port advertised in our SDP; defaults to the SIP port.
+    media_port: Option<u16>,
 }
 
 impl SipSock {
@@ -226,6 +342,7 @@ impl SipSock {
         Self {
             socket: UdpSocket::bind(("127.0.0.1", 0)).await.unwrap(),
             to_tag: None,
+            media_port: None,
         }
     }
 
@@ -329,7 +446,8 @@ impl SipSock {
     }
 
     fn answer_ok(&mut self, req: &str) {
-        let sdp = BOT_SDP.replace("{port}", &self.port().to_string());
+        let media_port = self.media_port.unwrap_or_else(|| self.port());
+        let sdp = BOT_SDP.replace("{port}", &media_port.to_string());
         let via = self.hdr(req, "Via").unwrap_or_default();
         let from = self.hdr(req, "From").unwrap_or_default();
         let to = self.hdr(req, "To").unwrap_or_default();
@@ -393,7 +511,13 @@ impl SipSock {
 
 /// Bot B — fake INVITE-mode carrier bridge: answers, then REFERs the call to
 /// the agent, rejects NOTIFY with 405 (like Aliyun's SBC), expects BYE.
-async fn run_bridge_bot(mut sock: SipSock, agent_port: u16, events: mpsc::UnboundedSender<String>) {
+async fn run_bridge_bot(
+    mut sock: SipSock,
+    agent_port: u16,
+    events: mpsc::UnboundedSender<String>,
+    media: Option<std::sync::Arc<MediaSock>>,
+) {
+    sock.media_port = media.as_ref().map(|m| m.port());
     let invite = loop {
         match sock.recv_sip(Duration::from_secs(20)).await {
             Some(msg) if msg.starts_with("INVITE") => break msg,
@@ -406,6 +530,12 @@ async fn run_bridge_bot(mut sock: SipSock, agent_port: u16, events: mpsc::Unboun
     };
     sock.reply(&invite, "SIP/2.0 100 Trying", None);
     sock.answer_ok(&invite);
+    // Report active-call's media address for this leg (before "answered", so
+    // a test waiting for both reads them in order).
+    let _ = events.send(format!(
+        "bridge_leg_media={}",
+        sdp_media_addr(&invite).map(|a| a.to_string()).unwrap_or_default()
+    ));
     let _ = events.send("answered".into());
 
     // Wait for ACK, skipping any stray packets.
@@ -422,7 +552,12 @@ async fn run_bridge_bot(mut sock: SipSock, agent_port: u16, events: mpsc::Unboun
 
     // Keep the bridge leg's inactivity watchdog fed with inbound RTP, like a
     // real carrier leg would.
-    tokio::spawn(pump_rtp(invite.clone(), Duration::from_secs(30), rand::random()));
+    match &media {
+        Some(m) => m.pump(&invite, Duration::from_secs(30), BRIDGE_FILL),
+        None => {
+            tokio::spawn(pump_rtp(invite.clone(), Duration::from_secs(30), rand::random()));
+        }
+    }
 
     // Send the in-dialog REFER with Refer-To = agent, plus carrier routing
     // headers that must survive onto the transfer INVITE.
@@ -472,7 +607,9 @@ async fn run_agent_bot(
     mut sock: SipSock,
     events: mpsc::UnboundedSender<String>,
     hold: Duration,
+    media: Option<std::sync::Arc<MediaSock>>,
 ) {
+    sock.media_port = media.as_ref().map(|m| m.port());
     let invite = loop {
         match sock.recv_sip(Duration::from_secs(25)).await {
             Some(msg) if msg.starts_with("INVITE") => break msg,
@@ -485,6 +622,10 @@ async fn run_agent_bot(
     };
     sock.reply(&invite, "SIP/2.0 100 Trying", None);
     sock.answer_ok(&invite);
+    let _ = events.send(format!(
+        "transfer_leg_media={}",
+        sdp_media_addr(&invite).map(|a| a.to_string()).unwrap_or_default()
+    ));
     let _ = events.send("agent_answered".into());
     // Report whether the REFER's custom headers made it onto the transfer
     // INVITE (blind header forwarding).
@@ -508,7 +649,12 @@ async fn run_agent_bot(
 
     // Talk for a while (feeding the transfer leg's inactivity watchdog with
     // RTP, like a real agent endpoint), then hang up.
-    tokio::spawn(pump_rtp(invite.clone(), hold + Duration::from_secs(4), rand::random()));
+    match &media {
+        Some(m) => m.pump(&invite, hold + Duration::from_secs(4), AGENT_FILL),
+        None => {
+            tokio::spawn(pump_rtp(invite.clone(), hold + Duration::from_secs(4), rand::random()));
+        }
+    }
     tokio::time::sleep(hold).await;
     sock.send_in_dialog(&invite, "BYE", &[], 2);
     loop {
@@ -532,8 +678,13 @@ async fn run_customer(
     pbx: std::net::SocketAddr,
     events: mpsc::UnboundedSender<String>,
     min_alive: Duration,
+    media: Option<std::sync::Arc<MediaSock>>,
 ) {
     let call_id = "auto-refer-customer-1";
+    let offer = match &media {
+        Some(m) => PCMU_OFFER.replace("m=audio 40000", &format!("m=audio {}", m.port())),
+        None => PCMU_OFFER.to_string(),
+    };
     let invite = format!(
         "INVITE sip:100@{pbx} SIP/2.0\r\n\
          Via: SIP/2.0/UDP 127.0.0.1:{port};branch=z9hG4bKcustomer1;rport\r\n\
@@ -546,9 +697,9 @@ async fn run_customer(
          Content-Type: application/sdp\r\n\
          Content-Length: {len}\r\n\
          \r\n\
-         {PCMU_OFFER}",
+         {offer}",
         port = sock.port(),
-        len = PCMU_OFFER.len(),
+        len = offer.len(),
     );
     sock.send_raw(&invite, pbx).await;
 
@@ -582,7 +733,12 @@ async fn run_customer(
     // Stream RTP to the answer's media port for the whole call duration
     // (feeds the caller leg's inactivity watchdog, like a real endpoint).
     let answer_body = ok.split("\r\n\r\n").nth(1).unwrap_or_default().to_string();
-    tokio::spawn(pump_rtp(answer_body, Duration::from_secs(120), rand::random()));
+    match &media {
+        Some(m) => m.pump(&answer_body, Duration::from_secs(120), CUSTOMER_FILL),
+        None => {
+            tokio::spawn(pump_rtp(answer_body, Duration::from_secs(120), rand::random()));
+        }
+    }
 
     // The session must survive the transfer; the final BYE comes only after
     // the agent hangs up. Stay listening for the whole expected call duration
@@ -650,13 +806,13 @@ async fn auto_refer_follows_bridge_leg_refer() {
     let agent_sock = SipSock::bind().await;
     let agent_port = agent_sock.port();
     let (agent_tx, mut agent_rx) = mpsc::unbounded_channel();
-    tokio::spawn(run_agent_bot(agent_sock, agent_tx, Duration::from_millis(1200)));
+    tokio::spawn(run_agent_bot(agent_sock, agent_tx, Duration::from_millis(1200), None));
 
     // Bridge (Bot B).
     let bridge_sock = SipSock::bind().await;
     let bridge_port = bridge_sock.port();
     let (bridge_tx, mut bridge_rx) = mpsc::unbounded_channel();
-    tokio::spawn(run_bridge_bot(bridge_sock, agent_port, bridge_tx));
+    tokio::spawn(run_bridge_bot(bridge_sock, agent_port, bridge_tx, None));
 
     // Customer (Bot A) + PBX + webhook.
     let customer_sock = SipSock::bind().await;
@@ -666,6 +822,7 @@ async fn auto_refer_follows_bridge_leg_refer() {
         pbx,
         customer_tx,
         Duration::from_secs(30),
+        None,
     ));
 
     // Attach the WS bot and accept, then trigger the INVITE-mode refer to the bridge.
@@ -796,12 +953,12 @@ async fn auto_refer_transfer_survives_refer_leg_watchdog() {
     let agent_port = agent_sock.port();
     let (agent_tx, mut agent_rx) = mpsc::unbounded_channel();
     // The agent holds the call for 8s — well past the 3s watchdog window.
-    tokio::spawn(run_agent_bot(agent_sock, agent_tx, Duration::from_secs(8)));
+    tokio::spawn(run_agent_bot(agent_sock, agent_tx, Duration::from_secs(8), None));
 
     let bridge_sock = SipSock::bind().await;
     let bridge_port = bridge_sock.port();
     let (bridge_tx, mut bridge_rx) = mpsc::unbounded_channel();
-    tokio::spawn(run_bridge_bot(bridge_sock, agent_port, bridge_tx));
+    tokio::spawn(run_bridge_bot(bridge_sock, agent_port, bridge_tx, None));
 
     let customer_sock = SipSock::bind().await;
     let (customer_tx, mut customer_rx) = mpsc::unbounded_channel();
@@ -810,6 +967,7 @@ async fn auto_refer_transfer_survives_refer_leg_watchdog() {
         pbx,
         customer_tx,
         Duration::from_secs(30),
+        None,
     ));
 
     let (mut ws_sink, mut ws_events) = attach_and_accept(&mut node).await;
@@ -890,12 +1048,12 @@ async fn auto_refer_transfer_survives_default_50s_watchdog() {
     let agent_sock = SipSock::bind().await;
     let agent_port = agent_sock.port();
     let (agent_tx, mut agent_rx) = mpsc::unbounded_channel();
-    tokio::spawn(run_agent_bot(agent_sock, agent_tx, Duration::from_secs(65)));
+    tokio::spawn(run_agent_bot(agent_sock, agent_tx, Duration::from_secs(65), None));
 
     let bridge_sock = SipSock::bind().await;
     let bridge_port = bridge_sock.port();
     let (bridge_tx, mut bridge_rx) = mpsc::unbounded_channel();
-    tokio::spawn(run_bridge_bot(bridge_sock, agent_port, bridge_tx));
+    tokio::spawn(run_bridge_bot(bridge_sock, agent_port, bridge_tx, None));
 
     let customer_sock = SipSock::bind().await;
     let (customer_tx, mut customer_rx) = mpsc::unbounded_channel();
@@ -904,6 +1062,7 @@ async fn auto_refer_transfer_survives_default_50s_watchdog() {
         pbx,
         customer_tx,
         Duration::from_secs(85),
+        None,
     ));
 
     let (mut ws_sink, mut ws_events) = attach_and_accept(&mut node).await;
@@ -951,4 +1110,191 @@ async fn auto_refer_transfer_survives_default_50s_watchdog() {
         .expect("customer never received the final BYE");
 
     info!("auto-refer default-watchdog test completed successfully");
+}
+
+/// Media-level check of the INVITE-mode auto-refer transfer. Unlike the
+/// watchdog tests above (which only notice a deaf leg after its inactivity
+/// timeout, and on the transfer leg only after the default 50s, since
+/// auto-refer does not inherit `inactivityTimeout`), this asserts on the
+/// audio itself. Each party sends a distinct constant PCMU byte, so every
+/// frame is attributable:
+///
+/// - before the transfer, the customer hears the bridge (also proves the
+///   attribution works);
+/// - after the transfer, the customer hears the agent (the new leg's inbound
+///   RTP is demuxed: the leg is not deaf) and the agent hears the customer;
+/// - after the bridge leg's BYE, none of its audio reaches the customer;
+/// - when the transfer INVITE goes out, the bridge leg still holds its RTP
+///   port and the transfer leg picked a different one.
+///
+/// Regression guard for RTP port reuse: `do_refer` used to start with
+/// `do_interrupt`, closing the bridge leg's PeerConnection (freeing its RTP
+/// port) *before* the transfer leg's PeerConnection picked its port. The
+/// transfer leg could randomly land on the freed port; the carrier's RTP,
+/// still flowing until its BYE at agent answer, then reached the transfer
+/// leg: interleaved with the agent's audio, and the leg could latch onto the
+/// carrier ("preserving latched RTP remote ... instead of selected-pair
+/// remote"), sending the customer's audio there — one-way audio for the whole
+/// call. The media checks only caught it when the port actually collided
+/// (~1 in 11 iterations with this node's 20-port range); the port probe
+/// catches the early release on every iteration.
+///
+/// Repeated `AUTO_REFER_MEDIA_ITERATIONS` times (default 3), each on a fresh
+/// node, to catch intermittent races.
+#[tokio::test]
+async fn auto_refer_transfer_media_flows_both_ways() {
+    tracing_subscriber::fmt()
+        .with_max_level(Level::INFO)
+        .with_test_writer()
+        .try_init()
+        .ok();
+
+    let iterations: u16 = std::env::var("AUTO_REFER_MEDIA_ITERATIONS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    for i in 0..iterations {
+        // Distinct SIP port (and so RTP range) per iteration.
+        auto_refer_media_iteration(35300 + i, i).await;
+    }
+}
+
+async fn auto_refer_media_iteration(sip_port: u16, iteration: u16) {
+    const HOLD: Duration = Duration::from_secs(4);
+    use tokio::time::Instant;
+
+    let mut node = spawn_node(sip_port).await;
+    let pbx = format!("127.0.0.1:{}", node.sip_port).parse().unwrap();
+
+    let customer_media = MediaSock::bind().await;
+    let bridge_media = MediaSock::bind().await;
+    let agent_media = MediaSock::bind().await;
+
+    let agent_sock = SipSock::bind().await;
+    let agent_port = agent_sock.port();
+    let (agent_tx, mut agent_rx) = mpsc::unbounded_channel();
+    tokio::spawn(run_agent_bot(agent_sock, agent_tx, HOLD, Some(agent_media.clone())));
+
+    let bridge_sock = SipSock::bind().await;
+    let bridge_port = bridge_sock.port();
+    let (bridge_tx, mut bridge_rx) = mpsc::unbounded_channel();
+    tokio::spawn(run_bridge_bot(
+        bridge_sock,
+        agent_port,
+        bridge_tx,
+        Some(bridge_media.clone()),
+    ));
+
+    let customer_sock = SipSock::bind().await;
+    let (customer_tx, mut customer_rx) = mpsc::unbounded_channel();
+    tokio::spawn(run_customer(
+        customer_sock,
+        pbx,
+        customer_tx,
+        Duration::from_secs(25),
+        Some(customer_media.clone()),
+    ));
+
+    let (mut ws_sink, mut ws_events) = attach_and_accept(&mut node).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    ws_sink
+        .send(Message::text(format!(
+            r#"{{"command":"refer","caller":"sip:1001@127.0.0.1","callee":"sip:bridge@127.0.0.1:{bridge_port}"}}"#
+        )))
+        .await
+        .expect("failed to send refer command");
+
+    let bridge_leg_media = wait_event(&mut bridge_rx, "bridge_leg_media=", Duration::from_secs(15))
+        .await
+        .expect("bridge leg was never invited");
+    wait_event(&mut bridge_rx, "answered", Duration::from_secs(15))
+        .await
+        .expect("bridge leg was never answered");
+    let t_bridge = Instant::now();
+    let transfer_leg_media =
+        wait_event(&mut agent_rx, "transfer_leg_media=", Duration::from_secs(15))
+            .await
+            .expect("transfer INVITE never reached the agent");
+    // The transfer leg picked its RTP port while the bridge leg must still
+    // hold its own: had the bridge's port been released first, the transfer
+    // leg could reuse it and receive the carrier's RTP. Probe right now (the
+    // superseded track is stopped only after a grace period): binding the
+    // bridge leg's address must still fail.
+    let media_addr = |ev: &str| -> std::net::SocketAddr {
+        ev.split('=')
+            .nth(1)
+            .and_then(|a| a.parse().ok())
+            .unwrap_or_else(|| panic!("no media address in {ev:?}"))
+    };
+    let (bridge_addr, transfer_addr) =
+        (media_addr(&bridge_leg_media), media_addr(&transfer_leg_media));
+    assert_ne!(
+        transfer_addr, bridge_addr,
+        "iteration {iteration}: transfer leg reused the bridge leg's RTP port"
+    );
+    assert!(
+        std::net::UdpSocket::bind(bridge_addr).is_err(),
+        "iteration {iteration}: bridge leg's RTP port {bridge_addr} was already released when the transfer leg was set up"
+    );
+    wait_event(&mut agent_rx, "agent_answered", Duration::from_secs(15))
+        .await
+        .expect("transfer INVITE was never answered");
+    let t_agent = Instant::now();
+    wait_event(&mut bridge_rx, "bridge_bye_received", Duration::from_secs(15))
+        .await
+        .expect("superseded bridge leg was never hung up");
+    let t_bye = Instant::now();
+    wait_event(&mut agent_rx, "agent_bye_acknowledged", HOLD + Duration::from_secs(10))
+        .await
+        .expect("agent BYE was not acknowledged");
+    let t_end = Instant::now();
+
+    // Talk window: skip 500ms of transfer setup, stop before the agent's BYE.
+    let from = t_agent + Duration::from_millis(500);
+    let to = (t_agent + HOLD - Duration::from_millis(300)).min(t_end);
+    let expected = (to - from).as_millis() as usize / 20;
+    let ctx = |m: &MediaSock, a: Instant, b: Instant| {
+        format!(
+            "iteration {iteration}: received (median byte, frames) {:?}",
+            m.histogram(a, b)
+        )
+    };
+
+    let pre = customer_media.count(BRIDGE_FILL, t_bridge, t_agent);
+    assert!(
+        pre >= 10,
+        "customer heard no bridge audio before the transfer ({pre} frames) — {}",
+        ctx(&customer_media, t_bridge, t_agent)
+    );
+    let heard_agent = customer_media.count(AGENT_FILL, from, to);
+    assert!(
+        heard_agent >= expected / 2,
+        "customer barely heard the agent after the transfer ({heard_agent}/{expected} frames): transfer leg deaf? — {}",
+        ctx(&customer_media, from, to)
+    );
+    let heard_customer = agent_media.count(CUSTOMER_FILL, from, to);
+    assert!(
+        heard_customer >= expected / 2,
+        "agent barely heard the customer after the transfer ({heard_customer}/{expected} frames) — {}",
+        ctx(&agent_media, from, to)
+    );
+    let bridge_after_bye =
+        customer_media.count(BRIDGE_FILL, t_bye + Duration::from_millis(300), t_end);
+    assert_eq!(
+        bridge_after_bye,
+        0,
+        "customer still heard the retired bridge leg after its BYE — {}",
+        ctx(&customer_media, t_bye, t_end)
+    );
+    info!(
+        iteration,
+        pre, heard_agent, heard_customer, expected, "auto-refer media iteration ok"
+    );
+
+    wait_event(&mut ws_events, "\"hangup\"", Duration::from_secs(10))
+        .await
+        .expect("session did not tear down after the agent hung up");
+    wait_event(&mut customer_rx, "customer_got_bye", Duration::from_secs(15))
+        .await
+        .expect("customer never received the final BYE");
 }

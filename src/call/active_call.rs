@@ -1480,7 +1480,7 @@ impl ActiveCall {
                     }
                 }
                 if let Err(e) = self
-                    .do_refer(runtime, caller, callee, Some(refer_option))
+                    .do_refer(runtime, caller, callee, Some(refer_option), is_current_bridge)
                     .await
                 {
                     warn!(
@@ -1607,7 +1607,7 @@ impl ActiveCall {
                 caller,
                 callee,
                 options,
-            } => self.do_refer(runtime, caller, callee, options).await,
+            } => self.do_refer(runtime, caller, callee, options, false).await,
             Command::Message {
                 body,
                 content_type,
@@ -2451,8 +2451,21 @@ impl ActiveCall {
         caller: String,
         callee: String,
         refer_option: Option<ReferOption>,
+        following_bridge_refer: bool,
     ) -> Result<()> {
-        self.do_interrupt(false).await.ok();
+        if following_bridge_refer {
+            // The server-side track IS the bridge leg's RtcTrack. Keep it
+            // running so its RTP port stays bound while the transfer leg's
+            // PeerConnection picks a port; the transfer leg's track then
+            // replaces it through `MediaStream::update_track`. Stopping it
+            // here freed the port first: the transfer leg could reuse it, get
+            // the carrier's RTP (still flowing until its BYE at agent answer)
+            // and latch onto the carrier, leaving the agent with one-way audio.
+            self.tts_handle.store(None);
+            self.set_moh(None);
+        } else {
+            self.do_interrupt(false).await.ok();
+        }
 
         // Check if we should pause parent ASR
         let pause_parent_asr = refer_option
