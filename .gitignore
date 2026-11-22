@@ -1,6 +1,7 @@
 /target
 Cargo.lock
 /config/mediacache
+/mediacache_*
 /config/cdr
 /config/recorders
 /config/playbook

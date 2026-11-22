@@ -1,7 +1,9 @@
 use anyhow::{Result, anyhow};
 use bytes::BytesMut;
+#[cfg(not(test))]
 use once_cell::sync::Lazy;
 use sha2::{Digest, Sha256};
+#[cfg(not(test))]
 use std::sync::RwLock;
 use std::{
     io::{IoSlice, SeekFrom},
@@ -15,11 +17,23 @@ use tracing::{debug, info};
 static DEFAULT_CACHE_DIR: &str = "/tmp/mediacache";
 
 // Global cache configuration
+#[cfg(not(test))]
 static CACHE_CONFIG: Lazy<RwLock<CacheConfig>> = Lazy::new(|| {
     RwLock::new(CacheConfig {
         cache_dir: PathBuf::from(DEFAULT_CACHE_DIR),
     })
 });
+
+/// Unit tests run in one process and in parallel, so a process-global cache
+/// directory makes them race: one test would retarget the cache while another
+/// was mid-store, and the file would be gone (or in the wrong directory) by
+/// the next assertion. Keep the test cache directory per thread instead. This
+/// only affects `cargo test`; the published library uses the global above.
+#[cfg(test)]
+thread_local! {
+    static TEST_CACHE_DIR: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 #[derive(Debug, Clone)]
 pub struct CacheConfig {
@@ -28,20 +42,39 @@ pub struct CacheConfig {
 
 /// Set the cache directory for the media cache
 pub fn set_cache_dir(path: &str) -> Result<()> {
-    let path = PathBuf::from(path);
-    let mut config = CACHE_CONFIG
-        .write()
-        .map_err(|_| anyhow!("Failed to acquire write lock"))?;
-    config.cache_dir = path;
-    Ok(())
+    #[cfg(test)]
+    {
+        TEST_CACHE_DIR.with(|dir| *dir.borrow_mut() = Some(PathBuf::from(path)));
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    {
+        let path = PathBuf::from(path);
+        let mut config = CACHE_CONFIG
+            .write()
+            .map_err(|_| anyhow!("Failed to acquire write lock"))?;
+        config.cache_dir = path;
+        Ok(())
+    }
 }
 
 /// Get the current cache directory
 pub fn get_cache_dir() -> Result<PathBuf> {
-    let config = CACHE_CONFIG
-        .read()
-        .map_err(|_| anyhow!("Failed to acquire read lock"))?;
-    Ok(config.cache_dir.clone())
+    #[cfg(test)]
+    {
+        Ok(TEST_CACHE_DIR
+            .with(|dir| dir.borrow().clone())
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_CACHE_DIR)))
+    }
+
+    #[cfg(not(test))]
+    {
+        let config = CACHE_CONFIG
+            .read()
+            .map_err(|_| anyhow!("Failed to acquire read lock"))?;
+        Ok(config.cache_dir.clone())
+    }
 }
 
 /// Ensure the cache directory exists
@@ -204,8 +237,18 @@ pub async fn delete_from_cache(key: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Give this test its own cache directory so it cannot observe another
+    /// test retargeting or deleting the cache (see `TEST_CACHE_DIR`).
+    fn test_cache_dir() -> Result<tempfile::TempDir> {
+        let dir = tempfile::tempdir()?;
+        set_cache_dir(dir.path().to_str().unwrap())?;
+        Ok(dir)
+    }
+
     #[tokio::test]
     async fn test_cache_operations() -> Result<()> {
+        let _cache_dir = test_cache_dir()?;
         ensure_cache_dir().await?;
 
         // Generate a cache key
@@ -234,6 +277,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pcm_cache_roundtrip_and_offset() -> Result<()> {
+        let _cache_dir = test_cache_dir()?;
         let key = generate_cache_key("test_pcm_offset", 16000, None, None);
         delete_from_cache(&key).await.ok();
 
@@ -272,6 +316,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_in_cache_v() -> Result<()> {
+        let _cache_dir = test_cache_dir()?;
         // Test data as multiple slices
         let data1 = b"Hello, ";
         let data2 = b"world!";
@@ -302,6 +347,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_in_cache_v_empty_slices() -> Result<()> {
+        let _cache_dir = test_cache_dir()?;
         let empty_data: &[&[u8]] = &[];
         let key = generate_cache_key("test_empty_vectored", 16000, None, None);
 
@@ -323,6 +369,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_retrieve_from_cache_with_buffer() -> Result<()> {
+        let _cache_dir = test_cache_dir()?;
         // Test data
         let test_data = b"This is test data for buffer retrieval testing.";
         let key = generate_cache_key("test_buffer_retrieve", 16000, None, None);
@@ -348,6 +395,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_retrieve_from_cache_with_buffer_large_file() -> Result<()> {
+        let _cache_dir = test_cache_dir()?;
         // Create larger test data (1MB)
         let large_data: Vec<u8> = vec![7; 1024 * 1024];
         let key = generate_cache_key("test_large_buffer", 16000, None, None);
@@ -373,6 +421,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_retrieve_from_cache_with_buffer_nonexistent() -> Result<()> {
+        let _cache_dir = test_cache_dir()?;
         let nonexistent_key = generate_cache_key("nonexistent_file", 16000, None, None);
         let mut buffer = BytesMut::new();
 
@@ -385,6 +434,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_v_and_retrieve_buffer_integration() -> Result<()> {
+        let _cache_dir = test_cache_dir()?;
         // Test integration between vectored store and buffer retrieve
         let data_parts = [
             b"Part 1: Hello".as_slice(),
