@@ -29,7 +29,7 @@ The examples use offline ASR (SenseVoice) and TTS (Supertonic) with an OpenAI LL
 - A server with a public IP address; UDP 5060 and the RTP port range open. Keep TCP 8080 closed to the internet: the HTTP API has no authentication.
 - Docker
 - An OpenAI API key
-- `active-call` v0.3.117 or later (the `ghcr.io/miuda-ai/active-call:latest` image)
+- `active-call` v0.3.119 or later (the `ghcr.io/miuda-ai/active-call:latest` image)
 - A clone of this repository; run the commands from its root
 
 ---
@@ -107,7 +107,7 @@ rule.rewrite.from.host = "fra.eu.out.didww.com"
 ```
 
 - **`external_ip`**: your server's public IP, used in SIP and SDP.
-- **`[[register_users]]`**: the outbound trunk credentials. `active-call` uses them for calls to `server`. `disabled = true` turns off SIP registration, which DIDWW does not require for outbound calls. Versions before v0.3.118 register anyway; this does no harm.
+- **`[[register_users]]`**: the outbound trunk credentials. `active-call` uses them for calls to `server`. `disabled = true` turns off SIP registration, which DIDWW does not require for outbound calls. Versions before v0.3.119 register anyway; this does no harm.
 - **`[[trunk_rules]]`**: sets your DID as the caller ID on outbound calls, in E.164 format without `+` (for example `442039968519`). Without it, DIDWW rejects the call with `404 No network found for src number`.
 - If you use another DIDWW endpoint, change it in both `server` and `rule.match.to.host`.
 
