@@ -22,9 +22,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run tests
+        shell: bash
         # --no-fail-fast: run every test target so one red run reveals all
-        # failures instead of stopping at the first failing binary
-        run: cargo test --workspace --no-fail-fast
+        # failures instead of stopping at the first failing binary.
+        # On failure, annotate each failing test so it is visible without the
+        # full job log (which needs repository admin rights via the API).
+        run: |
+          set +e
+          cargo test --workspace --no-fail-fast 2>&1 | tee /tmp/cargo-test.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            sed -E 's/\x1B\[[0-9;]*[mK]//g' /tmp/cargo-test.log \
+              | grep -E '^test .* \.\.\. FAILED$' \
+              | sed -E 's/^test (.*) \.\.\. FAILED$/\1/' \
+              | sort -u \
+              | while IFS= read -r name; do
+                  echo "::error title=Failing test::${name}"
+                done
+          fi
+          exit "$status"
 
   test-aarch64:
     # covers the fearless_simd codegen paths on ARM (e.g. TinySilero VAD)
@@ -41,6 +57,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run tests
+        shell: bash
         # --no-fail-fast: run every test target so one red run reveals all
-        # failures instead of stopping at the first failing binary
-        run: cargo test --workspace --no-fail-fast
+        # failures instead of stopping at the first failing binary.
+        # On failure, annotate each failing test so it is visible without the
+        # full job log (which needs repository admin rights via the API).
+        run: |
+          set +e
+          cargo test --workspace --no-fail-fast 2>&1 | tee /tmp/cargo-test.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            sed -E 's/\x1B\[[0-9;]*[mK]//g' /tmp/cargo-test.log \
+              | grep -E '^test .* \.\.\. FAILED$' \
+              | sed -E 's/^test (.*) \.\.\. FAILED$/\1/' \
+              | sort -u \
+              | while IFS= read -r name; do
+                  echo "::error title=Failing test::${name}"
+                done
+          fi
+          exit "$status"
