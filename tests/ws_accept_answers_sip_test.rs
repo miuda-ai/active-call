@@ -1495,7 +1495,7 @@ async fn ws_dtmf_command_sends_rfc4733_event() {
     let mut node = spawn_node(vec![]).await;
     let uac = SipUac::new(
         format!("127.0.0.1:{}", node.sip_port).parse().unwrap(),
-        41006,
+        0,
     )
     .await;
     let call_id = "ws-dtmf@127.0.0.1";
