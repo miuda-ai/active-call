@@ -471,7 +471,7 @@ impl ActiveCall {
         mut track: Box<dyn Track>,
         play_id: Option<String>,
     ) {
-        let (call_ambiance, subscribe, monitor) = {
+        let (call_ambiance, subscribe, monitor, control_ws_media) = {
             let state = self.progress.load_full();
             (
                 state.option.as_ref().and_then(|o| o.ambiance.clone()),
@@ -481,6 +481,12 @@ impl ActiveCall {
                     .and_then(|o| o.subscribe)
                     .unwrap_or_default(),
                 state.option.as_ref().and_then(|o| o.monitor.clone()),
+                state
+                    .option
+                    .as_ref()
+                    .and_then(|o| o.media_pass.as_ref())
+                    .map(|m| m.uses_control_ws())
+                    .unwrap_or(false),
             )
         };
         let ambiance_opt = self.merged_ambiance(call_ambiance.as_ref());
@@ -504,7 +510,7 @@ impl ActiveCall {
             }
         }
 
-        if subscribe && self.call_type != ActiveCallType::WebSocket {
+        if subscribe && self.call_type != ActiveCallType::WebSocket && !control_ws_media {
             let (track_index, sub_track_id) = if track.id() == &self.server_side_track_id {
                 (0, self.server_side_track_id.clone())
             } else {

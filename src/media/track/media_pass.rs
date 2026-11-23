@@ -12,17 +12,21 @@ use anyhow::Result;
 use async_trait::async_trait;
 use audio_codec::{bytes_to_samples, resample, samples_to_bytes};
 use bytes::{Bytes, BytesMut};
-use futures::{SinkExt, StreamExt, stream::SplitSink};
+use futures::{SinkExt, Stream, StreamExt, stream::SplitSink};
 use serde::{Deserialize, Serialize};
 use std::{
+    pin::Pin,
     sync::Arc,
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 use tokio::{net::TcpStream, sync::Mutex};
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+
+use super::websocket::WebsocketBytesReceiver;
 
 type WsConn = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsSink = SplitSink<WsConn, Message>;
@@ -30,7 +34,22 @@ type WsSink = SplitSink<WsConn, Message>;
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaPassOption {
-    url: String,             // websocket url, e.g. ws://localhost:8080/
+    /// Websocket URL to dial, e.g. `ws://localhost:8080/`. Optional when
+    /// `use_control_ws` is true (the call's own control websocket is used and
+    /// no outbound connection is opened).
+    #[serde(default)]
+    url: Option<String>,
+    /// Reuse the call's existing control websocket instead of dialing `url`.
+    ///
+    /// Only meaningful for call types that have a control websocket carrying
+    /// binary audio, i.e. `/call/sip` (and `/call` for inbound SIP attach).
+    /// In this mode binary frames from the client are treated exactly like the
+    /// media-pass downlink (buffered, then emitted once per `ptime`), and the
+    /// call's agent-side audio is emitted back to the client as binary frames
+    /// on the same websocket (chunked to `packet_size`). No second websocket
+    /// connection is created.
+    #[serde(default)]
+    use_control_ws: Option<bool>,
     input_sample_rate: u32,  // sample rate of audio receiving from websocket
     output_sample_rate: u32, // sample rate of audio sending to websocket server
     /// Size in bytes of each binary frame sent to the websocket server (uplink
@@ -231,13 +250,52 @@ impl MediaPassOption {
         ptime: Option<u32>,
     ) -> Self {
         Self {
-            url,
+            url: Some(url),
+            use_control_ws: None,
             input_sample_rate,
             output_sample_rate,
             packet_size,
             ptime,
         }
     }
+
+    /// Audio over the call's existing control websocket (no outbound dial).
+    pub fn control_ws(
+        input_sample_rate: u32,
+        output_sample_rate: u32,
+        packet_size: Option<u32>,
+        ptime: Option<u32>,
+    ) -> Self {
+        Self {
+            url: None,
+            use_control_ws: Some(true),
+            input_sample_rate,
+            output_sample_rate,
+            packet_size,
+            ptime,
+        }
+    }
+
+    /// Whether this option asks for the control-websocket transport.
+    pub fn uses_control_ws(&self) -> bool {
+        self.use_control_ws.unwrap_or(false)
+    }
+
+    /// The dial-out URL, if any (empty strings count as absent).
+    pub fn url(&self) -> Option<&str> {
+        self.url.as_deref().filter(|url| !url.is_empty())
+    }
+}
+
+#[derive(Debug, Clone)]
+enum MediaPassTransport {
+    /// Dial out to an external websocket (classic mediaPass).
+    Url(String),
+    /// Use the call's existing control websocket. Bytes come from the
+    /// handler's `audio_receiver`; outbound audio is emitted through the
+    /// session event channel, which the websocket send loop turns into binary
+    /// frames.
+    ControlWs,
 }
 
 pub struct MediaPassTrack {
@@ -245,7 +303,12 @@ pub struct MediaPassTrack {
     track_id: TrackId,
     cancel_token: CancellationToken,
     config: TrackConfig, // input sample rate is here, it is 0 if the ptime is None
-    url: String,
+    transport: MediaPassTransport,
+    /// Client -> call audio source, only used by [`MediaPassTransport::ControlWs`].
+    control_rx: Option<WebsocketBytesReceiver>,
+    /// Call -> client sink, only used by [`MediaPassTransport::ControlWs`].
+    /// Set in `start()` from the event sender the media stream hands us.
+    control_event_sender: Option<EventSender>,
     output_sample_rate: u32, // output sample rate
     packet_size: u32,
     // buffer the rtp/webrtc packets, send to websocket server with packet size
@@ -342,6 +405,50 @@ impl MediaPassTrack {
         cancel_token: CancellationToken,
         option: MediaPassOption,
     ) -> Self {
+        let url = option.url().unwrap_or_default().to_string();
+        Self::build(
+            session_id,
+            ssrc,
+            track_id,
+            cancel_token,
+            option,
+            MediaPassTransport::Url(url),
+            None,
+        )
+    }
+
+    /// Media-pass audio over the call's existing control websocket.
+    ///
+    /// `rx` is the handler's binary-audio receiver for that websocket. It must
+    /// be the only consumer of those frames.
+    pub fn for_control_ws(
+        session_id: String,
+        ssrc: u32,
+        track_id: TrackId,
+        cancel_token: CancellationToken,
+        option: MediaPassOption,
+        rx: WebsocketBytesReceiver,
+    ) -> Self {
+        Self::build(
+            session_id,
+            ssrc,
+            track_id,
+            cancel_token,
+            option,
+            MediaPassTransport::ControlWs,
+            Some(rx),
+        )
+    }
+
+    fn build(
+        session_id: String,
+        ssrc: u32,
+        track_id: TrackId,
+        cancel_token: CancellationToken,
+        option: MediaPassOption,
+        transport: MediaPassTransport,
+        control_rx: Option<WebsocketBytesReceiver>,
+    ) -> Self {
         let sample_rate = option.output_sample_rate;
         // `inputSampleRate` is sometimes omitted as 0 when ptime is disabled.
         // A 0 here used to flow into the track's frames and make
@@ -383,7 +490,9 @@ impl MediaPassTrack {
             track_id,
             cancel_token,
             config,
-            url: option.url,
+            transport,
+            control_rx,
+            control_event_sender: None,
             output_sample_rate: sample_rate,
             packet_size,
             buffer,
@@ -392,6 +501,14 @@ impl MediaPassTrack {
             bytes_sent: Arc::new(AtomicU64::new(0)),
             // dummy processor chain, will ignore processor
             processor_chain: ProcessorChain::new(sample_rate),
+        }
+    }
+
+    /// Cheap pre-check so callers never buffer audio that has nowhere to go.
+    async fn is_outbound_ready(&self) -> bool {
+        match &self.transport {
+            MediaPassTransport::Url(_) => self.ws_sink.lock().await.is_some(),
+            MediaPassTransport::ControlWs => self.control_event_sender.is_some(),
         }
     }
 }
@@ -437,15 +554,14 @@ impl Track for MediaPassTrack {
         event_sender: EventSender,
         packet_sender: TrackPacketSender,
     ) -> Result<()> {
-        let mut url = url::Url::parse(&self.url)?;
-        {
-            let mut query = url.query_pairs_mut();
-            query.append_pair("sample_rate", self.output_sample_rate.to_string().as_str());
-            query.append_pair("packet_size", self.packet_size.to_string().as_str());
-        }
+        let source_label = match &self.transport {
+            MediaPassTransport::Url(url) => url.clone(),
+            MediaPassTransport::ControlWs => "control-ws".to_string(),
+        };
         info!(
             session_id = %self.session_id,
             track_id = %self.track_id,
+            transport = %source_label,
             input_sample_rate = self.config.samplerate,
             output_sample_rate = self.output_sample_rate,
             packet_size = self.packet_size,
@@ -454,9 +570,39 @@ impl Track for MediaPassTrack {
         );
         let input_sample_rate = self.config.samplerate;
         let output_sample_rate = self.output_sample_rate;
-        let (ws_stream, _) = tokio_tungstenite::connect_async(url.as_str()).await?;
-        let (ws_sink, mut ws_source) = ws_stream.split();
-        *self.ws_sink.lock().await = Some(ws_sink);
+
+        // Both transports are reduced to a stream of websocket messages so the
+        // pacing/buffering loop below stays identical:
+        // - Url: dial the external media server.
+        // - ControlWs: consume the call's own control-websocket binary-audio
+        //   receiver (no new connection) and emit the return path through the
+        //   session event channel, which the handler's WS send loop forwards.
+        type Inbound = Pin<
+            Box<dyn Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Send>,
+        >;
+        let mut inbound: Inbound = match &self.transport {
+            MediaPassTransport::Url(url) => {
+                let mut url = url::Url::parse(url)?;
+                {
+                    let mut query = url.query_pairs_mut();
+                    query.append_pair("sample_rate", self.output_sample_rate.to_string().as_str());
+                    query.append_pair("packet_size", self.packet_size.to_string().as_str());
+                }
+                let (ws_stream, _) = tokio_tungstenite::connect_async(url.as_str()).await?;
+                let (sink, source) = ws_stream.split();
+                *self.ws_sink.lock().await = Some(sink);
+                Box::pin(source)
+            }
+            MediaPassTransport::ControlWs => {
+                let rx = self.control_rx.take().ok_or_else(|| {
+                    anyhow::anyhow!("media pass control websocket audio receiver is not available")
+                })?;
+                self.control_event_sender = Some(event_sender.clone());
+                Box::pin(UnboundedReceiverStream::new(rx).map(|bytes| {
+                    Ok::<Message, tokio_tungstenite::tungstenite::Error>(Message::Binary(bytes))
+                }))
+            }
+        };
         let ws_sink = self.ws_sink.clone();
         let bytes_sent = self.bytes_sent.clone();
         let session_id = self.session_id.clone();
@@ -530,7 +676,7 @@ impl Track for MediaPassTrack {
                             break;
                         }
                     }
-                    msg = ws_source.next() => {
+                    msg = inbound.next() => {
                         match msg {
                             Some(Ok(Message::Binary(data))) => {
                                 bytes_received += data.len() as u64;
@@ -584,7 +730,7 @@ impl Track for MediaPassTrack {
                                 let error = SessionEvent::Error {
                                     track_id: track_id.clone(),
                                     timestamp: crate::media::get_timestamp(),
-                                    sender: format!("media_pass: {}", url),
+                                    sender: format!("media_pass: {}", source_label),
                                     error: format!("Media pass track error: {:?}", e),
                                     code: None,
                                 };
@@ -619,6 +765,7 @@ impl Track for MediaPassTrack {
             let (bytes_padded, underrun_ticks, emit_ticks) = pacer.stats();
             info!(
                 session_id,
+                transport = %source_label,
                 duration,
                 input_sample_rate,
                 output_sample_rate,
@@ -659,27 +806,49 @@ impl Track for MediaPassTrack {
             warn!(track_id=%self.track_id, "processor_chain process_frame error: {:?}", e);
         }
 
-        if let Some(ws_sink) = self.ws_sink.lock().await.as_mut() {
-            if let Samples::PCM { samples } = &packet.samples {
-                let mut buffer = self.buffer.lock().await;
-                let bytes = samples_to_bytes(samples.as_slice());
-                buffer.reserve(bytes.len());
-                buffer.extend_from_slice(bytes.as_slice());
-                while buffer.len() >= self.packet_size as usize {
-                    let bytes = buffer.split_to(self.packet_size as usize).freeze();
-                    let bytes = if packet.sample_rate == self.output_sample_rate {
-                        bytes
-                    } else {
-                        let samples = bytes_to_samples(&bytes);
-                        let resample =
-                            resample(&samples, packet.sample_rate, self.output_sample_rate);
-                        let bytes = samples_to_bytes(resample.as_slice());
-                        Bytes::copy_from_slice(bytes.as_slice())
-                    };
-                    let bytes_len = bytes.len();
-                    ws_sink.send(Message::Binary(bytes)).await?;
-                    self.bytes_sent
-                        .fetch_add(bytes_len as u64, Ordering::Relaxed);
+        if !self.is_outbound_ready().await {
+            return Ok(());
+        }
+
+        if let Samples::PCM { samples } = &packet.samples {
+            let mut buffer = self.buffer.lock().await;
+            let bytes = samples_to_bytes(samples.as_slice());
+            buffer.reserve(bytes.len());
+            buffer.extend_from_slice(bytes.as_slice());
+            while buffer.len() >= self.packet_size as usize {
+                let chunk = buffer.split_to(self.packet_size as usize).freeze();
+                let chunk = if packet.sample_rate == self.output_sample_rate {
+                    chunk
+                } else {
+                    let samples = bytes_to_samples(&chunk);
+                    let resample =
+                        resample(&samples, packet.sample_rate, self.output_sample_rate);
+                    let bytes = samples_to_bytes(resample.as_slice());
+                    Bytes::copy_from_slice(bytes.as_slice())
+                };
+                let chunk_len = chunk.len();
+                match &self.transport {
+                    MediaPassTransport::Url(_) => {
+                        // Re-check under the sink lock: stop() may have taken it.
+                        if let Some(ws_sink) = self.ws_sink.lock().await.as_mut() {
+                            ws_sink.send(Message::Binary(chunk)).await?;
+                            self.bytes_sent
+                                .fetch_add(chunk_len as u64, Ordering::Relaxed);
+                        }
+                    }
+                    MediaPassTransport::ControlWs => {
+                        if let Some(sender) = &self.control_event_sender {
+                            sender
+                                .send(SessionEvent::Binary {
+                                    track_id: self.track_id.clone(),
+                                    timestamp: crate::media::get_timestamp(),
+                                    data: chunk.to_vec(),
+                                })
+                                .ok();
+                            self.bytes_sent
+                                .fetch_add(chunk_len as u64, Ordering::Relaxed);
+                        }
+                    }
                 }
             }
         }
@@ -715,5 +884,194 @@ mod tests {
     #[test]
     fn explicit_input_sample_rate_is_preserved() {
         assert_eq!(new_track(8000, 16000).config.samplerate, 8000);
+    }
+
+    fn pcm16(samples: usize, value: i16) -> AudioFrame {
+        AudioFrame {
+            samples: Samples::PCM {
+                samples: vec![value; samples],
+            },
+            sample_rate: 16000,
+            channels: 1,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn control_ws_option_needs_no_url() {
+        let opt: MediaPassOption = serde_json::from_str(
+            r#"{"useControlWs":true,"inputSampleRate":16000,"outputSampleRate":8000}"#,
+        )
+        .unwrap();
+        assert!(opt.uses_control_ws());
+        assert!(opt.url().is_none());
+
+        let url_opt: MediaPassOption = serde_json::from_str(
+            r#"{"url":"ws://media.example/audio","inputSampleRate":16000,"outputSampleRate":16000}"#,
+        )
+        .unwrap();
+        assert!(!url_opt.uses_control_ws());
+        assert_eq!(url_opt.url(), Some("ws://media.example/audio"));
+    }
+
+    /// Control-websocket transport, inbound direction: client PCM is buffered
+    /// and emitted towards the call one `ptime` frame at a time (no burst).
+    #[tokio::test]
+    async fn control_ws_buffers_client_audio_and_paces_it() {
+        let (client_tx, client_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+        let (packet_tx, mut packet_rx) = tokio::sync::mpsc::unbounded_channel::<AudioFrame>();
+        let events = crate::event::create_event_sender();
+
+        let mut track = MediaPassTrack::for_control_ws(
+            "session".to_string(),
+            1,
+            "server-side-track".to_string(),
+            CancellationToken::new(),
+            MediaPassOption::control_ws(16000, 16000, Some(640), Some(20)),
+            client_rx,
+        );
+        track.start(events, packet_tx).await.unwrap();
+
+        // 10 x 20 ms of PCM, all delivered at once: the pacer must spread them.
+        for _ in 0..10 {
+            client_tx.send(Bytes::from(vec![0x11u8; 640])).unwrap();
+        }
+
+        let started = tokio::time::Instant::now();
+        let mut stamps = Vec::with_capacity(10);
+        for _ in 0..10 {
+            let frame = tokio::time::timeout(Duration::from_secs(2), packet_rx.recv())
+                .await
+                .expect("pacer stopped emitting")
+                .expect("packet channel closed");
+            assert_eq!(frame.track_id, "server-side-track");
+            assert_eq!(frame.sample_rate, 16000);
+            match frame.samples {
+                Samples::PCM { samples } => assert_eq!(samples.len(), 320), // 20 ms @ 16 kHz
+                other => panic!("expected PCM frame, got {other:?}"),
+            }
+            stamps.push(tokio::time::Instant::now());
+        }
+
+        let total = stamps[9].duration_since(started);
+        assert!(
+            total >= Duration::from_millis(80),
+            "10 x 20 ms frames were emitted too fast ({total:?}); ptime pacing is not applied"
+        );
+        assert!(
+            stamps[2].duration_since(stamps[1]) >= Duration::from_millis(8),
+            "consecutive frames were not paced: {:?}",
+            stamps[2].duration_since(stamps[1])
+        );
+
+        track.cancel_token().cancel();
+    }
+
+    /// Control-websocket transport, outbound direction: call audio is emitted
+    /// as raw PCM binary chunks (no `[trackIndex]` header), sized by
+    /// `packetSize`.
+    #[tokio::test]
+    async fn control_ws_emits_call_audio_as_binary_chunks() {
+        let (_client_tx, client_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+        let (packet_tx, _packet_rx) = tokio::sync::mpsc::unbounded_channel::<AudioFrame>();
+        let events = crate::event::create_event_sender();
+        let mut event_rx = events.subscribe();
+
+        let mut track = MediaPassTrack::for_control_ws(
+            "session".to_string(),
+            1,
+            "server-side-track".to_string(),
+            CancellationToken::new(),
+            MediaPassOption::control_ws(16000, 16000, Some(640), Some(20)),
+            client_rx,
+        );
+        track.start(events, packet_tx).await.unwrap();
+
+        for _ in 0..2 {
+            track.send_packet(&pcm16(320, 1234)).await.unwrap();
+        }
+
+        for _ in 0..2 {
+            let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .expect("no binary event emitted")
+                .expect("event channel closed");
+            match event {
+                SessionEvent::Binary {
+                    track_id, data, ..
+                } => {
+                    assert_eq!(track_id, "server-side-track");
+                    assert_eq!(data.len(), 640);
+                    assert_eq!(i16::from_le_bytes([data[0], data[1]]), 1234);
+                }
+                other => panic!("expected binary audio event, got {other:?}"),
+            }
+        }
+
+        track.cancel_token().cancel();
+    }
+
+    /// Regression: the classic dial-out media-pass transport still round-trips
+    /// after the control-websocket refactor.
+    #[tokio::test]
+    async fn url_mode_still_round_trips() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let url = format!("ws://{}/media", listener.local_addr().unwrap());
+        let (server_tx, mut server_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel::<()>();
+
+        crate::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut sink, mut source) = ws.split();
+            accepted_tx.send(()).ok();
+            // Push 640 B (20 ms @ 16 kHz) towards the call.
+            sink.send(Message::Binary(Bytes::from(vec![0x07u8; 640])))
+                .await
+                .ok();
+            while let Some(Ok(msg)) = source.next().await {
+                if let Message::Binary(data) = msg {
+                    let _ = server_tx.send(data);
+                }
+            }
+        });
+
+        let (packet_tx, mut packet_rx) = tokio::sync::mpsc::unbounded_channel::<AudioFrame>();
+        let events = crate::event::create_event_sender();
+        let mut track = MediaPassTrack::new(
+            "session".to_string(),
+            1,
+            "track".to_string(),
+            CancellationToken::new(),
+            MediaPassOption::new(url, 16000, 16000, Some(640), Some(20)),
+        );
+        track.start(events, packet_tx).await.unwrap();
+        accepted_rx.await.unwrap();
+
+        // Server -> call.
+        let frame = tokio::time::timeout(Duration::from_secs(2), packet_rx.recv())
+            .await
+            .expect("no packet from the media-pass websocket")
+            .expect("packet channel closed");
+        match frame.samples {
+            Samples::PCM { samples } => {
+                assert_eq!(samples.len(), 320);
+                assert!(samples.iter().all(|s| *s == 0x0707));
+            }
+            other => panic!("expected PCM frame, got {other:?}"),
+        }
+
+        // Call -> server.
+        track.send_packet(&pcm16(320, 4321)).await.unwrap();
+        let chunk = tokio::time::timeout(Duration::from_secs(2), server_rx.recv())
+            .await
+            .expect("track did not send audio to the media-pass websocket")
+            .expect("server channel closed");
+        assert_eq!(chunk.len(), 640);
+        assert_eq!(i16::from_le_bytes([chunk[0], chunk[1]]), 4321);
+
+        track.cancel_token().cancel();
     }
 }

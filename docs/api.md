@@ -195,11 +195,38 @@ The `mediaPass` option in `CallOption` configures the WebSocket connection for a
 ```
 
 **MediaPass Fields:**
-- `url` (string): WebSocket URL to connect to for media streaming
+- `url` (string): WebSocket URL to connect to for media streaming. Optional when `useControlWs` is true.
+- `useControlWs` (boolean, optional): Reuse the call's existing control WebSocket (`/call/sip`) instead of dialing `url`. No second WebSocket connection is opened. Client → call binary frames are buffered and played at `ptime`; call → client audio is emitted on the same WebSocket as raw PCM binary chunks of `packetSize` bytes (no track-index header). `subscribe` is ignored while this is enabled. Uses the `server-side-track` (agent leg), so sending `tts`/`play`/`interrupt` replaces it just like the dial-out mediaPass.
 - `inputSampleRate` (number): Sample rate of audio received from the WebSocket server (also the sample rate of the track)
 - `outputSampleRate` (number): Sample rate of audio sent to the WebSocket server
-- `packetSize` (number, optional): Packet size sent to WebSocket server, default is 2560 bytes
-- `ptime` (numer, optional): if ptime is set, server will buffering the input audio, and playing it with `ptime` period
+- `packetSize` (number, optional): Packet size sent to WebSocket server, default is 100 ms of PCM (3200 bytes at 16 kHz)
+- `ptime` (numer, optional): if ptime is set, server will buffering the input audio, and playing it with `ptime` period (default 20 ms, max 40 ms)
+
+### MediaPass over the control WebSocket
+
+For `/call/sip` (and inbound SIP attach) the control WebSocket already exists. Setting `useControlWs` moves the media pass onto it:
+
+```json
+{
+  "command": "invite",
+  "option": {
+    "caller": "sip:bot@rustpbx.com",
+    "callee": "sip:+15551234567@carrier.example",
+    "mediaPass": {
+      "useControlWs": true,
+      "inputSampleRate": 16000,
+      "outputSampleRate": 16000,
+      "packetSize": 640,
+      "ptime": 20
+    }
+  }
+}
+```
+
+Frame format on the control WebSocket:
+- client → server: raw PCM16LE (mono) at `inputSampleRate`; any frame size is accepted (it is buffered internally).
+- server → client: raw PCM16LE at `outputSampleRate`, chunked to `packetSize` bytes (default 100 ms).
+- There is **no** `[trackIndex]` prefix; that format belongs to `subscribe` and is suppressed when `useControlWs` is active.
 
 
 ### MediaPass Example Usage

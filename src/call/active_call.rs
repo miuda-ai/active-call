@@ -1708,6 +1708,11 @@ impl ActiveCall {
         }
 
         option.check_default();
+        // Make the merged option visible to `update_track_wrapper` before any
+        // track is created: the media-pass track below is registered before
+        // `setup_caller_track`, and the control-WS transport must be known at
+        // that point so `subscribe` is not mirrored a second time.
+        self.set_option(option.clone());
         if let Some(opt) = self.build_record_option(&option) {
             self.media_stream.update_recorder_option(opt).await;
         }
@@ -1724,15 +1729,57 @@ impl ActiveCall {
             let track_id = self.server_side_track_id.clone();
             let cancel_token = self.cancel_token.child_token();
             let ssrc = rand::random::<u32>();
-            let media_pass_track = MediaPassTrack::new(
-                self.session_id.clone(),
-                ssrc,
-                track_id,
-                cancel_token,
-                opt.clone(),
-            );
-            self.update_track_wrapper(Box::new(media_pass_track), None)
-                .await;
+            if opt.uses_control_ws() {
+                if !matches!(self.call_type, ActiveCallType::Sip) {
+                    warn!(
+                        session_id = self.session_id,
+                        call_type = ?self.call_type,
+                        "mediaPass.useControlWs is only supported for SIP calls; \
+                         ignoring media pass"
+                    );
+                } else {
+                    // Take the receiver in its own statement: the std mutex
+                    // guard must not be held across the await below.
+                    let control_rx = self.audio_receiver.lock().unwrap().take();
+                    if let Some(rx) = control_rx {
+                        let media_pass_track = MediaPassTrack::for_control_ws(
+                            self.session_id.clone(),
+                            ssrc,
+                            track_id,
+                            cancel_token,
+                            opt.clone(),
+                            rx,
+                        );
+                        self.update_track_wrapper(Box::new(media_pass_track), None)
+                            .await;
+                    } else {
+                        // Second invite/accept on the same session: the first
+                        // one already attached the control-websocket media
+                        // track.
+                        debug!(
+                            session_id = self.session_id,
+                            "mediaPass.useControlWs: control websocket audio is already \
+                             attached or unavailable; keeping the existing track"
+                        );
+                    }
+                }
+            } else if opt.url().is_some() {
+                let media_pass_track = MediaPassTrack::new(
+                    self.session_id.clone(),
+                    ssrc,
+                    track_id,
+                    cancel_token,
+                    opt.clone(),
+                );
+                self.update_track_wrapper(Box::new(media_pass_track), None)
+                    .await;
+            } else {
+                warn!(
+                    session_id = self.session_id,
+                    "mediaPass.url is required unless useControlWs is true; \
+                     ignoring media pass"
+                );
+            }
         }
 
         info!(
