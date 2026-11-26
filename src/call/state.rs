@@ -95,6 +95,9 @@ impl CallProgress {
             if option.monitor.is_none() {
                 option.monitor = existing.monitor.clone();
             }
+            if option.realtime.is_none() {
+                option.realtime = existing.realtime.clone();
+            }
         }
         option
     }
@@ -379,6 +382,24 @@ mod tests {
     use super::*;
 
     const EARLY_SDP: &str = "v=0\r\no=- 1000 1 IN IP4 192.168.1.100\r\n";
+
+    #[test]
+    fn merge_option_keeps_realtime() {
+        let mut p = CallProgress::default();
+        p.option = Some(CallOption {
+            realtime: Some(crate::RealtimeOption {
+                model: Some("gpt-realtime".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let merged = p.merge_option(CallOption::default());
+        assert_eq!(
+            merged.realtime.and_then(|r| r.model).as_deref(),
+            Some("gpt-realtime")
+        );
+    }
 
     #[test]
     fn early_then_confirmed_progress() {
