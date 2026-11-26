@@ -2035,9 +2035,10 @@ curl http://localhost:8080/api/records
 
 **Description:** Pre-generates and caches TTS audio for a given text without requiring an active call session. Useful for warming the cache during off-peak hours.
 
-**Request Body (JSON):**
+**Request Body (JSON):** a [TTS command](#tts-command).
 ```json
 {
+  "command": "tts",
   "text": "Hello, welcome to our service!",
   "speaker": "F1",
   "option": {
@@ -2048,21 +2049,23 @@ curl http://localhost:8080/api/records
 ```
 
 **Fields:**
+- `command` (string, required): Must be `"tts"`
 - `text` (string, required): Text to synthesize
 - `speaker` (string, optional): Speaker voice
-- `option` (object, optional): TTS provider options
-- `cacheKey` (string, optional): Custom cache key
+- `option` (object, required): TTS provider options
+- `cacheKey` (string, optional): Custom cache key. Without it, the key is derived from the provider, text, sample rate, speaker and speed. A later `tts` command uses the cached audio when these values match or when it passes the same `cacheKey`.
 
 **Response:**
 ```json
-{ "status": "cached", "key": "welcome-message-en" }
+{ "status": "cached", "cacheKey": "welcome-message-en", "bytes": 85362 }
 ```
+If the audio is already cached, `status` is `"exists"` and `bytes` is `0`.
 
 **Usage:**
 ```bash
 curl -X POST http://localhost:8080/precache \
   -H "Content-Type: application/json" \
-  -d '{"text": "Hello!", "speaker": "F1", "cacheKey": "greeting"}'
+  -d '{"command": "tts", "text": "Hello!", "speaker": "F1", "option": {"provider": "supertonic"}, "cacheKey": "greeting"}'
 ```
 
 ## Error Handling
