@@ -19,23 +19,28 @@ RUN --mount=type=cache,target=/var/cache/apt \
     tzdata \
     curl \
     wget \
+    unzip \
     && rm -rf /var/lib/apt/lists/*
 
 # Download and install ONNX Runtime based on architecture
 ARG TARGETARCH
 ENV ORT_VERSION=1.23.2
 
+# The microsoft/onnxruntime GitHub releases are no longer available, so use the
+# official NuGet package, which ships the same Linux libraries.
 RUN if [ "$TARGETARCH" = "amd64" ]; then \
         ORT_ARCH="x64"; \
     elif [ "$TARGETARCH" = "arm64" ]; then \
-        ORT_ARCH="aarch64"; \
+        ORT_ARCH="arm64"; \
     else \
         echo "Unsupported architecture: $TARGETARCH" && exit 1; \
     fi && \
-    wget -q https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-${ORT_ARCH}-${ORT_VERSION}.tgz && \
-    tar -xzf onnxruntime-linux-${ORT_ARCH}-${ORT_VERSION}.tgz && \
-    mv onnxruntime-linux-${ORT_ARCH}-${ORT_VERSION}/lib/* /usr/local/lib/ && \
-    rm -rf onnxruntime-linux-${ORT_ARCH}-${ORT_VERSION}* && \
+    wget -q -O ort.nupkg https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/${ORT_VERSION}/microsoft.ml.onnxruntime.${ORT_VERSION}.nupkg && \
+    unzip -j ort.nupkg "runtimes/linux-${ORT_ARCH}/native/*.so" -d /usr/local/lib/ && \
+    rm ort.nupkg && \
+    mv /usr/local/lib/libonnxruntime.so /usr/local/lib/libonnxruntime.so.${ORT_VERSION} && \
+    ln -s libonnxruntime.so.${ORT_VERSION} /usr/local/lib/libonnxruntime.so.1 && \
+    ln -s libonnxruntime.so.1 /usr/local/lib/libonnxruntime.so && \
     ldconfig
 
 # Set ONNX Runtime dynamic library path
