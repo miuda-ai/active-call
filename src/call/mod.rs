@@ -190,6 +190,26 @@ mod tests {
     use super::Command;
 
     #[test]
+    fn sip_option_accepts_camel_case_keys() {
+        for sip in [
+            serde_json::json!({"enableSrtp": true, "extractHeaders": ["X-A"], "hangupHeaders": {"X-B": "1"}}),
+            serde_json::json!({"enable_srtp": true, "extract_headers": ["X-A"], "hangup_headers": {"X-B": "1"}}),
+        ] {
+            let command: Command = serde_json::from_value(
+                serde_json::json!({"command": "invite", "option": {"sip": sip}}),
+            )
+            .unwrap();
+            let Command::Invite { option } = command else {
+                unreachable!()
+            };
+            let sip = option.sip.unwrap();
+            assert_eq!(sip.enable_srtp, Some(true));
+            assert_eq!(sip.extract_headers, Some(vec!["X-A".to_string()]));
+            assert_eq!(sip.hangup_headers.unwrap()["X-B"], "1");
+        }
+    }
+
+    #[test]
     fn diagnostic_commands_omit_sip_password() {
         assert!(format!("{:?}", crate::SipOption::default()).contains("password: None"));
         let sip = serde_json::json!({"username": "alice", "password": "dummy-sip-secret"});
