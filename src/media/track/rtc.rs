@@ -104,6 +104,8 @@ pub struct RtcTrack {
     packet_sender: Arc<Mutex<Option<TrackPacketSender>>>,
     event_sender: Arc<Mutex<Option<EventSender>>>,
     media_ready_sent: Arc<AtomicBool>,
+    /// The Track event arrived before `start()` set the event sender.
+    media_ready_pending: Arc<AtomicBool>,
     rtp_timeout: Arc<RtpTimeoutMonitor>,
     /// Set when the peer connection is gone for good (failed, closed, or
     /// still disconnected after the grace); the track then ends asking the
@@ -333,6 +335,22 @@ const PLAYOUT_MAX_DELAY: Duration = Duration::from_millis(200);
 /// Hard cap on buffered frames, for packet times below 10 ms.
 const PLAYOUT_CAPACITY: usize = 64;
 
+/// Sends `MediaReady` once per track.
+fn send_media_ready(sender: &EventSender, sent: &AtomicBool, track_id: &TrackId) {
+    if sent
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        let result = sender.send(SessionEvent::MediaReady {
+            track_id: track_id.clone(),
+            timestamp: crate::media::get_timestamp(),
+        });
+        if result.is_err() {
+            sent.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
 impl RtcTrack {
     pub fn new(
         cancel_token: CancellationToken,
@@ -352,6 +370,7 @@ impl RtcTrack {
             packet_sender: Arc::new(Mutex::new(None)),
             event_sender: Arc::new(Mutex::new(None)),
             media_ready_sent: Arc::new(AtomicBool::new(false)),
+            media_ready_pending: Arc::new(AtomicBool::new(false)),
             rtp_timeout,
             connection_lost: Arc::new(AtomicBool::new(false)),
             cancel_token,
@@ -550,6 +569,7 @@ impl RtcTrack {
         let connection_lost = self.connection_lost.clone();
         let packet_sender = self.packet_sender.clone();
         let rtp_timeout = self.rtp_timeout.clone();
+        let media_ready_pending = self.media_ready_pending.clone();
         let pc_event = pc.clone();
         let pc_stats = pc.clone();
         let pc_state = pc.clone();
@@ -620,20 +640,14 @@ impl RtcTrack {
                             if let Some(receiver) = transceiver.receiver() {
                                 let track = receiver.track();
                                 if is_rtp_media {
-                                    let maybe_sender = event_sender.lock().await.clone();
-                                    if let Some(sender) = maybe_sender {
-                                        if media_ready_sent
-                                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                                            .is_ok()
-                                        {
-                                            let result = sender.send(SessionEvent::MediaReady {
-                                                track_id: track_id_log.clone(),
-                                                timestamp: crate::media::get_timestamp(),
-                                            });
-                                            if result.is_err() {
-                                                media_ready_sent.store(false, Ordering::SeqCst);
-                                            }
+                                    // For an answered offer the Track event comes during
+                                    // handshake, before `start()`; then `start()` sends it.
+                                    let sender = event_sender.lock().await;
+                                    match sender.as_ref() {
+                                        Some(sender) => {
+                                            send_media_ready(sender, &media_ready_sent, &track_id_log)
                                         }
+                                        None => media_ready_pending.store(true, Ordering::SeqCst),
                                     }
                                 }
                                 info!(track_id=%track_id_log, "New track received");
@@ -1421,7 +1435,13 @@ impl Track for RtcTrack {
         packet_sender: TrackPacketSender,
     ) -> Result<()> {
         *self.packet_sender.lock().await = Some(packet_sender.clone());
-        *self.event_sender.lock().await = Some(event_sender.clone());
+        {
+            let mut sender = self.event_sender.lock().await;
+            *sender = Some(event_sender.clone());
+            if self.media_ready_pending.swap(false, Ordering::SeqCst) {
+                send_media_ready(&event_sender, &self.media_ready_sent, &self.track_id);
+            }
+        }
         let token_clone = self.cancel_token.clone();
         let connection_lost = self.connection_lost.clone();
         let event_sender_clone = event_sender.clone();
@@ -1869,6 +1889,50 @@ a=sendrecv\r\n";
         } else {
             panic!("PeerConnection not initialized");
         }
+    }
+
+    /// For an answered RTP offer the Track event comes during handshake,
+    /// before `start()` sets the event sender; MediaReady must still be sent.
+    #[tokio::test]
+    async fn test_rtp_media_ready_after_track_before_start() {
+        let mut rtc_config = RtcTrackConfig::default();
+        rtc_config.mode = TransportMode::Rtp;
+        rtc_config.preferred_codec = Some(CodecType::PCMU);
+        rtc_config.codecs = vec![CodecType::PCMU];
+        let mut track = RtcTrack::new(
+            CancellationToken::new(),
+            "test-track-media-ready".to_string(),
+            TrackConfig::default(),
+            rtc_config,
+        );
+
+        let offer = "v=0\r\n\
+o=- 123456 123456 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+c=IN IP4 127.0.0.1\r\n\
+t=0 0\r\n\
+m=audio 10000 RTP/AVP 0\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=sendrecv\r\n\
+a=ssrc:12345 cname:test\r\n";
+        track.handshake(offer.to_string(), None).await.unwrap();
+        // Let the event loop take the Track event before start().
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(16);
+        let (packet_tx, _packet_rx) = tokio::sync::mpsc::unbounded_channel();
+        track.start(event_tx, packet_tx).await.unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(SessionEvent::MediaReady { track_id, .. }) = event_rx.recv().await {
+                    break track_id;
+                }
+            }
+        })
+        .await
+        .expect("no MediaReady after start()");
+        assert_eq!(event, "test-track-media-ready");
     }
 
     fn webrtc_offer(ufrag: &str, pwd: &str) -> String {
