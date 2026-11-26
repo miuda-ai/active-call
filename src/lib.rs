@@ -44,8 +44,11 @@ pub struct SipOption {
     pub realm: Option<String>,
     pub contact: Option<String>,
     pub headers: Option<HashMap<String, String>>,
+    #[serde(alias = "hangupHeaders")]
     pub hangup_headers: Option<HashMap<String, String>>,
+    #[serde(alias = "extractHeaders")]
     pub extract_headers: Option<Vec<String>>,
+    #[serde(alias = "enableSrtp")]
     pub enable_srtp: Option<bool>,
 }
 
